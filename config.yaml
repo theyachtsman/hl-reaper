@@ -1,0 +1,72 @@
+# HL Reaper — Phase 1 configuration
+network: testnet            # testnet | mainnet
+
+# Main account address (the wallet that holds funds — PUBLIC address only).
+# The bot signs with the API wallet secret (HL_REAPER_SECRET env var) but
+# acts on behalf of this account.
+account_address: "0xBC6F4A41272a2E55B488380498E1e3aE569B08b0"
+
+coins: ["BTC", "ETH", "SOL"]
+candle_intervals: ["1m", "5m", "1h"]
+candle_buffer_size: 500     # candles kept per coin/interval
+
+pollers:
+  asset_ctx_seconds: 60     # funding / OI / mark px poll
+  funding_history_minutes: 30
+  funding_lookback_hours: 24
+
+heartbeat:
+  path: "/tmp/hl_reaper_heartbeat"
+  interval_seconds: 30
+
+stale_feed_seconds: 30      # WS considered stale after this
+
+db_path: "data/hl_reaper.db"
+log_level: "INFO"
+
+# Phase 1 test-order settings (used only by scripts/test_order.py)
+test_order:
+  coin: "BTC"
+  usd_size: 12              # ~minimum order value is $10
+  limit_offset_pct: 20      # rest a limit bid 20% below mid (never fills)
+
+# ---- Phase 2: risk engine ----
+risk:
+  daily_drawdown_limit: 0.05
+  severe_drawdown_limit: 0.10
+  max_concurrent_positions: 3
+  max_per_symbol: 1
+  max_leverage: 5.0
+  min_confidence: 0.62
+  min_model_agreement: 5
+  max_spread_pct: 0.0015
+  atr_sl_multiplier: 1.5
+  atr_trail_multiplier: 1.0
+  trail_activation_r: 1.5
+  max_loss_per_trade_pct: 0.02
+  emergency_loss_pct: 0.03
+  max_hold_hours_scalp: 4
+  max_hold_hours_swing: 48
+  cascade_oi_drop_pct: 0.15
+  cascade_price_move_pct: 0.03
+  cascade_window_minutes: 5
+  cascade_halt_hours: 2
+  extreme_funding_long_halt: 0.001
+  extreme_funding_short_halt: -0.001
+  flash_crash_candle_pct: 0.05
+  weekly_drawdown_limit: 0.10
+  cooldown_hours: 48
+
+# ---- Phase 3: model settings ----
+models:
+  ml_model_dir: "models/"
+  ml_min_confidence: 0.55
+  ob_top_levels: 10
+  ob_min_imbalance: 0.30
+
+# ---- Phase 4/5: trading loop ----
+trading:
+  loop_interval_seconds: 10
+  default_usd_size: 50
+  default_leverage: 3.0
+  coins_active: ["BTC", "ETH", "SOL"]

@@ -1,0 +1,20 @@
+[Unit]
+Description=HL Reaper - Hyperliquid Perp Bot (Phase 1 data layer)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# --- adjust user/paths to your server ---
+User=ubuntu
+WorkingDirectory=/opt/hl-reaper
+ExecStart=/opt/hl-reaper/venv/bin/python scripts/run_phase1.py
+Restart=always
+RestartSec=10
+# secret loaded from env file, never inline here
+EnvironmentFile=/opt/hl-reaper/.env
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
