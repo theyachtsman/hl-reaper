@@ -259,14 +259,61 @@ def signals(limit: int = 200, coin: str | None = None):
 
 @app.get("/api/tickets")
 def tickets():
-    """Live per-model tickets, published by the bot each loop."""
+    """Live per-model tickets, published by the bot each loop, plus the same
+    aggregation the bot itself runs (real SignalAggregator, not a re-impl) so
+    the UI can show the actual verdict and how close it is to the entry gates.
+    """
+    risk_cfg = cfg._raw.get("risk", {}) or {}
+    gates = {
+        "min_confidence": float(risk_cfg.get("min_confidence", 0.62)),
+        "min_model_agreement": int(risk_cfg.get("min_model_agreement", 5)),
+    }
+    empty = {"ts": None, "coins": {}, "verdicts": {}, "gates": gates}
     raw = get_state("live_tickets")
     if not raw:
-        return {"ts": None, "coins": {}}
+        return empty
     try:
-        return json.loads(raw)
+        data = json.loads(raw)
     except Exception:
-        return {"ts": None, "coins": {}}
+        return empty
+
+    from reaper.aggregator import SignalAggregator
+    from reaper.models import Ticket
+
+    agg = SignalAggregator()
+    verdicts: dict = {}
+    for coin, tks in (data.get("coins") or {}).items():
+        try:
+            objs = [Ticket(model=t["model"], direction=t["direction"],
+                           confidence=float(t.get("confidence") or 0),
+                           meta=t.get("meta") or {}) for t in tks]
+            sig = agg.aggregate(coin, objs)
+            agreement = (sig.long_votes if sig.direction == "LONG"
+                         else sig.short_votes if sig.direction == "SHORT"
+                         else 0)
+            fund = next((t for t in objs
+                         if t.model == "FundingRateModel"), None)
+            veto = bool(fund and sig.direction in ("LONG", "SHORT")
+                        and fund.direction in ("LONG", "SHORT")
+                        and fund.direction != sig.direction)
+            verdicts[coin] = {
+                "direction": sig.direction,
+                "confidence": round(sig.confidence, 3),
+                "long_votes": sig.long_votes,
+                "short_votes": sig.short_votes,
+                "flat_votes": sig.flat_votes,
+                "agreement": agreement,
+                "regime": sig.regime,
+                "veto": veto,
+                "would_fire": (sig.direction in ("LONG", "SHORT")
+                               and sig.confidence >= gates["min_confidence"]
+                               and agreement >= gates["min_model_agreement"]),
+            }
+        except Exception as e:
+            log.warning("verdict aggregation failed for %s: %s", coin, e)
+    data["verdicts"] = verdicts
+    data["gates"] = gates
+    return data
 
 
 @app.get("/api/fills")

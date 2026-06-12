@@ -37,6 +37,40 @@ body {
 .flash-up { animation: flashUp 1.2s ease-out; }
 .flash-down { animation: flashDown 1.2s ease-out; }
 
+/* --- analysis core: decision panels ------------------------------------ */
+
+/* vote beams flowing from model nodes into the verdict core */
+@keyframes beamflow { to { stroke-dashoffset: -14; } }
+.beam { animation: beamflow 0.9s linear infinite; }
+
+/* ticker tape entries sliding in from the left */
+@keyframes tapeIn {
+  from { opacity: 0; transform: translateX(-14px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+.tape-in { animation: tapeIn 0.5s ease-out; }
+
+/* slow holographic sweep across the sparkline */
+@keyframes sweep {
+  0%   { left: -18%; opacity: 0; }
+  8%   { opacity: 0.7; }
+  92%  { opacity: 0.7; }
+  100% { left: 104%; opacity: 0; }
+}
+.sweep {
+  position: absolute; top: 0; bottom: 0; width: 14%;
+  background: linear-gradient(90deg, transparent, #22d3ee14, #22d3ee2e, transparent);
+  animation: sweep 5s ease-in-out infinite;
+  pointer-events: none;
+}
+
+/* armed verdict glow when all entry gates are clear */
+@keyframes armed {
+  0%, 100% { box-shadow: 0 0 4px 0 currentColor; }
+  50%      { box-shadow: 0 0 14px 2px currentColor; }
+}
+.armed { animation: armed 1.4s ease-in-out infinite; }
+
 .core-ring {
   background: conic-gradient(from 0deg, transparent 0%, #22d3ee22 55%,
               #22d3ee 78%, #a5f3fc 82%, transparent 86%);
