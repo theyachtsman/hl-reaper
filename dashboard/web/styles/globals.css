@@ -1,0 +1,52 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html,
+body {
+  /* never let wide content pan the page horizontally — it un-anchors the
+     fixed bottom nav on mobile; tables scroll inside their own wrappers */
+  overflow-x: hidden;
+  overflow-x: clip; /* keeps the sticky header working, unlike hidden */
+  max-width: 100vw;
+}
+
+body {
+  @apply bg-ink text-slate-200 antialiased;
+}
+
+.card {
+  /* min-w-0: grid/flex children default to min-width:auto, so a card holding
+     a wide table refuses to shrink and punches past the viewport on phones */
+  @apply bg-panel border border-edge rounded-xl p-4 min-w-0;
+}
+
+@keyframes feedIn {
+  from { opacity: 0; transform: translateY(-6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes corespin {
+  to { transform: rotate(360deg); }
+}
+
+@keyframes flashUp   { 0% { color: #34d399; } 100% { color: inherit; } }
+@keyframes flashDown { 0% { color: #f87171; } 100% { color: inherit; } }
+
+.feed-in { animation: feedIn 0.45s ease-out; }
+.flash-up { animation: flashUp 1.2s ease-out; }
+.flash-down { animation: flashDown 1.2s ease-out; }
+
+.core-ring {
+  background: conic-gradient(from 0deg, transparent 0%, #22d3ee22 55%,
+              #22d3ee 78%, #a5f3fc 82%, transparent 86%);
+  animation: corespin 2.8s linear infinite;
+}
+
+.label {
+  @apply text-xs uppercase tracking-wider text-slate-400;
+}
+
+.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}

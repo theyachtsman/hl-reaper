@@ -16,7 +16,10 @@ pollers:
   funding_lookback_hours: 24
 
 heartbeat:
-  path: "/tmp/hl_reaper_heartbeat"
+  # changed from /tmp/hl_reaper_heartbeat at Phase 6 start: the old Phase 1
+  # data service writes that path too, which would blind the watchdog to a
+  # dead trading loop. The trading loop owns this file exclusively.
+  path: "/tmp/hl_reaper_bot_heartbeat"
   interval_seconds: 30
 
 stale_feed_seconds: 30      # WS considered stale after this
@@ -70,3 +73,5 @@ trading:
   default_usd_size: 50
   default_leverage: 3.0
   coins_active: ["BTC", "ETH", "SOL"]
+  entry_style: "maker"        # maker = post-only limit, skip if unfilled; taker = market
+  entry_timeout_seconds: 30

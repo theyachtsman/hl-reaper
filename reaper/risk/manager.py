@@ -1,0 +1,501 @@
+"""RiskManager: 4-layer guard system + bot state machine (Phase 2)."""
+import time
+from collections import deque
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Callable
+
+from reaper.logger import get_logger
+from reaper.models import atr_from_candles
+from reaper.risk.state import BotState
+
+log = get_logger("risk")
+
+
+def with_retry(fn: Callable, what: str, tries: int = 3):
+    """Layer 4 API wrapper: exponential backoff, returns None on final failure."""
+    for i in range(tries):
+        try:
+            return fn()
+        except Exception as e:
+            wait = 2 ** i
+            log.warning("%s failed (%s) — retry in %ds", what, e, wait)
+            if i < tries - 1:
+                time.sleep(wait)
+    log.error("%s failed after %d tries", what, tries)
+    return None
+
+
+class RiskManager:
+    """Owns the bot state machine and every pre-trade / in-trade / market /
+    infra guard. Nothing opens a position without passing through here."""
+
+    def __init__(self, cfg, buf, db, xc):
+        self.cfg = cfg
+        self.buf = buf
+        self.db = db
+        self.xc = xc
+
+        r = (getattr(cfg, "_raw", {}) or {}).get("risk", {}) or {}
+        # Layer 1 — pre-trade
+        self.daily_drawdown_limit = float(r.get("daily_drawdown_limit", 0.05))
+        self.severe_drawdown_limit = float(r.get("severe_drawdown_limit", 0.10))
+        self.max_concurrent_positions = int(r.get("max_concurrent_positions", 3))
+        self.max_per_symbol = int(r.get("max_per_symbol", 1))
+        self.max_leverage = float(r.get("max_leverage", 5.0))
+        self.min_confidence = float(r.get("min_confidence", 0.62))
+        self.min_model_agreement = int(r.get("min_model_agreement", 5))
+        self.max_spread_pct = float(r.get("max_spread_pct", 0.0015))
+        # Layer 2 — in-trade
+        self.atr_sl_multiplier = float(r.get("atr_sl_multiplier", 1.5))
+        self.atr_trail_multiplier = float(r.get("atr_trail_multiplier", 1.0))
+        self.trail_activation_r = float(r.get("trail_activation_r", 1.5))
+        self.max_loss_per_trade_pct = float(r.get("max_loss_per_trade_pct", 0.02))
+        self.emergency_loss_pct = float(r.get("emergency_loss_pct", 0.03))
+        self.max_hold_hours_scalp = float(r.get("max_hold_hours_scalp", 4))
+        self.max_hold_hours_swing = float(r.get("max_hold_hours_swing", 48))
+        # Layer 3 — market kill switches
+        self.cascade_oi_drop_pct = float(r.get("cascade_oi_drop_pct", 0.15))
+        self.cascade_price_move_pct = float(r.get("cascade_price_move_pct", 0.03))
+        self.cascade_window_minutes = float(r.get("cascade_window_minutes", 5))
+        self.cascade_halt_hours = float(r.get("cascade_halt_hours", 2))
+        self.extreme_funding_long_halt = float(r.get("extreme_funding_long_halt", 0.001))
+        self.extreme_funding_short_halt = float(r.get("extreme_funding_short_halt", -0.001))
+        self.flash_crash_candle_pct = float(r.get("flash_crash_candle_pct", 0.05))
+        self.weekly_drawdown_limit = float(r.get("weekly_drawdown_limit", 0.10))
+        self.cooldown_hours = float(r.get("cooldown_hours", 48))
+
+        # internal tracking
+        self._oi_hist: dict[str, deque] = {c: deque(maxlen=120) for c in buf.coins}
+        self._pos_track: dict[str, dict] = {}        # coin -> entry/sl/tp tracker
+        self._flash_pause_until: dict[str, float] = {}
+        self._long_halt: set[str] = set()
+        self._short_halt: set[str] = set()
+        self._equity_cache: tuple[float, float] = (0.0, 0.0)  # (fetched_at, value)
+        self._halted_until = float(db.get_state("risk_halted_until") or 0)
+        self._cooldown_until = float(db.get_state("risk_cooldown_until") or 0)
+        self.day_open_equity = float(db.get_state("risk_day_open_equity") or 0)
+        self.week_open_equity = float(db.get_state("risk_week_open_equity") or 0)
+        self._day_anchor = db.get_state("risk_day_anchor") or ""
+        self._week_anchor = db.get_state("risk_week_anchor") or ""
+
+        persisted = db.get_state("risk_state")
+        try:
+            self.state = BotState(persisted) if persisted else BotState.ACTIVE
+        except ValueError:
+            self.state = BotState.ACTIVE
+        log.info("RiskManager up — state=%s day_open=%.2f week_open=%.2f",
+                 self.state.value, self.day_open_equity, self.week_open_equity)
+
+    # ------------------------------------------------------------------
+    # state helpers
+    # ------------------------------------------------------------------
+    def _set_state(self, new: BotState, reason: str):
+        if new == self.state:
+            return
+        log.warning("STATE %s -> %s (%s)", self.state.value, new.value, reason)
+        self.state = new
+        self.db.set_state("risk_state", new.value)
+        self.db.set_state("risk_state_reason", reason)
+
+    def _halt(self, until_ts: float, reason: str):
+        self._halted_until = until_ts
+        self.db.set_state("risk_halted_until", str(until_ts))
+        self._set_state(BotState.HALTED, reason)
+
+    def _cooldown(self, until_ts: float, reason: str):
+        self._cooldown_until = until_ts
+        self.db.set_state("risk_cooldown_until", str(until_ts))
+        self._set_state(BotState.COOLDOWN, reason)
+
+    @staticmethod
+    def _next_utc_midnight() -> float:
+        now = datetime.now(timezone.utc)
+        nxt = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0,
+                                                microsecond=0)
+        return nxt.timestamp()
+
+    # ------------------------------------------------------------------
+    # equity / anchors
+    # ------------------------------------------------------------------
+    def _equity(self) -> float:
+        """Current account value, cached 30s. 0.0 if unavailable."""
+        now = time.time()
+        ts, val = self._equity_cache
+        if now - ts < 30 and val > 0:
+            return val
+        state = with_retry(
+            lambda: self.xc.info.user_state(self.xc.account_address),
+            "user_state", tries=2)
+        if not state:
+            return val  # stale value better than nothing
+        eq = float(state.get("marginSummary", {}).get("accountValue", 0) or 0)
+        self._equity_cache = (now, eq)
+        return eq
+
+    def record_day_open_equity(self, equity: float):
+        """Set the daily drawdown baseline (called at UTC midnight rollover)."""
+        self.day_open_equity = equity
+        self._day_anchor = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        self.db.set_state("risk_day_open_equity", str(equity))
+        self.db.set_state("risk_day_anchor", self._day_anchor)
+        if self.state == BotState.MANAGING:
+            self._set_state(BotState.ACTIVE, "new trading day")
+        log.info("day-open equity baseline set: %.2f", equity)
+
+    def _roll_anchors(self, equity: float):
+        if equity <= 0:
+            return
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        week = datetime.now(timezone.utc).strftime("%G-%V")
+        if self._day_anchor != today or self.day_open_equity <= 0:
+            self.record_day_open_equity(equity)
+        if self._week_anchor != week or self.week_open_equity <= 0:
+            self.week_open_equity = equity
+            self._week_anchor = week
+            self.db.set_state("risk_week_open_equity", str(equity))
+            self.db.set_state("risk_week_anchor", week)
+            log.info("week-open equity baseline set: %.2f", equity)
+
+    # ------------------------------------------------------------------
+    # Layer 3 detectors
+    # ------------------------------------------------------------------
+    def _cascade_triggered(self, coin: str) -> bool:
+        ctx = self.buf.ctx.get(coin) or {}
+        oi = float(ctx.get("open_interest") or 0)
+        px = self.buf.mid(coin) or float(ctx.get("mark_px") or 0)
+        if oi <= 0 or px <= 0:
+            return False
+        now = time.time()
+        hist = self._oi_hist[coin]
+        hist.append((now, oi, px))
+        cutoff = now - self.cascade_window_minutes * 60
+        in_win = [e for e in hist if e[0] >= cutoff]
+        if len(in_win) < 2:
+            return False
+        _, oi0, px0 = in_win[0]
+        oi_drop = (oi0 - oi) / oi0 if oi0 > 0 else 0.0
+        px_move = abs(px - px0) / px0 if px0 > 0 else 0.0
+        if oi_drop > self.cascade_oi_drop_pct and px_move > self.cascade_price_move_pct:
+            log.error("CASCADE on %s: OI -%.1f%%, price %.1f%% in %dmin",
+                      coin, oi_drop * 100, px_move * 100,
+                      self.cascade_window_minutes)
+            return True
+        return False
+
+    def _update_funding_halts(self, coin: str):
+        ctx = self.buf.ctx.get(coin) or {}
+        funding = ctx.get("funding")
+        if funding is None:
+            return
+        rate_8h = float(funding) * 8
+        if rate_8h > self.extreme_funding_long_halt:
+            if coin not in self._long_halt:
+                log.warning("extreme +funding on %s (%.5f/8h) — longs halted",
+                            coin, rate_8h)
+            self._long_halt.add(coin)
+        else:
+            self._long_halt.discard(coin)
+        if rate_8h < self.extreme_funding_short_halt:
+            if coin not in self._short_halt:
+                log.warning("extreme -funding on %s (%.5f/8h) — shorts halted",
+                            coin, rate_8h)
+            self._short_halt.add(coin)
+        else:
+            self._short_halt.discard(coin)
+
+    def _update_flash_pause(self, coin: str):
+        candles = self.buf.latest_candles(coin, "1m", 2)
+        if not candles:
+            return
+        cd = candles[-1]
+        o, c = float(cd["o"]), float(cd["c"])
+        if o <= 0:
+            return
+        move = abs(c - o) / o
+        if move > self.flash_crash_candle_pct:
+            until = float(cd["T"]) / 1000 + 2 * 60  # pause for 2 more 1m candles
+            if until > self._flash_pause_until.get(coin, 0):
+                self._flash_pause_until[coin] = until
+                log.warning("flash move %.1f%% on %s — entries paused 2 candles",
+                            move * 100, coin)
+
+    # ------------------------------------------------------------------
+    # Layer 4
+    # ------------------------------------------------------------------
+    def heartbeat_ok(self) -> bool:
+        try:
+            raw = Path(self.cfg.heartbeat_path).read_text().strip()
+            age = time.time() - float(raw)
+        except Exception:
+            return False
+        return age <= 3 * self.cfg.heartbeat_interval
+
+    # ------------------------------------------------------------------
+    # main guard pass
+    # ------------------------------------------------------------------
+    def check(self) -> BotState:
+        """Run all Layer 1/3/4 guards. Update self.state. Return current state."""
+        now = time.time()
+        equity = self._equity()
+        self._roll_anchors(equity)
+
+        # timed lockouts hold until expiry
+        if self.state == BotState.HALTED:
+            if now < self._halted_until:
+                return self.state
+            self._set_state(BotState.ACTIVE, "halt window expired")
+        if self.state == BotState.COOLDOWN:
+            if now < self._cooldown_until:
+                return self.state
+            self._set_state(BotState.ACTIVE, "cooldown expired")
+
+        # Layer 4: feed staleness
+        if self.buf.seconds_since_msg() > self.cfg.stale_feed_seconds:
+            self._set_state(BotState.RECONNECTING, "stale market data feed")
+            return self.state
+        if self.state == BotState.RECONNECTING:
+            self._set_state(BotState.ACTIVE, "feed recovered")
+
+        if not self.heartbeat_ok():
+            log.warning("heartbeat file stale/missing at %s",
+                        self.cfg.heartbeat_path)
+
+        # Layer 1: account drawdowns
+        if equity > 0 and self.day_open_equity > 0:
+            dd = 1 - equity / self.day_open_equity
+            if dd >= self.severe_drawdown_limit:
+                self._close_all(f"severe daily drawdown {dd:.1%}")
+                self._halt(self._next_utc_midnight(),
+                           f"severe daily drawdown {dd:.1%}")
+                return self.state
+            if dd >= self.daily_drawdown_limit and self.state == BotState.ACTIVE:
+                self._set_state(BotState.MANAGING,
+                                f"daily drawdown {dd:.1%} — no new entries")
+
+        # Layer 3: weekly drawdown -> cooldown
+        if equity > 0 and self.week_open_equity > 0:
+            wdd = 1 - equity / self.week_open_equity
+            if wdd >= self.weekly_drawdown_limit:
+                self._cooldown(now + self.cooldown_hours * 3600,
+                               f"weekly drawdown {wdd:.1%}")
+                return self.state
+
+        # Layer 3: per-coin kill switches
+        for coin in self.buf.coins:
+            if self._cascade_triggered(coin):
+                self._close_all(f"liquidation cascade on {coin}")
+                self._halt(now + self.cascade_halt_hours * 3600,
+                           f"cascade on {coin}")
+                return self.state
+            self._update_funding_halts(coin)
+            self._update_flash_pause(coin)
+
+        return self.state
+
+    # ------------------------------------------------------------------
+    # Layer 1: pre-trade gate
+    # ------------------------------------------------------------------
+    def can_open(self, coin: str, direction: str, confidence: float,
+                 model_agreement: int, leverage: float) -> tuple[bool, str]:
+        """Returns (allowed, reason). Checks all pre-trade guards."""
+        if self.state != BotState.ACTIVE:
+            return False, f"state={self.state.value}"
+        if direction not in ("LONG", "SHORT"):
+            return False, f"no tradeable direction ({direction})"
+        if confidence < self.min_confidence:
+            return False, (f"confidence {confidence:.2f} < "
+                           f"{self.min_confidence:.2f}")
+        if model_agreement < self.min_model_agreement:
+            return False, (f"model agreement {model_agreement} < "
+                           f"{self.min_model_agreement}")
+        if direction == "LONG" and coin in self._long_halt:
+            return False, "extreme positive funding — longs halted"
+        if direction == "SHORT" and coin in self._short_halt:
+            return False, "extreme negative funding — shorts halted"
+        if time.time() < self._flash_pause_until.get(coin, 0):
+            return False, "flash-crash pause active"
+
+        positions = with_retry(self.xc.positions, "positions") or []
+        if len(positions) >= self.max_concurrent_positions:
+            return False, (f"max concurrent positions "
+                           f"({self.max_concurrent_positions}) reached")
+        per_sym = sum(1 for p in positions
+                      if p.get("position", {}).get("coin") == coin)
+        if per_sym >= self.max_per_symbol:
+            return False, f"already holding {coin}"
+
+        book = self.buf.books.get(coin)
+        if not book or not book.get("bids") or not book.get("asks"):
+            return False, "no orderbook"
+        bid, ask = book["bids"][0][0], book["asks"][0][0]
+        mid = (bid + ask) / 2
+        if mid <= 0:
+            return False, "bad mid price"
+        spread = (ask - bid) / mid
+        if spread > self.max_spread_pct:
+            return False, f"spread {spread:.4%} > {self.max_spread_pct:.4%}"
+
+        if leverage <= 0:
+            return False, "non-positive leverage"
+        return True, "OK"
+
+    def clamp_leverage(self, requested: float) -> float:
+        """Return min(requested, max_leverage)."""
+        return min(requested, self.max_leverage)
+
+    # ------------------------------------------------------------------
+    # Layer 2: stops & targets
+    # ------------------------------------------------------------------
+    def calc_sl_tp(self, coin: str, entry_px: float, is_long: bool,
+                   atr: float) -> tuple[float, float]:
+        """Returns (stop_loss_px, take_profit_px). SL at 1.5*ATR, TP at 2R."""
+        r = atr * self.atr_sl_multiplier
+        if is_long:
+            return entry_px - r, entry_px + 2 * r
+        return entry_px + r, entry_px - 2 * r
+
+    def register_entry(self, coin: str, entry_px: float, sl: float, tp: float,
+                       is_long: bool, hold_hours: float | None = None):
+        """Seed the in-trade tracker right after an order fills, so SL/TP/
+        trailing/expiry are enforced from the first tick."""
+        self._pos_track[coin] = {
+            "entry_px": entry_px,
+            "sl": sl,
+            "tp": tp,
+            "is_long": is_long,
+            "opened_ts": time.time(),
+            "r_px": abs(entry_px - sl),
+            "trailing": False,
+            "max_hold_s": (hold_hours or self.max_hold_hours_scalp) * 3600,
+        }
+
+    def check_open_positions(self, positions: list) -> list[dict]:
+        """Check all open positions against in-trade guards.
+        Returns list of actions: [{"coin":str,"action":"CLOSE"|"UPDATE_SL",
+        "new_sl":float,"reason":str}]. UPDATE_SL is already applied to the
+        internal tracker; callers act on CLOSE."""
+        actions: list[dict] = []
+        equity = self._equity()
+        now = time.time()
+        seen: set[str] = set()
+
+        for p in positions:
+            pos = p.get("position") or {}
+            coin = pos.get("coin")
+            if not coin:
+                continue
+            szi = float(pos.get("szi") or 0)
+            if szi == 0:
+                continue
+            seen.add(coin)
+            is_long = szi > 0
+            entry = float(pos.get("entryPx") or 0)
+            upnl = float(pos.get("unrealizedPnl") or 0)
+
+            tr = self._pos_track.get(coin)
+            if tr is None or tr["is_long"] != is_long:
+                # position not opened through this process — adopt it
+                atr = atr_from_candles(self.buf.latest_candles(coin, "1m", 60))
+                if not atr or entry <= 0:
+                    continue
+                sl, tp = self.calc_sl_tp(coin, entry, is_long, atr)
+                self.register_entry(coin, entry, sl, tp, is_long)
+                tr = self._pos_track[coin]
+                log.info("adopted untracked %s position: entry=%.4f sl=%.4f "
+                         "tp=%.4f", coin, entry, sl, tp)
+
+            ctx = self.buf.ctx.get(coin) or {}
+            mid = self.buf.mid(coin) or float(ctx.get("mark_px") or 0) or entry
+
+            # hard $ loss floors (account-relative)
+            if equity > 0 and upnl <= -self.emergency_loss_pct * equity:
+                actions.append({"coin": coin, "action": "CLOSE",
+                                "reason": f"EMERGENCY loss {upnl:.2f} "
+                                          f"<= -{self.emergency_loss_pct:.0%} equity"})
+                continue
+            if equity > 0 and upnl <= -self.max_loss_per_trade_pct * equity:
+                actions.append({"coin": coin, "action": "CLOSE",
+                                "reason": f"max per-trade loss {upnl:.2f}"})
+                continue
+
+            # stop loss / take profit
+            hit_sl = mid <= tr["sl"] if is_long else mid >= tr["sl"]
+            hit_tp = mid >= tr["tp"] if is_long else mid <= tr["tp"]
+            if hit_sl:
+                label = "trailing stop" if tr["trailing"] else "stop loss"
+                actions.append({"coin": coin, "action": "CLOSE",
+                                "reason": f"{label} @ {tr['sl']:.4f}"})
+                continue
+            if hit_tp:
+                actions.append({"coin": coin, "action": "CLOSE",
+                                "reason": f"take profit @ {tr['tp']:.4f}"})
+                continue
+
+            # time expiry
+            if now - tr["opened_ts"] > tr["max_hold_s"]:
+                actions.append({"coin": coin, "action": "CLOSE",
+                                "reason": "max hold time expired"})
+                continue
+
+            # trailing stop: activate at >= 1.5R unrealized, trail at 1*ATR
+            r_px = tr["r_px"]
+            if r_px > 0:
+                unreal_r = ((mid - tr["entry_px"]) if is_long
+                            else (tr["entry_px"] - mid)) / r_px
+                if unreal_r >= self.trail_activation_r:
+                    atr = (atr_from_candles(
+                        self.buf.latest_candles(coin, "1m", 60))
+                        or r_px / self.atr_sl_multiplier)
+                    new_sl = (mid - atr * self.atr_trail_multiplier if is_long
+                              else mid + atr * self.atr_trail_multiplier)
+                    improved = (new_sl > tr["sl"]) if is_long else (new_sl < tr["sl"])
+                    if improved:
+                        tr["sl"] = new_sl
+                        tr["trailing"] = True
+                        actions.append({"coin": coin, "action": "UPDATE_SL",
+                                        "new_sl": new_sl,
+                                        "reason": f"trailing @ {unreal_r:.2f}R"})
+
+        # drop trackers for positions that no longer exist
+        for coin in list(self._pos_track):
+            if coin not in seen:
+                del self._pos_track[coin]
+        return actions
+
+    # ------------------------------------------------------------------
+    # manual controls (dashboard)
+    # ------------------------------------------------------------------
+    def manual_halt(self):
+        """Emergency stop: close everything, hold HALTED until manual resume."""
+        self._close_all("manual halt from dashboard")
+        self._halt(time.time() + 365 * 86_400, "manual halt from dashboard")
+
+    def manual_resume(self):
+        if self.state in (BotState.HALTED, BotState.COOLDOWN):
+            self._halted_until = 0.0
+            self._cooldown_until = 0.0
+            self.db.set_state("risk_halted_until", "0")
+            self.db.set_state("risk_cooldown_until", "0")
+            self._set_state(BotState.ACTIVE, "manual resume from dashboard")
+
+    # ------------------------------------------------------------------
+    # emergency close
+    # ------------------------------------------------------------------
+    def _close_all(self, reason: str):
+        log.error("CLOSING ALL POSITIONS: %s", reason)
+        with_retry(self.xc.cancel_all, "cancel_all")
+        positions = with_retry(self.xc.positions, "positions") or []
+        for p in positions:
+            pos = p.get("position") or {}
+            coin = pos.get("coin")
+            if not coin:
+                continue
+            side = "LONG" if float(pos.get("szi") or 0) > 0 else "SHORT"
+            res = with_retry(lambda c=coin: self.xc.market_close(c),
+                             f"market_close({coin})")
+            self.db.log_trade(coin, side, "CLOSE",
+                              size=abs(float(pos.get("szi") or 0)),
+                              status="ok" if res else "error",
+                              note=f"risk: {reason}")
+        self._pos_track.clear()

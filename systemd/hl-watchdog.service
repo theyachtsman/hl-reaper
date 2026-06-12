@@ -1,0 +1,15 @@
+[Unit]
+Description=HL Reaper watchdog (dead man's switch — flattens on stale heartbeat)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=veilcerpin
+WorkingDirectory=/opt/hl-reaper
+ExecStart=/opt/hl-reaper/venv/bin/python /opt/hl-reaper/scripts/run_watchdog.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

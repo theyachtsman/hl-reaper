@@ -4,6 +4,7 @@ Signs with the API/agent wallet (HL_REAPER_SECRET) on behalf of the main
 account_address. Handles size/price rounding to asset precision.
 """
 import math
+import time
 
 import eth_account
 from hyperliquid.exchange import Exchange
@@ -77,6 +78,81 @@ class ExchangeClient:
     def market_close(self, coin: str) -> dict:
         log.info("MARKET CLOSE %s", coin)
         return self.exchange.market_close(coin)
+
+    def best_px(self, coin: str, is_buy: bool) -> float:
+        """Best bid (buy) / best ask (sell) from a fresh L2 snapshot."""
+        book = self.info.l2_snapshot(coin)
+        side = book["levels"][0 if is_buy else 1]
+        return float(side[0]["px"])
+
+    def _order_status(self, oid: int) -> dict | None:
+        try:
+            r = self.info.query_order_by_oid(self.account_address, oid)
+            return r.get("order") if isinstance(r, dict) else None
+        except Exception as e:
+            log.debug("query_order_by_oid(%s) failed: %s", oid, e)
+            return None
+
+    def try_limit_entry(self, coin: str, is_buy: bool, usd_size: float,
+                        timeout_s: float = 30.0,
+                        px: float | None = None) -> dict:
+        """Maker (post-only) entry: rest at best bid/ask, poll until filled
+        or timeout, cancel the remainder. Maker fees are a fraction of
+        taker — with near-zero gross edge the fee side decides the sign.
+
+        Returns {"status": "filled"|"partial"|"timeout"|"rejected"|"error",
+                 "avg_px": float|None, "filled_sz": float}."""
+        if px is None:
+            px = self.best_px(coin, is_buy)
+        px = self.round_px(px)
+        sz = self.round_sz(coin, usd_size / px)
+        log.info("MAKER %s %s sz=%s px=%s (~$%.2f, timeout %.0fs)",
+                 "BUY" if is_buy else "SELL", coin, sz, px, sz * px,
+                 timeout_s)
+        res = self.exchange.order(
+            coin, is_buy, sz, px, {"limit": {"tif": "Alo"}})
+        try:
+            st = res["response"]["data"]["statuses"][0]
+        except Exception:
+            return {"status": "error", "avg_px": None, "filled_sz": 0.0,
+                    "raw": res}
+        if "error" in st:
+            # post-only that would cross is rejected — caller retries later
+            return {"status": "rejected", "avg_px": None, "filled_sz": 0.0,
+                    "reason": st["error"]}
+        if "filled" in st:
+            f = st["filled"]
+            return {"status": "filled", "avg_px": float(f["avgPx"]),
+                    "filled_sz": float(f["totalSz"])}
+        oid = (st.get("resting") or {}).get("oid")
+        if oid is None:
+            return {"status": "error", "avg_px": None, "filled_sz": 0.0,
+                    "raw": res}
+
+        deadline = time.time() + timeout_s
+        filled_sz = 0.0
+        while time.time() < deadline:
+            time.sleep(2)
+            o = self._order_status(oid)
+            if not o:
+                continue
+            status = o.get("status", "")
+            inner = o.get("order") or {}
+            orig = float(inner.get("origSz") or sz)
+            remaining = float(inner.get("sz") or 0)
+            filled_sz = max(filled_sz, orig - remaining)
+            if status == "filled" or (status == "open" and remaining == 0):
+                return {"status": "filled", "avg_px": px, "filled_sz": orig}
+            if status in ("canceled", "rejected", "marginCanceled"):
+                break
+        try:
+            self.cancel(coin, oid)
+        except Exception as e:
+            log.warning("cancel after timeout failed for %s oid=%s: %s",
+                        coin, oid, e)
+        if filled_sz > 0:
+            return {"status": "partial", "avg_px": px, "filled_sz": filled_sz}
+        return {"status": "timeout", "avg_px": None, "filled_sz": 0.0}
 
     def cancel(self, coin: str, oid: int) -> dict:
         log.info("CANCEL %s oid=%s", coin, oid)
