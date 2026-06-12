@@ -2538,3 +2538,14 @@ Killed
 
  ✓ Starting...
  ✓ Ready in 291ms
+Killed
+
+> hl-reaper-dashboard@1.0.0 start
+> next start -p 8888 -H 0.0.0.0
+
+  ▲ Next.js 14.2.29
+  - Local:        http://localhost:8888
+  - Network:      http://0.0.0.0:8888
+
+ ✓ Starting...
+ ✓ Ready in 332ms

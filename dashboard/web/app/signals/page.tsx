@@ -166,18 +166,7 @@ export default function SignalsPage() {
             ) : (
               /* ALL view: compact chips */
               <div className="flex flex-wrap gap-2">
-                {tickets.map((t) => (
-                  <span key={t.model}
-                    className="inline-flex items-center gap-1.5 border border-edge rounded-full px-2.5 py-1 text-xs mono">
-                    <span className="text-slate-400">{MODEL_ABBR[t.model] ?? t.model}</span>
-                    <span className={dirColor(t.direction)}>
-                      {dirArrow(t.direction)} {t.direction === "FLAT" ? "" : t.direction}
-                    </span>
-                    {t.confidence > 0 && (
-                      <span className="text-slate-500">{Number(t.confidence).toFixed(2)}</span>
-                    )}
-                  </span>
-                ))}
+                {tickets.map((t) => <TicketChip key={t.model} t={t} />)}
               </div>
             )}
           </div>
