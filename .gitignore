@@ -5,3 +5,6 @@ data/recorded/l2_BTC_20260612.jsonl.gz
 data/recorded/l2_DOGE_20260612.jsonl.gz
 data/recorded/l2_ETH_20260612.jsonl.gz
 data/recorded/l2_SOL_20260612.jsonl.gz
+data/hl_reaper.db-shm
+data/hl_reaper.db-wal
+data/recorded/l2_ETH_20260612.jsonl.gz
