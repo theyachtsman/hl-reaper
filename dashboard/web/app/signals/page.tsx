@@ -28,6 +28,42 @@ function dirArrow(d: string) {
   return "·";
 }
 
+const REGIMES = ["TRENDING_UP", "TRENDING_DOWN", "RANGING", "HIGH_VOL", "UNKNOWN"];
+
+/** compact, human reason for why a model is abstaining */
+function flatReason(meta: any): string {
+  const r = meta?.reason ?? meta?.zone ?? meta?.band ?? "";
+  return String(r).replace(/_/g, " ").slice(0, 18);
+}
+
+function TicketChip({ t }: { t: any }) {
+  const isRegime = REGIMES.includes(t.direction);
+  return (
+    <span
+      title={t.meta ? JSON.stringify(t.meta) : ""}
+      className="inline-flex items-center gap-1.5 border border-edge rounded-full px-2.5 py-1 text-xs mono">
+      <span className="text-slate-400">{MODEL_ABBR[t.model] ?? t.model}</span>
+      {isRegime ? (
+        <span className="text-sky-300">{t.direction}</span>
+      ) : t.direction === "FLAT" ? (
+        <>
+          <span className="text-slate-500">FLAT</span>
+          {flatReason(t.meta) && (
+            <span className="text-slate-600 text-[10px]">{flatReason(t.meta)}</span>
+          )}
+        </>
+      ) : (
+        <>
+          <span className={dirColor(t.direction)}>
+            {dirArrow(t.direction)} {t.direction}
+          </span>
+          <span className="text-slate-500">{Number(t.confidence).toFixed(2)}</span>
+        </>
+      )}
+    </span>
+  );
+}
+
 function AggCard({ agg }: { agg: any }) {
   return (
     <div className="card border-glow/30">
