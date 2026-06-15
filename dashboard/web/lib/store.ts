@@ -5,6 +5,7 @@ export type Status = {
   network: string;
   risk_state: string;
   risk_reason: string | null;
+  trading_mode?: string;
   bot_status: string | null;
   phase: string | null;
   control_request: string | null;

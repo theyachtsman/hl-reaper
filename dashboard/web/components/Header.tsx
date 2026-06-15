@@ -5,12 +5,14 @@ import { useEffect } from "react";
 import clsx from "clsx";
 import { api } from "@/lib/api";
 import { useStatusStore } from "@/lib/store";
+import ModeBadge from "./ModeBadge";
 import StateBadge from "./StateBadge";
 
 const NAV = [
   { href: "/", label: "Live" },
   { href: "/signals", label: "Signals" },
   { href: "/risk", label: "Risk" },
+  { href: "/history", label: "History" },
   { href: "/controls", label: "Controls" },
 ];
 
@@ -56,6 +58,7 @@ export default function Header() {
               <span className={hbOk ? "text-emerald-400" : "text-red-400"}>
                 ♥ {status.heartbeat_age_s != null ? `${status.heartbeat_age_s}s` : "—"}
               </span>
+              <ModeBadge mode={status.trading_mode} />
               <StateBadge state={status.risk_state} />
             </>
           )}

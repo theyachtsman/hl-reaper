@@ -1,0 +1,101 @@
+Microstructure signal-quality backtest — coins=['BTC', 'ETH', 'SOL', 'ARB', 'AVAX', 'DOGE', 'WIF']
+eval stride 30s · horizons [1, 5, 15]min · recorded data in /opt/hl-reaper/data/recorded
+
+########################################################################
+# BTC  (84705 L2 snapshots)
+########################################################################
+
+=== BTC — OrderbookImbalanceModel (FLAT on 1376 evals) ===
+conf_bucket       n    hit_1m    dirret_1m    hit_5m    dirret_5m   hit_15m   dirret_15m
+0.50-0.70      904      0.46      0.0017%      0.50      0.0020%      0.49     -0.0013%
+0.70-1.01     3143      0.56      0.0067%      0.54      0.0092%      0.54      0.0126%
+
+=== BTC — LiquidationHeatmapModel (FLAT on 5425 evals) ===
+  no directional signals emitted
+
+########################################################################
+# ETH  (84792 L2 snapshots)
+########################################################################
+
+=== ETH — OrderbookImbalanceModel (FLAT on 4177 evals) ===
+conf_bucket       n    hit_1m    dirret_1m    hit_5m    dirret_5m   hit_15m   dirret_15m
+0.50-0.70     1001      0.54      0.0068%      0.54      0.0077%      0.51     -0.0038%
+0.70-1.01      253      0.54      0.0083%      0.54      0.0037%      0.46     -0.0137%
+
+=== ETH — LiquidationHeatmapModel (FLAT on 5432 evals) ===
+  no directional signals emitted
+
+########################################################################
+# SOL  (84727 L2 snapshots)
+########################################################################
+
+=== SOL — OrderbookImbalanceModel (FLAT on 2199 evals) ===
+conf_bucket       n    hit_1m    dirret_1m    hit_5m    dirret_5m   hit_15m   dirret_15m
+0.50-0.70     1381      0.51      0.0038%      0.52      0.0044%      0.49      0.0022%
+0.70-1.01     1845      0.55      0.0055%      0.49     -0.0014%      0.47     -0.0214%
+
+=== SOL — LiquidationHeatmapModel (FLAT on 5427 evals) ===
+  no directional signals emitted
+
+########################################################################
+# ARB  (84663 L2 snapshots)
+########################################################################
+
+=== ARB — OrderbookImbalanceModel (FLAT on 3658 evals) ===
+conf_bucket       n    hit_1m    dirret_1m    hit_5m    dirret_5m   hit_15m   dirret_15m
+0.50-0.70     1317      0.50      0.0035%      0.51      0.0020%      0.50     -0.0025%
+0.70-1.01      448      0.48      0.0064%      0.49      0.0012%      0.48     -0.0155%
+
+=== ARB — LiquidationHeatmapModel (FLAT on 5424 evals) ===
+  no directional signals emitted
+
+########################################################################
+# AVAX  (84729 L2 snapshots)
+########################################################################
+
+=== AVAX — OrderbookImbalanceModel (FLAT on 3008 evals) ===
+conf_bucket       n    hit_1m    dirret_1m    hit_5m    dirret_5m   hit_15m   dirret_15m
+0.50-0.70     1654      0.51      0.0020%      0.48      0.0017%      0.49     -0.0040%
+0.70-1.01      765      0.57      0.0102%      0.54      0.0099%      0.52      0.0199%
+
+=== AVAX — LiquidationHeatmapModel (FLAT on 5429 evals) ===
+  no directional signals emitted
+
+########################################################################
+# DOGE  (84273 L2 snapshots)
+########################################################################
+
+=== DOGE — OrderbookImbalanceModel (FLAT on 2467 evals) ===
+conf_bucket       n    hit_1m    dirret_1m    hit_5m    dirret_5m   hit_15m   dirret_15m
+0.50-0.70     1491      0.53      0.0047%      0.52      0.0065%      0.51      0.0168%
+0.70-1.01     1440      0.57      0.0061%      0.54      0.0114%      0.51      0.0221%
+
+=== DOGE — LiquidationHeatmapModel (FLAT on 5399 evals) ===
+  no directional signals emitted
+
+########################################################################
+# WIF  (123427 L2 snapshots)
+########################################################################
+
+=== WIF — OrderbookImbalanceModel (FLAT on 3652 evals) ===
+conf_bucket       n    hit_1m    dirret_1m    hit_5m    dirret_5m   hit_15m   dirret_15m
+0.50-0.70     2444      0.49      0.0017%      0.53      0.0035%      0.54      0.0138%
+0.70-1.01     1785      0.52      0.0055%      0.52      0.0061%      0.51      0.0128%
+
+=== WIF — LiquidationHeatmapModel (FLAT on 7882 evals) ===
+  no directional signals emitted
+
+========================================================================
+INTERPRETATION
+========================================================================
+* hit_rate ~0.50 across all buckets regardless of confidence -> no
+  signal; extends the Phase 4.6 'candle signal is neutral' finding to
+  microstructure.
+* hit_rate climbing meaningfully >0.50 in higher-conf buckets AND
+  avg dir_return positive (model's predicted direction) -> real signal,
+  worth weighting up.
+* dir_return is the forward mid move signed toward the model's call;
+  positive = right on average. It is the metric that matters most
+  (hit_rate ignores magnitude).
+* Any bucket with n<30 in the highest-confidence row is too small to
+  conclude — flagged below.

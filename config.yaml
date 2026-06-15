@@ -6,7 +6,7 @@ network: testnet            # testnet | mainnet
 # acts on behalf of this account.
 account_address: "0xBC6F4A41272a2E55B488380498E1e3aE569B08b0"
 
-coins: ["BTC", "ETH", "SOL"]
+coins: ["BTC", "ETH", "SOL", "ARB", "AVAX", "DOGE", "WIF"]
 candle_intervals: ["1m", "5m", "1h"]
 candle_buffer_size: 500     # candles kept per coin/interval
 
@@ -60,6 +60,22 @@ risk:
   weekly_drawdown_limit: 0.10
   cooldown_hours: 48
 
+# ---- Phase 8.6: cascade bounce (event-driven track, separate from ensemble)
+cascade_bounce:
+  enabled: false
+  allocation_pct: 0.12          # max bounce position = 12% of equity
+  max_hold_minutes: 20          # hard time exit (enforced by RiskManager)
+  maker_timeout_seconds: 5      # maker-then-taker: short post-only attempt...
+  taker_fallback: true          # ...then take the market (speed beats fees here)
+  min_cascade_move_pct: 0.015   # 1.5% move in window = cascade candidate
+  cascade_window_minutes: 5
+  min_volume_mult: 3.0          # window volume vs 1h baseline
+  stabilization_bars: 2         # 1m bars without a new extreme -> enter
+  cascade_stale_minutes: 15     # still falling after this -> abandon episode
+  retrigger_cooldown_minutes: 30
+  profit_target_pct: 0.010      # fast exit: +1.0% TP
+  stop_pct: 0.0075              # -0.75% SL (beyond the extreme = thesis dead)
+
 # ---- Phase 3: model settings ----
 models:
   ml_model_dir: "models/"
@@ -69,9 +85,13 @@ models:
 
 # ---- Phase 4/5: trading loop ----
 trading:
+  # conservative = mainnet-safe gates from the risk section (0.62 / 5 / 3)
+  # paper_aggressive = TESTNET ONLY: 0.35 confidence, 3-model quorum,
+  #                    5 concurrent positions — for data collection
+  mode: "paper_aggressive"
   loop_interval_seconds: 10
   default_usd_size: 50
   default_leverage: 3.0
-  coins_active: ["BTC", "ETH", "SOL"]
+  coins_active: ["BTC", "ETH", "SOL", "ARB", "AVAX", "DOGE", "WIF"]
   entry_style: "maker"        # maker = post-only limit, skip if unfilled; taker = market
   entry_timeout_seconds: 30

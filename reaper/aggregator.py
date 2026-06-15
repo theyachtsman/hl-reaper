@@ -14,9 +14,15 @@ BASE_WEIGHTS = {
     "RegimeDetectorModel":      0.00,  # meta-model, used for routing only
     "MeanReversionModel":       0.12,
     "FundingRateModel":         0.12,
-    "OrderbookImbalanceModel":  0.15,
+    # OB carries LiqHeatmap's freed 0.11 (0.15 -> 0.26): only model with a
+    # measured positive directional tilt (docs/microstructure_backtest_report.md
+    # — 1m hit 0.54-0.57, positive on 7/7 coins, holds to 15m on BTC/AVAX/DOGE).
+    "OrderbookImbalanceModel":  0.26,
     "VWAPModel":                0.12,
-    "LiquidationHeatmapModel":  0.11,
+    # zeroed 2026-06-14: 100% FLAT across all 7 coins on ~4 days recorded live
+    # L2 — structurally inert on normal tape. Model still computes/logs (its
+    # OI-distribution logic may feed Phase 8.6 cascade-v2); just no vote weight.
+    "LiquidationHeatmapModel":  0.00,
 }
 
 REGIME_NAMES = ("TRENDING_UP", "TRENDING_DOWN", "RANGING", "HIGH_VOL")

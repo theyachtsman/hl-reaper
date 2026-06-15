@@ -2,7 +2,9 @@
 import { usePoll, fmtUsd, fmtPct, fmtTs } from "@/lib/api";
 import { useStatusStore } from "@/lib/store";
 import AnalysisCore from "@/components/AnalysisCore";
+import ProfitDeck from "@/components/ProfitDeck";
 import EquityChart from "@/components/EquityChart";
+import ModeBadge from "@/components/ModeBadge";
 import StateBadge from "@/components/StateBadge";
 
 export default function LivePage() {
@@ -23,7 +25,10 @@ export default function LivePage() {
       <div className="grid md:grid-cols-4 gap-4">
         <div className="card">
           <div className="label">Bot State</div>
-          <div className="mt-2"><StateBadge state={status?.risk_state ?? "UNKNOWN"} large /></div>
+          <div className="mt-2 flex flex-wrap items-center gap-2">
+            <StateBadge state={status?.risk_state ?? "UNKNOWN"} large />
+            <ModeBadge mode={status?.trading_mode} large />
+          </div>
           {status?.risk_reason && (
             <div className="text-xs text-slate-400 mt-2">{status.risk_reason}</div>
           )}
@@ -54,6 +59,8 @@ export default function LivePage() {
           </div>
         </div>
       </div>
+
+      <ProfitDeck />
 
       <AnalysisCore />
 

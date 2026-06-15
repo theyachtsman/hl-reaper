@@ -7,6 +7,7 @@ const TABS = [
   { href: "/", label: "Live", icon: "📈" },
   { href: "/signals", label: "Signals", icon: "🎯" },
   { href: "/risk", label: "Risk", icon: "🛡️" },
+  { href: "/history", label: "History", icon: "📜" },
   { href: "/controls", label: "Controls", icon: "🎛️" },
 ];
 
@@ -15,7 +16,7 @@ export default function BottomNav() {
   const path = usePathname();
   return (
     <nav className="md:hidden fixed bottom-0 inset-x-0 z-20 bg-panel/95 backdrop-blur border-t border-edge pb-[env(safe-area-inset-bottom)]">
-      <div className="grid grid-cols-4">
+      <div className="grid grid-cols-5">
         {TABS.map((t) => (
           <Link
             key={t.href}

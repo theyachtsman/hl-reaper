@@ -1,0 +1,21 @@
+[Unit]
+Description=HL Reaper - Horizon Shadow Run (15m ATR1.5/RR2, paper only)
+After=network-online.target hl-reaper.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=veilcerpin
+WorkingDirectory=/opt/hl-reaper
+# Shadow run: NO orders. Same feed/models/aggregator/gate as the live bot, but
+# 15m-ATR x1.5 / 2R-TP / trail-1.5R / 8h-hold horizon. Writes only to its own
+# data/shadow.db (isolated from data/hl_reaper.db).
+ExecStart=/opt/hl-reaper/venv/bin/python /opt/hl-reaper/scripts/dry_run_horizon.py
+Restart=always
+RestartSec=10
+EnvironmentFile=/opt/hl-reaper/.env
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,415 @@
+{
+  "config": {
+    "coins": [
+      "BTC",
+      "ETH",
+      "SOL",
+      "ARB",
+      "AVAX",
+      "DOGE",
+      "WIF"
+    ],
+    "min_move": 0.015,
+    "vol_mult": 3.0,
+    "window": 5,
+    "stab_bars": 2,
+    "tp": 0.01,
+    "sl": 0.0075,
+    "max_hold": 20,
+    "json": "data/backtest_cascade_bounce_20260614.json"
+  },
+  "results": [
+    {
+      "fwd": {
+        "5": {
+          "mean_pct": -0.0752,
+          "hit_rate": 0.556,
+          "n": 18
+        },
+        "15": {
+          "mean_pct": 0.1802,
+          "hit_rate": 0.667,
+          "n": 18
+        },
+        "30": {
+          "mean_pct": 0.2466,
+          "hit_rate": 0.444,
+          "n": 18
+        },
+        "60": {
+          "mean_pct": 0.5672,
+          "hit_rate": 0.611,
+          "n": 18
+        }
+      },
+      "coin": "BTC",
+      "n_bars": 276480,
+      "days": 192.0,
+      "trades": 18,
+      "trades_per_week": 0.66,
+      "long": 8,
+      "short": 10,
+      "exit_reasons": {
+        "STOP": 8,
+        "TIME": 7,
+        "TP": 3
+      },
+      "avg_bars_held": 11.2,
+      "avg_cascade_move_pct": 2.05,
+      "gross": {
+        "net_sum_pct": -1.737,
+        "avg_pct": -0.0965,
+        "win_rate": 0.389,
+        "profit_factor": 0.75
+      },
+      "maker": {
+        "net_sum_pct": -2.547,
+        "avg_pct": -0.1415,
+        "win_rate": 0.389,
+        "profit_factor": 0.66
+      },
+      "taker": {
+        "net_sum_pct": -2.997,
+        "avg_pct": -0.1665,
+        "win_rate": 0.389,
+        "profit_factor": 0.61
+      }
+    },
+    {
+      "fwd": {
+        "5": {
+          "mean_pct": -0.0175,
+          "hit_rate": 0.526,
+          "n": 76
+        },
+        "15": {
+          "mean_pct": 0.0022,
+          "hit_rate": 0.526,
+          "n": 76
+        },
+        "30": {
+          "mean_pct": 0.2154,
+          "hit_rate": 0.526,
+          "n": 76
+        },
+        "60": {
+          "mean_pct": 0.2615,
+          "hit_rate": 0.605,
+          "n": 76
+        }
+      },
+      "coin": "ETH",
+      "n_bars": 276480,
+      "days": 192.0,
+      "trades": 76,
+      "trades_per_week": 2.77,
+      "long": 35,
+      "short": 41,
+      "exit_reasons": {
+        "STOP": 32,
+        "TP": 18,
+        "TIME": 26
+      },
+      "avg_bars_held": 11.3,
+      "avg_cascade_move_pct": 2.05,
+      "gross": {
+        "net_sum_pct": -3.0,
+        "avg_pct": -0.0395,
+        "win_rate": 0.434,
+        "profit_factor": 0.89
+      },
+      "maker": {
+        "net_sum_pct": -6.42,
+        "avg_pct": -0.0845,
+        "win_rate": 0.434,
+        "profit_factor": 0.77
+      },
+      "taker": {
+        "net_sum_pct": -8.32,
+        "avg_pct": -0.1095,
+        "win_rate": 0.421,
+        "profit_factor": 0.72
+      }
+    },
+    {
+      "fwd": {
+        "5": {
+          "mean_pct": -0.1278,
+          "hit_rate": 0.519,
+          "n": 79
+        },
+        "15": {
+          "mean_pct": -0.0752,
+          "hit_rate": 0.57,
+          "n": 79
+        },
+        "30": {
+          "mean_pct": 0.1358,
+          "hit_rate": 0.608,
+          "n": 79
+        },
+        "60": {
+          "mean_pct": 0.2261,
+          "hit_rate": 0.57,
+          "n": 79
+        }
+      },
+      "coin": "SOL",
+      "n_bars": 276480,
+      "days": 192.0,
+      "trades": 79,
+      "trades_per_week": 2.88,
+      "long": 38,
+      "short": 41,
+      "exit_reasons": {
+        "TIME": 29,
+        "TP": 19,
+        "STOP": 31
+      },
+      "avg_bars_held": 10.8,
+      "avg_cascade_move_pct": 2.13,
+      "gross": {
+        "net_sum_pct": 1.185,
+        "avg_pct": 0.015,
+        "win_rate": 0.506,
+        "profit_factor": 1.05
+      },
+      "maker": {
+        "net_sum_pct": -2.37,
+        "avg_pct": -0.03,
+        "win_rate": 0.494,
+        "profit_factor": 0.91
+      },
+      "taker": {
+        "net_sum_pct": -4.345,
+        "avg_pct": -0.055,
+        "win_rate": 0.481,
+        "profit_factor": 0.84
+      }
+    },
+    {
+      "fwd": {
+        "5": {
+          "mean_pct": -0.1566,
+          "hit_rate": 0.417,
+          "n": 115
+        },
+        "15": {
+          "mean_pct": -0.1431,
+          "hit_rate": 0.47,
+          "n": 115
+        },
+        "30": {
+          "mean_pct": -0.002,
+          "hit_rate": 0.539,
+          "n": 115
+        },
+        "60": {
+          "mean_pct": 0.1764,
+          "hit_rate": 0.574,
+          "n": 115
+        }
+      },
+      "coin": "ARB",
+      "n_bars": 276480,
+      "days": 192.0,
+      "trades": 115,
+      "trades_per_week": 4.19,
+      "long": 54,
+      "short": 61,
+      "exit_reasons": {
+        "STOP": 53,
+        "TIME": 33,
+        "TP": 29
+      },
+      "avg_bars_held": 10.7,
+      "avg_cascade_move_pct": 2.15,
+      "gross": {
+        "net_sum_pct": -3.656,
+        "avg_pct": -0.0318,
+        "win_rate": 0.452,
+        "profit_factor": 0.91
+      },
+      "maker": {
+        "net_sum_pct": -8.831,
+        "avg_pct": -0.0768,
+        "win_rate": 0.452,
+        "profit_factor": 0.8
+      },
+      "taker": {
+        "net_sum_pct": -11.706,
+        "avg_pct": -0.1018,
+        "win_rate": 0.443,
+        "profit_factor": 0.74
+      }
+    },
+    {
+      "fwd": {
+        "5": {
+          "mean_pct": -0.1495,
+          "hit_rate": 0.464,
+          "n": 69
+        },
+        "15": {
+          "mean_pct": -0.1852,
+          "hit_rate": 0.406,
+          "n": 69
+        },
+        "30": {
+          "mean_pct": -0.0493,
+          "hit_rate": 0.536,
+          "n": 69
+        },
+        "60": {
+          "mean_pct": 0.0241,
+          "hit_rate": 0.551,
+          "n": 69
+        }
+      },
+      "coin": "AVAX",
+      "n_bars": 276480,
+      "days": 192.0,
+      "trades": 69,
+      "trades_per_week": 2.52,
+      "long": 35,
+      "short": 34,
+      "exit_reasons": {
+        "TIME": 25,
+        "STOP": 35,
+        "TP": 9
+      },
+      "avg_bars_held": 11.3,
+      "avg_cascade_move_pct": 2.2,
+      "gross": {
+        "net_sum_pct": -13.672,
+        "avg_pct": -0.1981,
+        "win_rate": 0.348,
+        "profit_factor": 0.52
+      },
+      "maker": {
+        "net_sum_pct": -16.777,
+        "avg_pct": -0.2431,
+        "win_rate": 0.348,
+        "profit_factor": 0.46
+      },
+      "taker": {
+        "net_sum_pct": -18.502,
+        "avg_pct": -0.2681,
+        "win_rate": 0.348,
+        "profit_factor": 0.42
+      }
+    },
+    {
+      "fwd": {
+        "5": {
+          "mean_pct": -0.1208,
+          "hit_rate": 0.48,
+          "n": 98
+        },
+        "15": {
+          "mean_pct": -0.0618,
+          "hit_rate": 0.469,
+          "n": 98
+        },
+        "30": {
+          "mean_pct": 0.0736,
+          "hit_rate": 0.51,
+          "n": 98
+        },
+        "60": {
+          "mean_pct": 0.1738,
+          "hit_rate": 0.571,
+          "n": 98
+        }
+      },
+      "coin": "DOGE",
+      "n_bars": 276480,
+      "days": 192.0,
+      "trades": 98,
+      "trades_per_week": 3.57,
+      "long": 49,
+      "short": 49,
+      "exit_reasons": {
+        "TIME": 28,
+        "STOP": 53,
+        "TP": 17
+      },
+      "avg_bars_held": 10.3,
+      "avg_cascade_move_pct": 2.17,
+      "gross": {
+        "net_sum_pct": -15.621,
+        "avg_pct": -0.1594,
+        "win_rate": 0.357,
+        "profit_factor": 0.62
+      },
+      "maker": {
+        "net_sum_pct": -20.031,
+        "avg_pct": -0.2044,
+        "win_rate": 0.327,
+        "profit_factor": 0.54
+      },
+      "taker": {
+        "net_sum_pct": -22.481,
+        "avg_pct": -0.2294,
+        "win_rate": 0.327,
+        "profit_factor": 0.51
+      }
+    },
+    {
+      "fwd": {
+        "5": {
+          "mean_pct": -0.1339,
+          "hit_rate": 0.434,
+          "n": 198
+        },
+        "15": {
+          "mean_pct": -0.2455,
+          "hit_rate": 0.419,
+          "n": 198
+        },
+        "30": {
+          "mean_pct": -0.2071,
+          "hit_rate": 0.46,
+          "n": 198
+        },
+        "60": {
+          "mean_pct": -0.1427,
+          "hit_rate": 0.525,
+          "n": 198
+        }
+      },
+      "coin": "WIF",
+      "n_bars": 276480,
+      "days": 192.0,
+      "trades": 198,
+      "trades_per_week": 7.22,
+      "long": 93,
+      "short": 105,
+      "exit_reasons": {
+        "STOP": 109,
+        "TIME": 54,
+        "TP": 35
+      },
+      "avg_bars_held": 9.7,
+      "avg_cascade_move_pct": 2.28,
+      "gross": {
+        "net_sum_pct": -34.551,
+        "avg_pct": -0.1745,
+        "win_rate": 0.369,
+        "profit_factor": 0.59
+      },
+      "maker": {
+        "net_sum_pct": -43.461,
+        "avg_pct": -0.2195,
+        "win_rate": 0.364,
+        "profit_factor": 0.52
+      },
+      "taker": {
+        "net_sum_pct": -48.411,
+        "avg_pct": -0.2445,
+        "win_rate": 0.364,
+        "profit_factor": 0.48
+      }
+    }
+  ]
+}

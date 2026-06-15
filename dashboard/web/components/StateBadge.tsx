@@ -7,6 +7,7 @@ const COLORS: Record<string, string> = {
   HALTED: "bg-red-500/15 text-red-300 border-red-500/40",
   RECONNECTING: "bg-sky-500/15 text-sky-300 border-sky-500/40",
   COOLDOWN: "bg-violet-500/15 text-violet-300 border-violet-500/40",
+  CASCADE_BOUNCE_ACTIVE: "bg-fuchsia-500/15 text-fuchsia-300 border-fuchsia-500/40",
   DATA_ONLY: "bg-cyan-500/10 text-cyan-300 border-cyan-500/40",
   OFFLINE: "bg-red-500/10 text-red-400 border-red-500/60",
   UNKNOWN: "bg-slate-500/15 text-slate-300 border-slate-500/40",

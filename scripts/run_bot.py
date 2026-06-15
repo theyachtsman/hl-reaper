@@ -23,7 +23,9 @@ from reaper.data.websocket_feed import WebSocketFeed
 from reaper.db import DB
 from reaper.execution.exchange_client import ExchangeClient
 from reaper.logger import get_logger
+from reaper.data import liquidation_store
 from reaper.models import FLAT, LONG, atr_from_candles
+from reaper.models.cascade_bounce import CascadeBounceModel
 from reaper.models.funding_rate import FundingRateModel
 from reaper.models.liquidation_heatmap import LiquidationHeatmapModel
 from reaper.models.mean_reversion import MeanReversionModel
@@ -139,6 +141,26 @@ def main():
     aggregator = SignalAggregator()
     risk = RiskManager(cfg, buf, db, xc)
     signals = SignalWriter(cfg.db_path)
+    # publish the ACTIVE mode for the dashboard — source of truth is the
+    # running process, not the config file (which can change between restarts)
+    db.set_state("trading_mode", risk.mode)
+
+    # Phase 8.6: cascade bounce — event-driven track, separate from ensemble
+    cb_raw = (cfg._raw.get("cascade_bounce", {}) or {})
+    cb_enabled = bool(cb_raw.get("enabled", False))
+    cb_model = CascadeBounceModel(cb_raw)
+    cb_maker_timeout = float(cb_raw.get("maker_timeout_seconds", 5))
+    cb_taker_fallback = bool(cb_raw.get("taker_fallback", True))
+    cb_tp_pct = float(cb_raw.get("profit_target_pct", 0.010))
+    cb_sl_pct = float(cb_raw.get("stop_pct", 0.0075))
+    # survives restarts: if a bounce trade was open, pick it back up so the
+    # persisted CASCADE_BOUNCE_ACTIVE state can resolve back to ACTIVE
+    cb_coin: str | None = db.get_state("cascade_bounce_coin") or None
+    liq_conn = liquidation_store.connect() if cb_enabled else None
+    if cb_enabled:
+        log.info("cascade bounce track ENABLED — alloc %.0f%% equity, "
+                 "max hold %.0fmin, maker-then-taker",
+                 risk.cb_allocation_pct * 100, risk.cb_max_hold_minutes)
 
     signal.signal(signal.SIGINT, _sig)
     signal.signal(signal.SIGTERM, _sig)
@@ -177,8 +199,9 @@ def main():
                             f"{db.get_state('risk_state_reason') or ''}")
             prev_state = state
 
-            # b. manage open positions (also while MANAGING)
-            if state in (BotState.ACTIVE, BotState.MANAGING):
+            # b. manage open positions (also while MANAGING / bounce open)
+            if state in (BotState.ACTIVE, BotState.MANAGING,
+                         BotState.CASCADE_BOUNCE_ACTIVE):
                 positions = with_retry(xc.positions, "positions") or []
                 if positions:
                     for act in risk.check_open_positions(positions):
@@ -196,6 +219,92 @@ def main():
                         elif act["action"] == "UPDATE_SL":
                             log.info("SL -> %.4f on %s (%s)", act["new_sl"],
                                      act["coin"], act["reason"])
+
+            # c0. cascade bounce track (Phase 8.6) — event-driven, runs
+            # outside the ensemble gate; one bounce position at a time.
+            # While it's open the state is CASCADE_BOUNCE_ACTIVE, which
+            # pauses ensemble entries (can_open requires ACTIVE) but keeps
+            # position management (step b) running.
+            if cb_enabled:
+                if cb_coin:
+                    positions = with_retry(xc.positions, "positions") or []
+                    still_open = any(
+                        (p.get("position") or {}).get("coin") == cb_coin
+                        and float((p.get("position") or {}).get("szi") or 0)
+                        != 0 for p in positions)
+                    if not still_open:
+                        log.warning("cascade bounce on %s closed — resuming "
+                                    "ensemble", cb_coin)
+                        db.set_state("cascade_bounce_coin", "")
+                        risk.exit_cascade_bounce()
+                        cb_coin = None
+                        state = risk.state
+                    elif state == BotState.ACTIVE:
+                        # state was stomped by a reconnect/restart — re-assert
+                        risk.enter_cascade_bounce(cb_coin)
+                        state = risk.state
+                elif state == BotState.ACTIVE:
+                    for coin in coins_active:
+                        if coin in coins_disabled:
+                            continue
+                        cbsig = cb_model.compute(coin, buf, liq_conn)
+                        if not cbsig:
+                            continue
+                        ok, reason, max_usd = \
+                            risk.check_cascade_bounce_allocation(coin)
+                        if not ok:
+                            log.warning("cascade bounce %s vetoed: %s",
+                                        coin, reason)
+                            continue
+                        is_long = cbsig["side"] == LONG
+                        signals.log(coin, "CASCADE_BOUNCE", cbsig["side"],
+                                    cbsig["confidence"], cbsig)
+                        # maker-then-taker: try post-only briefly, then take
+                        # the market — in a dislocation speed beats fees
+                        mres = xc.try_limit_entry(coin, is_long, max_usd,
+                                                  timeout_s=cb_maker_timeout)
+                        fill_px = mres.get("avg_px")
+                        note = f"cb_maker:{mres['status']}"
+                        if mres["status"] not in ("filled", "partial") \
+                                and cb_taker_fallback:
+                            res = with_retry(
+                                lambda c=coin, lg=is_long:
+                                xc.market_open(c, lg, max_usd),
+                                f"cb_market_open({coin})")
+                            if res:
+                                fill_px, st_note = parse_fill(res)
+                                note = f"cb_taker:{st_note}"
+                            else:
+                                note = "cb_taker:order failed"
+                        if not fill_px:
+                            db.log_trade(coin, cbsig["side"], "OPEN",
+                                         status="failed", note=note)
+                            continue
+                        sl = fill_px * (1 - cb_sl_pct if is_long
+                                        else 1 + cb_sl_pct)
+                        tp = fill_px * (1 + cb_tp_pct if is_long
+                                        else 1 - cb_tp_pct)
+                        risk.register_entry(
+                            coin, fill_px, sl, tp, is_long,
+                            hold_hours=risk.cb_max_hold_minutes / 60)
+                        risk.enter_cascade_bounce(coin)
+                        cb_coin = coin
+                        state = risk.state
+                        db.set_state("cascade_bounce_coin", coin)
+                        db.log_trade(coin, cbsig["side"], "OPEN",
+                                     size=max_usd / fill_px, price=fill_px,
+                                     leverage=1.0, status="filled",
+                                     note=(f"cascade_bounce conf="
+                                           f"{cbsig['confidence']:.2f} "
+                                           f"move={cbsig['cascade_move_pct']:.4f}"
+                                           f" {note}"))
+                        alerts.send(
+                            f"CASCADE BOUNCE {cbsig['side']} {coin} @ "
+                            f"{fill_px}\nmove={cbsig['cascade_move_pct']:.2%}"
+                            f" conf={cbsig['confidence']:.2f}\n"
+                            f"sl={sl:.4f} tp={tp:.4f} "
+                            f"max_hold={risk.cb_max_hold_minutes:.0f}min")
+                        break
 
             # c. evaluate entries
             if state == BotState.ACTIVE:

@@ -11,5 +11,8 @@ def get_logger(name: str, level: str = "INFO") -> logging.Logger:
         h = logging.StreamHandler(sys.stdout)
         h.setFormatter(logging.Formatter(_FMT, datefmt="%H:%M:%S"))
         logger.addHandler(h)
+        # don't also bubble to the root logger — a library (hyperliquid SDK)
+        # installs a root handler, which was double-printing every line.
+        logger.propagate = False
     logger.setLevel(getattr(logging, level.upper(), logging.INFO))
     return logger

@@ -64,6 +64,24 @@ body {
   pointer-events: none;
 }
 
+/* LED panel text flickering in like a cold cathode */
+@keyframes ledIn {
+  0% { opacity: 0; } 8% { opacity: 1; } 14% { opacity: 0.25; }
+  22% { opacity: 1; } 30% { opacity: 0.5; } 38% { opacity: 1; }
+  100% { opacity: 1; }
+}
+.led-in { animation: ledIn 0.7s linear; }
+
+/* RPG damage numbers: realized pnl pops up and drifts away */
+@keyframes dmgFloat {
+  0%   { opacity: 0; transform: translateY(10px) scale(0.7); }
+  10%  { opacity: 1; transform: translateY(0) scale(1.18); }
+  22%  { transform: translateY(-5px) scale(1); }
+  75%  { opacity: 0.9; }
+  100% { opacity: 0; transform: translateY(-52px) scale(0.92); }
+}
+.dmg-float { animation: dmgFloat 2.6s ease-out forwards; }
+
 /* armed verdict glow when all entry gates are clear */
 @keyframes armed {
   0%, 100% { box-shadow: 0 0 4px 0 currentColor; }

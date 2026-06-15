@@ -11,6 +11,15 @@ from reaper.risk.state import BotState
 
 log = get_logger("risk")
 
+# trading.mode == "paper_aggressive" gate overrides (testnet data collection,
+# NOT mainnet-safe). Single source of truth — the dashboard bridge imports
+# this so the UI always shows the gates the bot is actually enforcing.
+PAPER_AGGRESSIVE_GATES = {
+    "min_confidence": 0.35,
+    "min_model_agreement": 3,
+    "max_concurrent_positions": 5,
+}
+
 
 def with_retry(fn: Callable, what: str, tries: int = 3):
     """Layer 4 API wrapper: exponential backoff, returns None on final failure."""
@@ -36,7 +45,8 @@ class RiskManager:
         self.db = db
         self.xc = xc
 
-        r = (getattr(cfg, "_raw", {}) or {}).get("risk", {}) or {}
+        raw = getattr(cfg, "_raw", {}) or {}
+        r = raw.get("risk", {}) or {}
         # Layer 1 — pre-trade
         self.daily_drawdown_limit = float(r.get("daily_drawdown_limit", 0.05))
         self.severe_drawdown_limit = float(r.get("severe_drawdown_limit", 0.10))
@@ -45,6 +55,32 @@ class RiskManager:
         self.max_leverage = float(r.get("max_leverage", 5.0))
         self.min_confidence = float(r.get("min_confidence", 0.62))
         self.min_model_agreement = int(r.get("min_model_agreement", 5))
+
+        # trading.mode: "conservative" (defaults above, mainnet-safe) or
+        # "paper_aggressive" (testnet data collection — lowers the entry
+        # gates so the ensemble actually trades; never use on mainnet)
+        self.mode = str((raw.get("trading", {}) or {})
+                        .get("mode", "conservative"))
+        if self.mode == "paper_aggressive":
+            self.min_confidence = PAPER_AGGRESSIVE_GATES["min_confidence"]
+            self.min_model_agreement = \
+                PAPER_AGGRESSIVE_GATES["min_model_agreement"]
+            self.max_concurrent_positions = \
+                PAPER_AGGRESSIVE_GATES["max_concurrent_positions"]
+            log.warning(
+                "PAPER AGGRESSIVE MODE — thresholds lowered for testnet "
+                "data collection, NOT mainnet-safe (min_confidence=%.2f, "
+                "min_model_agreement=%d, max_concurrent_positions=%d)",
+                self.min_confidence, self.min_model_agreement,
+                self.max_concurrent_positions)
+        elif self.mode != "conservative":
+            log.warning("unknown trading.mode %r — using conservative "
+                        "defaults", self.mode)
+
+        # cascade bounce track (Phase 8.6) — separate allocation pool
+        cb = raw.get("cascade_bounce", {}) or {}
+        self.cb_allocation_pct = float(cb.get("allocation_pct", 0.12))
+        self.cb_max_hold_minutes = float(cb.get("max_hold_minutes", 20))
         self.max_spread_pct = float(r.get("max_spread_pct", 0.0015))
         # Layer 2 — in-trade
         self.atr_sl_multiplier = float(r.get("atr_sl_multiplier", 1.5))
@@ -343,6 +379,42 @@ class RiskManager:
     def clamp_leverage(self, requested: float) -> float:
         """Return min(requested, max_leverage)."""
         return min(requested, self.max_leverage)
+
+    # ------------------------------------------------------------------
+    # cascade bounce track (Phase 8.6) — event-driven, separate from the
+    # ensemble gate. Deliberately does NOT check spread or flash-pause
+    # (a cascade IS a flash move — that's the trade), but still requires
+    # ACTIVE state, so Layer 3 halts and drawdown locks veto it.
+    # ------------------------------------------------------------------
+    def check_cascade_bounce_allocation(
+            self, coin: str, min_order_usd: float = 12.0
+    ) -> tuple[bool, str, float]:
+        """Gate + size a cascade bounce entry. Returns
+        (allowed, reason, max_usd) where max_usd = allocation_pct x equity."""
+        if self.state != BotState.ACTIVE:
+            return False, f"state={self.state.value}", 0.0
+        equity = self._equity()
+        if equity <= 0:
+            return False, "equity unavailable", 0.0
+        max_usd = self.cb_allocation_pct * equity
+        if max_usd < min_order_usd:
+            return False, (f"allocation {max_usd:.2f} below min order "
+                           f"{min_order_usd:.2f}"), 0.0
+        positions = with_retry(self.xc.positions, "positions") or []
+        for p in positions:
+            if (p.get("position") or {}).get("coin") == coin and \
+                    float(p.get("position", {}).get("szi") or 0) != 0:
+                return False, f"already holding {coin}", 0.0
+        return True, "OK", max_usd
+
+    def enter_cascade_bounce(self, coin: str):
+        """Bounce position open: pause ensemble entries, keep managing."""
+        self._set_state(BotState.CASCADE_BOUNCE_ACTIVE,
+                        f"cascade bounce open on {coin}")
+
+    def exit_cascade_bounce(self, reason: str = "bounce position closed"):
+        if self.state == BotState.CASCADE_BOUNCE_ACTIVE:
+            self._set_state(BotState.ACTIVE, reason)
 
     # ------------------------------------------------------------------
     # Layer 2: stops & targets

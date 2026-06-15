@@ -8,3 +8,4 @@ class BotState(Enum):
     HALTED       = "HALTED"       # cascade/weekly limit, all positions closed, loop frozen
     RECONNECTING = "RECONNECTING" # WS dropped, entries paused
     COOLDOWN     = "COOLDOWN"     # voluntary pause with countdown timer
+    CASCADE_BOUNCE_ACTIVE = "CASCADE_BOUNCE_ACTIVE"  # bounce trade open: ensemble entries paused, positions managed

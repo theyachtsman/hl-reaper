@@ -42,6 +42,12 @@ export default function RiskPage() {
   const { data: risk } = usePoll("/api/risk", 10000);
   const { data: fills } = usePoll("/api/fills", 30000);
   const params = risk?.params ?? {};
+  const mode = risk?.mode ?? "conservative";
+  const aggressive = mode === "paper_aggressive";
+  // params the trading.mode override changes vs the conservative base
+  const OVERRIDDEN = aggressive
+    ? new Set(["min_confidence", "min_model_agreement", "max_concurrent_positions"])
+    : new Set<string>();
 
   return (
     <div className="grid gap-4">
@@ -94,19 +100,41 @@ export default function RiskPage() {
       </div>
 
       <div className="card">
-        <div className="label mb-3">Guard Parameters (config.yaml — read-only)</div>
+        <div className="flex flex-wrap items-center gap-2 mb-3">
+          <span className="label">Guard Parameters — effective (live)</span>
+          {aggressive ? (
+            <span className="text-[10px] mono uppercase tracking-wider px-2 py-0.5 rounded-full border border-orange-500/60 bg-orange-500/15 text-orange-300">
+              ⚠ paper_aggressive — overrides applied
+            </span>
+          ) : (
+            <span className="text-[10px] mono uppercase tracking-wider px-2 py-0.5 rounded-full border border-slate-500/40 text-slate-400">
+              conservative
+            </span>
+          )}
+        </div>
         <div className="grid md:grid-cols-2 gap-x-8 gap-y-1.5 text-sm">
-          {Object.entries(PARAM_LABELS).map(([key, label]) => (
-            <div key={key} className="flex justify-between border-b border-edge/50 py-1">
-              <span className="text-slate-400">{label}</span>
-              <span className="mono">
-                {params[key] == null ? "—"
-                  : key.includes("pct") || key.includes("limit") || key.includes("confidence")
-                    ? (params[key] < 1 ? fmtPct(params[key]) : params[key])
-                    : params[key]}
-              </span>
-            </div>
-          ))}
+          {Object.entries(PARAM_LABELS).map(([key, label]) => {
+            const ov = OVERRIDDEN.has(key);
+            return (
+              <div key={key} className="flex justify-between border-b border-edge/50 py-1">
+                <span className="text-slate-400">
+                  {label}
+                  {ov && <span className="ml-1.5 text-[9px] text-orange-400/80 uppercase">override</span>}
+                </span>
+                <span className={ov ? "mono text-orange-300 font-semibold" : "mono"}>
+                  {params[key] == null ? "—"
+                    : key.includes("pct") || key.includes("limit") || key.includes("confidence")
+                      ? (params[key] < 1 ? fmtPct(params[key]) : params[key])
+                      : params[key]}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+        <div className="text-[10px] text-slate-500 mt-3">
+          {aggressive
+            ? "Highlighted rows are loosened from config.yaml for testnet data collection. NOT mainnet-safe."
+            : "Showing mainnet-safe config.yaml defaults."}
         </div>
       </div>
     </div>

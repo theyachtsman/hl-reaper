@@ -30,7 +30,9 @@ from fastapi import FastAPI, Header, HTTPException
 from hyperliquid.info import Info
 from pydantic import BaseModel
 
+from fastapi.responses import Response
 from reaper.config import PROJECT_ROOT, Config
+from reaper.data import fills_store
 from reaper.logger import get_logger
 
 log = get_logger("dashboard")
@@ -147,6 +149,34 @@ cache = MarketCache()
 
 
 # ---------------------------------------------------------------------------
+# durable fill archive — keeps a permanent local copy of every fill so the
+# History page survives HL's ~2000-fill user_fills cap, and reconstructs
+# round-trip trades (the corrected, per-trade PnL — never per-fill).
+# ---------------------------------------------------------------------------
+def _fills_sync_loop():
+    # own connection (sqlite handles are per-thread); first pass is a full
+    # backfill, then incremental top-ups.
+    conn = fills_store.connect()
+    first = True
+    while True:
+        try:
+            fills_store.sync(conn, cache.info, cfg.account_address, full=first)
+            first = False
+        except Exception as e:
+            log.warning("fills sync loop error: %s", e)
+        time.sleep(60)
+
+
+threading.Thread(target=_fills_sync_loop, daemon=True).start()
+
+
+def _history_trades() -> list[dict]:
+    """All reconstructed round-trip trades from the durable archive."""
+    conn = fills_store.connect()
+    return fills_store.reconstruct_trades(conn)
+
+
+# ---------------------------------------------------------------------------
 # read endpoints
 # ---------------------------------------------------------------------------
 @app.get("/api/status")
@@ -177,10 +207,17 @@ def status():
         risk_state = "DATA_ONLY"
         risk_reason = ("Phase 1 data service running — trading loop "
                        "(run_bot.py) not started yet")
+    # mode: what the running bot reports; config-file value as fallback
+    # (suffixed so a config edit pending a restart can't masquerade as live)
+    mode = get_state("trading_mode")
+    if not mode:
+        mode = ((cfg._raw.get("trading", {}) or {})
+                .get("mode", "conservative")) + " (config)"
     return {
         "network": cfg.network,
         "risk_state": risk_state,
         "risk_reason": risk_reason,
+        "trading_mode": mode,
         "bot_status": get_state("status"),
         "phase": phase,
         "control_request": get_state("control_request"),
@@ -268,6 +305,16 @@ def tickets():
         "min_confidence": float(risk_cfg.get("min_confidence", 0.62)),
         "min_model_agreement": int(risk_cfg.get("min_model_agreement", 5)),
     }
+    # apply the same mode overrides the bot's RiskManager enforces, so the
+    # UI never shows conservative gates while paper_aggressive is live
+    mode = get_state("trading_mode") or \
+        (cfg._raw.get("trading", {}) or {}).get("mode", "conservative")
+    if mode == "paper_aggressive":
+        from reaper.risk.manager import PAPER_AGGRESSIVE_GATES
+        gates["min_confidence"] = PAPER_AGGRESSIVE_GATES["min_confidence"]
+        gates["min_model_agreement"] = \
+            PAPER_AGGRESSIVE_GATES["min_model_agreement"]
+    gates["mode"] = mode
     empty = {"ts": None, "coins": {}, "verdicts": {}, "gates": gates}
     raw = get_state("live_tickets")
     if not raw:
@@ -347,9 +394,172 @@ def fills():
     return {"per_coin": per, "recent": recent}
 
 
+# ---------------------------------------------------------------------------
+# History page — round-trip trade archive (corrected per-trade PnL)
+# ---------------------------------------------------------------------------
+def _filter_sort(trades: list[dict], coin, direction, result,
+                 start, end, sort, order):
+    out = trades
+    if coin:
+        out = [t for t in out if t["coin"] == coin]
+    if direction:
+        out = [t for t in out if t["direction"] == direction.upper()]
+    if result == "win":
+        out = [t for t in out if t["realized_pnl"] > 0]
+    elif result == "loss":
+        out = [t for t in out if t["realized_pnl"] <= 0]
+    if start is not None:
+        out = [t for t in out if t["exit_ts"] >= start]
+    if end is not None:
+        out = [t for t in out if t["exit_ts"] <= end]
+    valid = {"entry_ts", "exit_ts", "coin", "direction", "realized_pnl",
+             "gross_pnl", "fees", "hold_minutes", "n_fills"}
+    key = sort if sort in valid else "exit_ts"
+    out = sorted(out, key=lambda t: (t.get(key) is None, t.get(key)),
+                 reverse=(order != "asc"))
+    return out
+
+
+def _summarize(trades: list[dict]) -> dict:
+    if not trades:
+        return {"n_trades": 0}
+    net = sum(t["realized_pnl"] for t in trades)
+    gross = sum(t["gross_pnl"] for t in trades)
+    fees = sum(t["fees"] for t in trades)
+    wins = [t for t in trades if t["realized_pnl"] > 0]
+    gl = -sum(t["realized_pnl"] for t in trades if t["realized_pnl"] <= 0)
+    per_coin: dict[str, dict] = {}
+    for t in trades:
+        s = per_coin.setdefault(t["coin"], {"n": 0, "net": 0.0, "wins": 0,
+                                            "fees": 0.0})
+        s["n"] += 1
+        s["net"] += t["realized_pnl"]
+        s["fees"] += t["fees"]
+        s["wins"] += 1 if t["realized_pnl"] > 0 else 0
+    for s in per_coin.values():
+        s["net"] = round(s["net"], 4)
+        s["fees"] = round(s["fees"], 4)
+        s["win_rate"] = s["wins"] / s["n"] if s["n"] else None
+    best = max(trades, key=lambda t: t["realized_pnl"])
+    worst = min(trades, key=lambda t: t["realized_pnl"])
+    return {
+        "n_trades": len(trades),
+        "net_pnl": round(net, 4),
+        "gross_pnl": round(gross, 4),
+        "fees": round(fees, 4),
+        "win_rate": len(wins) / len(trades),
+        "wins": len(wins), "losses": len(trades) - len(wins),
+        "profit_factor": round(sum(t["realized_pnl"] for t in wins) / gl, 3)
+        if gl > 0 else None,
+        "avg_pnl": round(net / len(trades), 4),
+        "avg_hold_min": round(sum(t["hold_minutes"] for t in trades)
+                              / len(trades), 1),
+        "first_ts": min(t["entry_ts"] for t in trades),
+        "last_ts": max(t["exit_ts"] for t in trades),
+        "per_coin": per_coin,
+        "best": {"coin": best["coin"], "pnl": round(best["realized_pnl"], 4),
+                 "ts": best["exit_ts"]},
+        "worst": {"coin": worst["coin"], "pnl": round(worst["realized_pnl"], 4),
+                  "ts": worst["exit_ts"]},
+    }
+
+
+@app.get("/api/history/summary")
+def history_summary():
+    """All-time totals + per-coin breakdown from reconstructed round-trips."""
+    return _summarize(_history_trades())
+
+
+@app.get("/api/history/daily")
+def history_daily():
+    """Realized PnL per UTC day (by exit date) + running cumulative."""
+    import datetime as _dt
+    trades = _history_trades()
+    days: dict[str, dict] = {}
+    for t in trades:
+        day = _dt.datetime.utcfromtimestamp(
+            t["exit_ts"] / 1000).strftime("%Y-%m-%d")
+        d = days.setdefault(day, {"date": day, "net": 0.0, "gross": 0.0,
+                                  "fees": 0.0, "n": 0, "wins": 0})
+        d["net"] += t["realized_pnl"]
+        d["gross"] += t["gross_pnl"]
+        d["fees"] += t["fees"]
+        d["n"] += 1
+        d["wins"] += 1 if t["realized_pnl"] > 0 else 0
+    out = []
+    cum = 0.0
+    for day in sorted(days):
+        d = days[day]
+        cum += d["net"]
+        d["net"] = round(d["net"], 4)
+        d["gross"] = round(d["gross"], 4)
+        d["fees"] = round(d["fees"], 4)
+        d["win_rate"] = d["wins"] / d["n"] if d["n"] else None
+        d["cumulative"] = round(cum, 4)
+        out.append(d)
+    return out
+
+
+@app.get("/api/history/trades")
+def history_trades(coin: str | None = None, direction: str | None = None,
+                   result: str | None = None, start: int | None = None,
+                   end: int | None = None, sort: str = "exit_ts",
+                   order: str = "desc", limit: int = 500, offset: int = 0):
+    """Filtered/sorted/paginated round-trip trades."""
+    flt = _filter_sort(_history_trades(), coin, direction, result, start, end,
+                       sort, order)
+    page = flt[offset:offset + limit]
+    for t in page:
+        t["realized_pnl"] = round(t["realized_pnl"], 4)
+        t["gross_pnl"] = round(t["gross_pnl"], 4)
+        t["fees"] = round(t["fees"], 4)
+    return {"total": len(flt), "count": len(page), "offset": offset,
+            "trades": page}
+
+
+@app.get("/api/history/export.csv")
+def history_export(coin: str | None = None, direction: str | None = None,
+                   result: str | None = None, start: int | None = None,
+                   end: int | None = None, sort: str = "exit_ts",
+                   order: str = "desc"):
+    """CSV of round-trip trades honoring the same filters as the table —
+    hand this to evaluation."""
+    import csv as _csv
+    import datetime as _dt
+    import io as _io
+    flt = _filter_sort(_history_trades(), coin, direction, result, start, end,
+                       sort, order)
+    buf = _io.StringIO()
+    w = _csv.writer(buf)
+    w.writerow(["entry_utc", "exit_utc", "coin", "direction", "hold_minutes",
+                "entry_px", "exit_px", "qty", "n_fills", "gross_pnl", "fees",
+                "net_pnl"])
+    iso = lambda ms: _dt.datetime.utcfromtimestamp(ms / 1000).strftime(
+        "%Y-%m-%d %H:%M:%S")  # noqa: E731
+    for t in flt:
+        w.writerow([iso(t["entry_ts"]), iso(t["exit_ts"]), t["coin"],
+                    t["direction"], t["hold_minutes"],
+                    round(t.get("entry_px", 0), 6), round(t.get("exit_px", 0), 6),
+                    round(t.get("qty", 0), 6), t["n_fills"],
+                    round(t["gross_pnl"], 4), round(t["fees"], 4),
+                    round(t["realized_pnl"], 4)])
+    fname = f"hl_reaper_trades_{int(time.time())}.csv"
+    return Response(buf.getvalue(), media_type="text/csv",
+                    headers={"Content-Disposition":
+                             f'attachment; filename="{fname}"'})
+
+
 @app.get("/api/risk")
 def risk():
-    r = cfg._raw.get("risk", {}) or {}
+    # effective guard params: start from config, then apply the same
+    # trading.mode overrides the bot's RiskManager enforces, so the page
+    # shows what's actually gating trades — not the raw conservative base
+    r = dict(cfg._raw.get("risk", {}) or {})
+    mode = get_state("trading_mode") or \
+        (cfg._raw.get("trading", {}) or {}).get("mode", "conservative")
+    if mode == "paper_aggressive":
+        from reaper.risk.manager import PAPER_AGGRESSIVE_GATES
+        r.update(PAPER_AGGRESSIVE_GATES)
     acct = float((cache.user.get("marginSummary", {}) or {})
                  .get("accountValue") or 0)
     day_open = float(get_state("risk_day_open_equity") or 0)
@@ -357,6 +567,7 @@ def risk():
     st = status()  # same honest state derivation as /api/status
     return {
         "params": r,
+        "mode": mode,
         "state": st["risk_state"],
         "reason": st["risk_reason"],
         "halted_until": float(get_state("risk_halted_until") or 0),

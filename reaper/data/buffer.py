@@ -20,6 +20,10 @@ class MarketBuffer:
         self.trades = {c: deque(maxlen=200) for c in coins}
         # asset contexts (funding, OI, mark px) per coin
         self.ctx = {c: {} for c in coins}
+        # external SPOT reference (Binance spot) per coin, for spot-perp
+        # lead/lag — additive, written by the spot poller, read by future
+        # signal code. {"px": float, "ts": ms}
+        self.spot = {c: {} for c in coins}
         # staleness tracking
         self.last_msg_ts = 0.0
         self.msg_count = 0
@@ -57,6 +61,12 @@ class MarketBuffer:
         with self._lock:
             self.ctx[coin] = ctx
 
+    def on_spot(self, coin: str, px: float, ts: int):
+        """External spot reference price (Binance spot). Additive — does not
+        affect existing readers."""
+        with self._lock:
+            self.spot[coin] = {"px": px, "ts": ts}
+
     def _touch(self):
         self.last_msg_ts = time.time()
         self.msg_count += 1
@@ -68,6 +78,10 @@ class MarketBuffer:
             if not b or not b["bids"] or not b["asks"]:
                 return None
             return (b["bids"][0][0] + b["asks"][0][0]) / 2
+
+    def spot_price(self, coin: str) -> float | None:
+        with self._lock:
+            return (self.spot.get(coin) or {}).get("px")
 
     def latest_candles(self, coin: str, interval: str, n: int = 100):
         with self._lock:
