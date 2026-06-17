@@ -24,7 +24,7 @@ from reaper.db import DB
 from reaper.execution.exchange_client import ExchangeClient
 from reaper.logger import get_logger
 from reaper.data import liquidation_store
-from reaper.models import FLAT, LONG, atr_from_candles
+from reaper.models import FLAT, LONG, SHORT, atr_from_candles
 from reaper.models.cascade_bounce import CascadeBounceModel
 from reaper.models.funding_rate import FundingRateModel
 from reaper.models.liquidation_heatmap import LiquidationHeatmapModel
@@ -34,7 +34,7 @@ from reaper.models.orderbook_imbalance import OrderbookImbalanceModel
 from reaper.models.regime_detector import RegimeDetectorModel
 from reaper.models.ta_model import TAModel
 from reaper.models.vwap_model import VWAPModel
-from reaper.risk.manager import RiskManager, with_retry
+from reaper.risk.manager import CLOSE_PENDING_TIMEOUT_S, RiskManager, with_retry
 from reaper.risk.state import BotState
 
 log = get_logger("bot")
@@ -64,6 +64,13 @@ class SignalWriter:
                  json.dumps(meta, default=str)))
 
 
+def long_confirmation_count(model_votes: dict, models: set) -> int:
+    """How many of `models` are actively voting LONG (Change B gate). Used by
+    the entry loop and the dashboard verdict so they never drift apart."""
+    return sum(1 for t in model_votes.values()
+               if t.model in models and t.direction == LONG)
+
+
 def parse_fill(res: dict) -> tuple[float | None, str]:
     """Extract (avg_px, status_note) from an exchange order response."""
     try:
@@ -76,6 +83,118 @@ def parse_fill(res: dict) -> tuple[float | None, str]:
         return None, f"unfilled: {statuses}"
     except Exception:
         return None, f"unparsed: {res}"
+
+
+class MakerTimeoutTracker:
+    """Per-coin maker-timeout streak tracker for the intelligent taker
+    fallback. A streak is consecutive maker non-fills on the same coin +
+    direction within a rolling window; the mid at the FIRST timeout anchors
+    the exhaustion check. The streak resets on a direction flip, after the
+    window elapses, or explicitly via reset() (called on any fill or skip)."""
+
+    def __init__(self, n: int, window_s: float):
+        self.n = n
+        self.window_s = window_s
+        self._streaks: dict[str, dict] = {}
+
+    def record_timeout(self, coin: str, direction: str, mid: float | None,
+                       now: float | None = None) -> dict:
+        """Register a maker non-fill; returns the (possibly fresh) streak dict
+        {'direction','count','first_ts','start_mid'}."""
+        now = time.time() if now is None else now
+        s = self._streaks.get(coin)
+        if (s is None or s["direction"] != direction
+                or now - s["first_ts"] > self.window_s):
+            s = {"direction": direction, "count": 0, "first_ts": now,
+                 "start_mid": mid}
+            self._streaks[coin] = s
+        s["count"] += 1
+        return s
+
+    def reset(self, coin: str):
+        self._streaks.pop(coin, None)
+
+
+def run_taker_fallback(coin, is_long, usd_size, *, models, aggregator, buf, xc,
+                       db, min_confidence, min_model_agreement,
+                       exhaustion_atr_mult, start_mid) -> dict:
+    """Maker-timeout streak hit N: re-validate the signal on the CURRENT
+    buffer (never the cached one from streak start) and confirm the move is
+    still live, then take the market only if both hold. Every decision —
+    fired or skipped — is logged to the trades table for later audit.
+
+    Returns {"status": taker_fallback|taker_skipped_degraded|
+    taker_skipped_exhausted|taker_failed, "fill_px", "sig", "agreement"}."""
+    direction = LONG if is_long else SHORT
+
+    # Step 2 — re-validate the signal on current buffer state
+    tickets = [m.compute(coin, buf) for m in models]
+    sig = aggregator.aggregate(coin, tickets)
+    agreement = (sig.long_votes if sig.direction == LONG else sig.short_votes)
+    degraded = None
+    if sig.direction != direction:
+        degraded = f"direction {sig.direction} != {direction}"
+    elif sig.confidence < min_confidence:
+        degraded = f"conf {sig.confidence:.2f} < {min_confidence:.2f}"
+    elif agreement < min_model_agreement:
+        degraded = f"agreement {agreement} < {min_model_agreement}"
+    if degraded:
+        log.info("taker fallback %s %s SKIP — signal degraded: %s",
+                 direction, coin, degraded)
+        db.log_trade(coin, direction, "OPEN", status="taker_skipped_degraded",
+                     note=f"maker:taker_skipped_degraded ({degraded})")
+        return {"status": "taker_skipped_degraded", "fill_px": None,
+                "sig": sig, "agreement": agreement}
+
+    # Step 3 — exhaustion: price already ran our way, or book flipped against us
+    cur_mid = buf.mid(coin)
+    atr = atr_from_candles(buf.latest_candles(coin, "1m", 60))
+    exhausted = None
+    if atr and atr > 0 and start_mid and cur_mid:
+        moved = (cur_mid - start_mid) if is_long else (start_mid - cur_mid)
+        if moved > exhaustion_atr_mult * atr:
+            exhausted = (f"moved {moved:.4f} > {exhaustion_atr_mult}xATR "
+                         f"({exhaustion_atr_mult * atr:.4f}) since streak start")
+    if exhausted is None:
+        book = buf.books.get(coin)
+        if book and book.get("bids") and book.get("asks"):
+            bid_sz = sum(sz for _, sz in book["bids"][:10])
+            ask_sz = sum(sz for _, sz in book["asks"][:10])
+            tot = bid_sz + ask_sz
+            if tot > 0:
+                bid_frac = bid_sz / tot
+                if not is_long and bid_frac > 0.60:
+                    exhausted = f"book bid-heavy {bid_frac:.0%} — SHORT reversal"
+                elif is_long and bid_frac < 0.40:
+                    exhausted = (f"book ask-heavy {(1 - bid_frac):.0%} — "
+                                 f"LONG reversal")
+    if exhausted:
+        log.info("taker fallback %s %s SKIP — move exhausted: %s",
+                 direction, coin, exhausted)
+        db.log_trade(coin, direction, "OPEN", status="taker_skipped_exhausted",
+                     note=f"maker:taker_skipped_exhausted ({exhausted})")
+        return {"status": "taker_skipped_exhausted", "fill_px": None,
+                "sig": sig, "agreement": agreement}
+
+    # Step 4 — signal live + move not exhausted -> take the market
+    log.warning("TAKER FALLBACK %s %s conf=%.2f votes=%d — converting maker "
+                "timeout to market", direction, coin, sig.confidence, agreement)
+    res = with_retry(lambda: xc.market_open(coin, is_long, usd_size),
+                     f"taker_fallback_market_open({coin})")
+    if not res:
+        db.log_trade(coin, direction, "OPEN", status="taker_failed",
+                     note="maker:taker_fallback order failed")
+        return {"status": "taker_failed", "fill_px": None, "sig": sig,
+                "agreement": agreement}
+    fill_px, st_note = parse_fill(res)
+    db.log_trade(coin, direction, "OPEN",
+                 size=usd_size / (fill_px or cur_mid or 1),
+                 price=fill_px,
+                 status="taker_fallback" if fill_px else "taker_failed",
+                 note=(f"maker:taker_fallback conf={sig.confidence:.2f} "
+                       f"votes={agreement} {st_note}"))
+    return {"status": "taker_fallback" if fill_px else "taker_failed",
+            "fill_px": fill_px, "sig": sig, "agreement": agreement}
 
 
 def acquire_singleton_lock() -> object:
@@ -100,12 +219,33 @@ def main():
     log.setLevel(cfg.log_level)
     t_raw = (cfg._raw.get("trading", {}) or {})
     m_raw = (cfg._raw.get("models", {}) or {})
+    r_raw = (cfg._raw.get("risk", {}) or {})
     loop_s = float(t_raw.get("loop_interval_seconds", 10))
     usd_size = float(t_raw.get("default_usd_size", 50))
     default_lev = float(t_raw.get("default_leverage", 3.0))
     coins_active = t_raw.get("coins_active", cfg.coins)
     entry_style = t_raw.get("entry_style", "maker")
     entry_timeout = float(t_raw.get("entry_timeout_seconds", 30))
+    fallback_enabled = bool(t_raw.get("maker_timeout_fallback_enabled", True))
+    fallback_n = int(t_raw.get("maker_timeout_fallback_n", 3))
+    fallback_window_s = float(t_raw.get("maker_timeout_fallback_window_s", 180))
+    fallback_exhaustion_mult = float(
+        t_raw.get("maker_timeout_exhaustion_atr_mult", 1.5))
+    # LONG-only microstructure confirmation gate (Change B, 2026-06-16): a LONG
+    # verdict must be confirmed by at least N of the listed live models actively
+    # voting LONG, else skip. SHORTs (the working side) are never gated.
+    long_conf_enabled = bool(t_raw.get("long_confirmation_enabled", True))
+    long_conf_models = set(t_raw.get(
+        "long_confirmation_models",
+        ["OrderbookImbalanceModel", "VWAPModel"]))
+    long_conf_min = int(t_raw.get("long_confirmation_min", 1))
+    # SHORT mirror — OFF by default (working side stays untouched); exposable
+    # for testing via the controls page.
+    short_conf_enabled = bool(t_raw.get("short_confirmation_enabled", False))
+    short_conf_models = set(t_raw.get(
+        "short_confirmation_models",
+        ["OrderbookImbalanceModel", "VWAPModel"]))
+    short_conf_min = int(t_raw.get("short_confirmation_min", 1))
     ml_dir = str((PROJECT_ROOT / m_raw.get("ml_model_dir", "models/")).resolve())
 
     log.info("HL Reaper FULL LOOP starting — network=%s coins=%s size=$%.0f",
@@ -138,12 +278,99 @@ def main():
                         min_confidence=float(m_raw.get("ml_min_confidence",
                                                        0.55))),
     ]
-    aggregator = SignalAggregator()
+    aggregator = SignalAggregator(
+        funding_hard_block_enabled=bool(
+            r_raw.get("funding_hard_block_enabled", True)),
+        funding_hard_block_conf=float(
+            r_raw.get("funding_hard_block_conf", 0.75)),
+        funding_hard_block_short_enabled=bool(
+            r_raw.get("funding_hard_block_short_enabled", False)),
+        funding_hard_block_short_conf=float(
+            r_raw.get("funding_hard_block_short_conf", 0.75)))
+    if aggregator.funding_hard_block_enabled:
+        log.info("funding HARD-block ENABLED — FundingRate SHORT conf >= %.2f "
+                 "blocks all LONG entries", aggregator.funding_hard_block_conf)
+    if long_conf_enabled:
+        log.info("LONG confirmation gate ENABLED — need >=%d of %s voting LONG",
+                 long_conf_min, sorted(long_conf_models))
+    maker_streaks = MakerTimeoutTracker(fallback_n, fallback_window_s)
+    if entry_style == "maker" and fallback_enabled:
+        log.info("maker timeout->taker fallback ENABLED — fire after %d "
+                 "consecutive timeouts within %.0fs, skip if move > %.1fxATR",
+                 fallback_n, fallback_window_s, fallback_exhaustion_mult)
     risk = RiskManager(cfg, buf, db, xc)
     signals = SignalWriter(cfg.db_path)
-    # publish the ACTIVE mode for the dashboard — source of truth is the
-    # running process, not the config file (which can change between restarts)
-    db.set_state("trading_mode", risk.mode)
+    # the legacy "paper_aggressive / conservative" mode is gone — every gate is
+    # now an individual live_config override on top of the config.yaml floor.
+    # Publish the effective gates for the dashboard instead of a mode label.
+    db.set_state("trading_mode", "live_config")
+
+    def close_position(coin: str, reason: str, side: str = "?") -> bool:
+        """Submit a close order and arm the close-pending guard so the in-trade
+        guard does not re-issue the identical close every cycle while the
+        on-chain position state catches up (critical pre-mainnet duplicate-close
+        fix). Returns True if the close order was accepted.
+
+        We arm close-pending on *acceptance*, not on a short re-poll: the state
+        lag that caused the duplicate-close bug runs 1-2 cycles, longer than any
+        quick verify window, so a 2s re-check would still race. The re-check
+        here only early-clears the flag (and logs) when the close is already
+        visibly gone. A close that is never accepted leaves the flag unset, so
+        a genuinely failed close retries next cycle."""
+        res = with_retry(lambda: xc.market_close(coin), f"market_close({coin})")
+        if res:
+            risk.mark_close_pending(coin)
+            # best-effort fast confirmation (informational / early-clear only)
+            time.sleep(2)
+            remaining = with_retry(xc.positions, "positions") or []
+            gone = not any(
+                (p.get("position") or {}).get("coin") == coin
+                and float((p.get("position") or {}).get("szi") or 0) != 0
+                for p in remaining)
+            if gone:
+                risk.clear_close_pending(coin)
+                log.info("position confirmed closed for %s", coin)
+            else:
+                log.info("close submitted for %s — state still catching up, "
+                         "suppressing re-close for %ds", coin,
+                         int(CLOSE_PENDING_TIMEOUT_S))
+        else:
+            log.warning("close order FAILED for %s (%s) — will retry next cycle",
+                        coin, reason)
+        db.log_trade(coin, side, "CLOSE", status="ok" if res else "error",
+                     note=reason)
+        return bool(res)
+
+    def handle_command(command: str) -> str:
+        """Execute one queued dashboard control command; return a status note."""
+        cmd = (command or "").strip()
+        if cmd == "pause":
+            risk.manual_pause()
+            return "paused (MANAGING — no new entries)"
+        if cmd == "resume":
+            risk.manual_resume()
+            return "resumed"
+        if cmd == "close_all":
+            risk.manual_close_all()
+            return "closed all positions"
+        if cmd.startswith("close_coin/"):
+            coin = cmd.split("/", 1)[1]
+            if coin not in cfg.coins:
+                raise ValueError(f"unknown coin {coin}")
+            close_position(coin, "dashboard close_coin command")
+            return f"closed {coin}"
+        if cmd.startswith("set_state/"):
+            target = cmd.split("/", 1)[1].upper()
+            if target in ("ACTIVE", "RESUME"):
+                risk.manual_resume()
+            elif target in ("MANAGING", "PAUSE"):
+                risk.manual_pause()
+            elif target in ("HALTED", "HALT"):
+                risk.manual_halt()
+            else:
+                risk._set_state(BotState(target), "dashboard set_state")
+            return f"state -> {target}"
+        raise ValueError(f"unknown command {cmd!r}")
 
     # Phase 8.6: cascade bounce — event-driven track, separate from ensemble
     cb_raw = (cfg._raw.get("cascade_bounce", {}) or {})
@@ -175,6 +402,68 @@ def main():
     try:
         while _running:
             cycle_start = time.time()
+
+            # --- hot-reload live config (controls page) ---------------------
+            # merge live_config overrides onto the config.yaml floor, then push
+            # the tunable values into RiskManager + the loop locals so changes
+            # take effect THIS cycle without a restart. Nothing on the controls
+            # page is cached across cycles.
+            try:
+                live_overrides = db.get_live_config()
+            except Exception as e:
+                log.warning("live_config read failed: %s", e)
+                live_overrides = {}
+            cfg.apply_overrides(live_overrides)
+            for k, (old, new) in risk.refresh_params().items():
+                log.warning("LIVE CONFIG: risk.%s changed %s -> %s", k, old, new)
+            t_raw = cfg._raw.get("trading", {}) or {}
+            r_raw = cfg._raw.get("risk", {}) or {}
+            usd_size = float(t_raw.get("default_usd_size", 50))
+            default_lev = float(t_raw.get("default_leverage", 3.0))
+            coins_active = t_raw.get("coins_active", cfg.coins)
+            entry_style = t_raw.get("entry_style", "maker")
+            entry_timeout = float(t_raw.get("entry_timeout_seconds", 30))
+            fallback_enabled = bool(
+                t_raw.get("maker_timeout_fallback_enabled", True))
+            fallback_n = int(t_raw.get("maker_timeout_fallback_n", 3))
+            fallback_window_s = float(
+                t_raw.get("maker_timeout_fallback_window_s", 180))
+            fallback_exhaustion_mult = float(
+                t_raw.get("maker_timeout_exhaustion_atr_mult", 1.5))
+            maker_streaks.n = fallback_n
+            maker_streaks.window_s = fallback_window_s
+            long_conf_enabled = bool(
+                t_raw.get("long_confirmation_enabled", True))
+            long_conf_models = set(t_raw.get(
+                "long_confirmation_models",
+                ["OrderbookImbalanceModel", "VWAPModel"]))
+            long_conf_min = int(t_raw.get("long_confirmation_min", 1))
+            short_conf_enabled = bool(
+                t_raw.get("short_confirmation_enabled", False))
+            short_conf_models = set(t_raw.get(
+                "short_confirmation_models",
+                ["OrderbookImbalanceModel", "VWAPModel"]))
+            short_conf_min = int(t_raw.get("short_confirmation_min", 1))
+            per_coin_cfg = cfg._raw.get("per_coin", {}) or {}
+            loop_s = float(t_raw.get("loop_interval_seconds", 10))
+            aggregator.funding_hard_block_enabled = bool(
+                r_raw.get("funding_hard_block_enabled", True))
+            aggregator.funding_hard_block_conf = float(
+                r_raw.get("funding_hard_block_conf", 0.75))
+            aggregator.funding_hard_block_short_enabled = bool(
+                r_raw.get("funding_hard_block_short_enabled", False))
+            aggregator.funding_hard_block_short_conf = float(
+                r_raw.get("funding_hard_block_short_conf", 0.75))
+
+            # --- drain one-shot control commands (controls page) -----------
+            for cmd_id, command in db.get_pending_commands():
+                try:
+                    note = handle_command(command)
+                    log.warning("COMMAND %s: %s", command, note)
+                    db.mark_command_done(cmd_id, "done")
+                except Exception as e:
+                    log.error("COMMAND %s failed: %s", command, e)
+                    db.mark_command_done(cmd_id, f"error: {e}")
 
             # honor dashboard control requests (bot_state table)
             ctrl = db.get_state("control_request")
@@ -208,12 +497,7 @@ def main():
                         if act["action"] == "CLOSE":
                             log.warning("CLOSE %s: %s", act["coin"],
                                         act["reason"])
-                            res = with_retry(
-                                lambda c=act["coin"]: xc.market_close(c),
-                                f"market_close({act['coin']})")
-                            db.log_trade(act["coin"], "?", "CLOSE",
-                                         status="ok" if res else "error",
-                                         note=act["reason"])
+                            close_position(act["coin"], act["reason"])
                             alerts.send(f"CLOSE {act['coin']} — "
                                         f"{act['reason']}")
                         elif act["action"] == "UPDATE_SL":
@@ -327,18 +611,57 @@ def main():
                                 {"regime": sig.regime,
                                  "long": sig.long_votes,
                                  "short": sig.short_votes,
-                                 "flat": sig.flat_votes})
+                                 "flat": sig.flat_votes,
+                                 **sig.meta})
+                    # Change B: LONG entries require live microstructure
+                    # confirmation. SHORTs (the working side) are never gated.
+                    if long_conf_enabled and sig.direction == LONG:
+                        confirming = long_confirmation_count(
+                            sig.model_votes, long_conf_models)
+                        if confirming < long_conf_min:
+                            log.info("LONG entry skipped: no microstructure "
+                                     "confirmation (%d/%d of %s voting LONG) "
+                                     "on %s", confirming, long_conf_min,
+                                     sorted(long_conf_models), coin)
+                            db.log_trade(coin, sig.direction, "OPEN",
+                                         status="long_unconfirmed",
+                                         note=("skip: no microstructure "
+                                               f"confirmation ({confirming}/"
+                                               f"{long_conf_min})"))
+                            continue
+                    # SHORT mirror (OFF by default) — same OB/VWAP gate
+                    if short_conf_enabled and sig.direction == SHORT:
+                        confirming = sum(
+                            1 for t in sig.model_votes.values()
+                            if t.model in short_conf_models
+                            and t.direction == SHORT)
+                        if confirming < short_conf_min:
+                            log.info("SHORT entry skipped: no microstructure "
+                                     "confirmation (%d/%d of %s voting SHORT) "
+                                     "on %s", confirming, short_conf_min,
+                                     sorted(short_conf_models), coin)
+                            db.log_trade(coin, sig.direction, "OPEN",
+                                         status="short_unconfirmed",
+                                         note=("skip: no microstructure "
+                                               f"confirmation ({confirming}/"
+                                               f"{short_conf_min})"))
+                            continue
+                    # per-coin size/leverage overrides (controls page) fall back
+                    # to the global defaults when unset.
+                    pc = per_coin_cfg.get(coin, {}) or {}
+                    coin_usd = float(pc.get("usd_size") or usd_size)
+                    coin_lev = float(pc.get("leverage") or default_lev)
                     agreement = (sig.long_votes if sig.direction == LONG
                                  else sig.short_votes)
                     ok, reason = risk.can_open(coin, sig.direction,
                                                sig.confidence, agreement,
-                                               default_lev)
+                                               coin_lev)
                     if not ok:
                         log.debug("skip %s %s: %s", coin, sig.direction,
                                   reason)
                         continue
 
-                    lev = risk.clamp_leverage(default_lev)
+                    lev = risk.clamp_leverage(coin_lev)
                     atr = atr_from_candles(buf.latest_candles(coin, "1m", 60))
                     entry_ref = buf.mid(coin)
                     if not atr or not entry_ref:
@@ -354,21 +677,62 @@ def main():
                         signals.log(coin, tk.model, tk.direction,
                                     tk.confidence, tk.meta)
                     if entry_style == "maker":
-                        # post-only entry; not filled in time -> skip the
-                        # signal entirely (never chase with a taker order)
-                        mres = xc.try_limit_entry(coin, is_long, usd_size,
+                        # post-only entry; maker stays the default. On repeated
+                        # timeouts (price outrunning the limit) the intelligent
+                        # taker fallback re-validates and may take the market —
+                        # otherwise the signal is skipped (never blind-chase).
+                        mres = xc.try_limit_entry(coin, is_long, coin_usd,
                                                   timeout_s=entry_timeout)
                         fill_px = mres.get("avg_px")
                         note = f"maker:{mres['status']}"
                         if mres["status"] not in ("filled", "partial"):
-                            log.info("maker entry %s on %s — skipped",
-                                     mres["status"], coin)
-                            db.log_trade(coin, sig.direction, "OPEN",
-                                         status=mres["status"], note=note)
+                            triggered = False
+                            streak_count = 0
+                            if fallback_enabled:
+                                streak = maker_streaks.record_timeout(
+                                    coin, sig.direction, entry_ref)
+                                streak_count = streak["count"]
+                                if streak_count >= fallback_n:
+                                    triggered = True
+                                    fb = run_taker_fallback(
+                                        coin, is_long, coin_usd, models=models,
+                                        aggregator=aggregator, buf=buf, xc=xc,
+                                        db=db,
+                                        min_confidence=risk.min_confidence,
+                                        min_model_agreement=(
+                                            risk.min_model_agreement),
+                                        exhaustion_atr_mult=(
+                                            fallback_exhaustion_mult),
+                                        start_mid=streak["start_mid"])
+                                    # streak resolved either way — reset it
+                                    maker_streaks.reset(coin)
+                                    if fb["status"] == "taker_fallback" \
+                                            and fb["fill_px"]:
+                                        fill_px = fb["fill_px"]
+                                        sl, tp = risk.calc_sl_tp(
+                                            coin, fill_px, is_long, atr)
+                                        risk.register_entry(
+                                            coin, fill_px, sl, tp, is_long)
+                                        alerts.send(
+                                            f"TAKER FALLBACK {sig.direction} "
+                                            f"{coin} @ {fill_px}\n"
+                                            f"conf={fb['sig'].confidence:.2f} "
+                                            f"votes={fb['agreement']} "
+                                            f"(maker timed out {streak['count']}"
+                                            f"x)\nsl={sl:.4f} tp={tp:.4f}")
+                            if not triggered:
+                                log.info("maker entry %s on %s — skipped "
+                                         "(timeout streak=%d/%d)",
+                                         mres["status"], coin, streak_count,
+                                         fallback_n)
+                                db.log_trade(coin, sig.direction, "OPEN",
+                                             status=mres["status"], note=note)
                             continue
+                        # maker filled — clear any prior timeout streak
+                        maker_streaks.reset(coin)
                     else:
                         res = with_retry(
-                            lambda: xc.market_open(coin, is_long, usd_size),
+                            lambda: xc.market_open(coin, is_long, coin_usd),
                             f"market_open({coin})")
                         if not res:
                             db.log_trade(coin, sig.direction, "OPEN",
@@ -383,7 +747,7 @@ def main():
                             f"conf={sig.confidence:.2f} votes={agreement} "
                             f"regime={sig.regime}\nsl={sl:.4f} tp={tp:.4f}")
                     db.log_trade(coin, sig.direction, "OPEN",
-                                 size=usd_size / (fill_px or entry_ref),
+                                 size=coin_usd / (fill_px or entry_ref),
                                  price=fill_px, leverage=lev,
                                  status="filled" if fill_px else "failed",
                                  note=f"conf={sig.confidence:.2f} "

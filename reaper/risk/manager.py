@@ -11,14 +11,13 @@ from reaper.risk.state import BotState
 
 log = get_logger("risk")
 
-# trading.mode == "paper_aggressive" gate overrides (testnet data collection,
-# NOT mainnet-safe). Single source of truth — the dashboard bridge imports
-# this so the UI always shows the gates the bot is actually enforcing.
-PAPER_AGGRESSIVE_GATES = {
-    "min_confidence": 0.35,
-    "min_model_agreement": 3,
-    "max_concurrent_positions": 5,
-}
+# After a close order is accepted we suppress further SL/TP re-evaluation on
+# that coin for this long. The on-chain position state can lag the close by
+# 1-2 cycles; without this, the in-trade guard re-fires the identical close
+# every loop until the state refreshes (the duplicate-close bug). If the
+# position is STILL open once this expires it's treated as a genuinely stuck
+# position and re-evaluated (so a real failed close eventually retries).
+CLOSE_PENDING_TIMEOUT_S = 30.0
 
 
 def with_retry(fn: Callable, what: str, tries: int = 3):
@@ -45,65 +44,18 @@ class RiskManager:
         self.db = db
         self.xc = xc
 
-        raw = getattr(cfg, "_raw", {}) or {}
-        r = raw.get("risk", {}) or {}
-        # Layer 1 — pre-trade
-        self.daily_drawdown_limit = float(r.get("daily_drawdown_limit", 0.05))
-        self.severe_drawdown_limit = float(r.get("severe_drawdown_limit", 0.10))
-        self.max_concurrent_positions = int(r.get("max_concurrent_positions", 3))
-        self.max_per_symbol = int(r.get("max_per_symbol", 1))
-        self.max_leverage = float(r.get("max_leverage", 5.0))
-        self.min_confidence = float(r.get("min_confidence", 0.62))
-        self.min_model_agreement = int(r.get("min_model_agreement", 5))
-
-        # trading.mode: "conservative" (defaults above, mainnet-safe) or
-        # "paper_aggressive" (testnet data collection — lowers the entry
-        # gates so the ensemble actually trades; never use on mainnet)
-        self.mode = str((raw.get("trading", {}) or {})
-                        .get("mode", "conservative"))
-        if self.mode == "paper_aggressive":
-            self.min_confidence = PAPER_AGGRESSIVE_GATES["min_confidence"]
-            self.min_model_agreement = \
-                PAPER_AGGRESSIVE_GATES["min_model_agreement"]
-            self.max_concurrent_positions = \
-                PAPER_AGGRESSIVE_GATES["max_concurrent_positions"]
-            log.warning(
-                "PAPER AGGRESSIVE MODE — thresholds lowered for testnet "
-                "data collection, NOT mainnet-safe (min_confidence=%.2f, "
-                "min_model_agreement=%d, max_concurrent_positions=%d)",
-                self.min_confidence, self.min_model_agreement,
-                self.max_concurrent_positions)
-        elif self.mode != "conservative":
-            log.warning("unknown trading.mode %r — using conservative "
-                        "defaults", self.mode)
-
-        # cascade bounce track (Phase 8.6) — separate allocation pool
-        cb = raw.get("cascade_bounce", {}) or {}
-        self.cb_allocation_pct = float(cb.get("allocation_pct", 0.12))
-        self.cb_max_hold_minutes = float(cb.get("max_hold_minutes", 20))
-        self.max_spread_pct = float(r.get("max_spread_pct", 0.0015))
-        # Layer 2 — in-trade
-        self.atr_sl_multiplier = float(r.get("atr_sl_multiplier", 1.5))
-        self.atr_trail_multiplier = float(r.get("atr_trail_multiplier", 1.0))
-        self.trail_activation_r = float(r.get("trail_activation_r", 1.5))
-        self.max_loss_per_trade_pct = float(r.get("max_loss_per_trade_pct", 0.02))
-        self.emergency_loss_pct = float(r.get("emergency_loss_pct", 0.03))
-        self.max_hold_hours_scalp = float(r.get("max_hold_hours_scalp", 4))
-        self.max_hold_hours_swing = float(r.get("max_hold_hours_swing", 48))
-        # Layer 3 — market kill switches
-        self.cascade_oi_drop_pct = float(r.get("cascade_oi_drop_pct", 0.15))
-        self.cascade_price_move_pct = float(r.get("cascade_price_move_pct", 0.03))
-        self.cascade_window_minutes = float(r.get("cascade_window_minutes", 5))
-        self.cascade_halt_hours = float(r.get("cascade_halt_hours", 2))
-        self.extreme_funding_long_halt = float(r.get("extreme_funding_long_halt", 0.001))
-        self.extreme_funding_short_halt = float(r.get("extreme_funding_short_halt", -0.001))
-        self.flash_crash_candle_pct = float(r.get("flash_crash_candle_pct", 0.05))
-        self.weekly_drawdown_limit = float(r.get("weekly_drawdown_limit", 0.10))
-        self.cooldown_hours = float(r.get("cooldown_hours", 48))
+        # all tunable guard params live in _load_params() so the trading loop
+        # can hot-reload them each cycle (refresh_params) after live_config
+        # overrides are merged onto the config — no restart needed.
+        self._load_params()
 
         # internal tracking
         self._oi_hist: dict[str, deque] = {c: deque(maxlen=120) for c in buf.coins}
         self._pos_track: dict[str, dict] = {}        # coin -> entry/sl/tp tracker
+        # coin -> ts a close order was accepted; suppresses duplicate close
+        # attempts while the exchange position state catches up (see
+        # check_open_positions / mark_close_pending).
+        self._close_pending: dict[str, float] = {}
         self._flash_pause_until: dict[str, float] = {}
         self._long_halt: set[str] = set()
         self._short_halt: set[str] = set()
@@ -122,6 +74,64 @@ class RiskManager:
             self.state = BotState.ACTIVE
         log.info("RiskManager up — state=%s day_open=%.2f week_open=%.2f",
                  self.state.value, self.day_open_equity, self.week_open_equity)
+
+    # ------------------------------------------------------------------
+    # tunable params — re-read from the (override-merged) config each cycle
+    # ------------------------------------------------------------------
+    def _load_params(self):
+        raw = getattr(self.cfg, "_raw", {}) or {}
+        r = raw.get("risk", {}) or {}
+        # Layer 1 — pre-trade
+        self.daily_drawdown_limit = float(r.get("daily_drawdown_limit", 0.05))
+        self.severe_drawdown_limit = float(r.get("severe_drawdown_limit", 0.10))
+        self.max_concurrent_positions = int(r.get("max_concurrent_positions", 3))
+        self.max_per_symbol = int(r.get("max_per_symbol", 1))
+        self.max_leverage = float(r.get("max_leverage", 5.0))
+        self.min_confidence = float(r.get("min_confidence", 0.62))
+        self.min_model_agreement = int(r.get("min_model_agreement", 4))
+        # cascade bounce track (Phase 8.6) — separate allocation pool
+        cb = raw.get("cascade_bounce", {}) or {}
+        self.cb_allocation_pct = float(cb.get("allocation_pct", 0.12))
+        self.cb_max_hold_minutes = float(cb.get("max_hold_minutes", 20))
+        self.max_spread_pct = float(r.get("max_spread_pct", 0.0015))
+        # Layer 2 — in-trade
+        self.atr_sl_multiplier = float(r.get("atr_sl_multiplier", 1.5))
+        self.atr_trail_multiplier = float(r.get("atr_trail_multiplier", 1.0))
+        self.trail_activation_r = float(r.get("trail_activation_r", 1.5))
+        self.take_profit_r = float(r.get("take_profit_r", 2.0))
+        self.max_loss_per_trade_pct = float(r.get("max_loss_per_trade_pct", 0.02))
+        self.emergency_loss_pct = float(r.get("emergency_loss_pct", 0.03))
+        self.max_hold_hours_scalp = float(r.get("max_hold_hours_scalp", 4))
+        self.max_hold_hours_swing = float(r.get("max_hold_hours_swing", 48))
+        # Layer 3 — market kill switches
+        self.cascade_detection_enabled = bool(
+            r.get("cascade_detection_enabled", True))
+        self.cascade_oi_drop_pct = float(r.get("cascade_oi_drop_pct", 0.15))
+        self.cascade_price_move_pct = float(r.get("cascade_price_move_pct", 0.03))
+        self.cascade_window_minutes = float(r.get("cascade_window_minutes", 5))
+        self.cascade_halt_hours = float(r.get("cascade_halt_hours", 2))
+        self.extreme_funding_long_halt = float(r.get("extreme_funding_long_halt", 0.001))
+        self.extreme_funding_short_halt = float(r.get("extreme_funding_short_halt", -0.001))
+        self.flash_crash_candle_pct = float(r.get("flash_crash_candle_pct", 0.05))
+        self.weekly_drawdown_limit = float(r.get("weekly_drawdown_limit", 0.10))
+        self.cooldown_hours = float(r.get("cooldown_hours", 48))
+
+    def refresh_params(self) -> dict:
+        """Re-read all tunable guard params from the (already override-merged)
+        config. Returns {param: (old, new)} for values that changed, so the
+        loop can log an audit line. Called once per cycle by run_bot.py."""
+        before = {k: getattr(self, k) for k in (
+            "daily_drawdown_limit", "severe_drawdown_limit",
+            "max_concurrent_positions", "max_leverage", "min_confidence",
+            "min_model_agreement", "max_spread_pct", "atr_sl_multiplier",
+            "atr_trail_multiplier", "trail_activation_r", "take_profit_r",
+            "max_loss_per_trade_pct", "emergency_loss_pct",
+            "max_hold_hours_scalp", "cascade_detection_enabled",
+            "cascade_oi_drop_pct", "cascade_price_move_pct",
+            "cascade_window_minutes", "weekly_drawdown_limit")}
+        self._load_params()
+        return {k: (before[k], getattr(self, k))
+                for k in before if before[k] != getattr(self, k)}
 
     # ------------------------------------------------------------------
     # state helpers
@@ -319,7 +329,7 @@ class RiskManager:
 
         # Layer 3: per-coin kill switches
         for coin in self.buf.coins:
-            if self._cascade_triggered(coin):
+            if self.cascade_detection_enabled and self._cascade_triggered(coin):
                 self._close_all(f"liquidation cascade on {coin}")
                 self._halt(now + self.cascade_halt_hours * 3600,
                            f"cascade on {coin}")
@@ -421,11 +431,13 @@ class RiskManager:
     # ------------------------------------------------------------------
     def calc_sl_tp(self, coin: str, entry_px: float, is_long: bool,
                    atr: float) -> tuple[float, float]:
-        """Returns (stop_loss_px, take_profit_px). SL at 1.5*ATR, TP at 2R."""
+        """Returns (stop_loss_px, take_profit_px). SL at atr_sl_multiplier*ATR,
+        TP at take_profit_r * the initial risk (R)."""
         r = atr * self.atr_sl_multiplier
+        tp_r = self.take_profit_r
         if is_long:
-            return entry_px - r, entry_px + 2 * r
-        return entry_px + r, entry_px - 2 * r
+            return entry_px - r, entry_px + tp_r * r
+        return entry_px + r, entry_px - tp_r * r
 
     def register_entry(self, coin: str, entry_px: float, sl: float, tp: float,
                        is_long: bool, hold_hours: float | None = None):
@@ -461,6 +473,23 @@ class RiskManager:
             if szi == 0:
                 continue
             seen.add(coin)
+
+            # close-pending guard: a close order was already accepted for this
+            # coin. Skip re-evaluating SL/TP until the position state refreshes
+            # (the position should disappear from the next positions() call). If
+            # it's still here after the timeout, treat it as stuck and re-check
+            # so a genuinely failed close eventually retries.
+            pending_ts = self._close_pending.get(coin)
+            if pending_ts is not None:
+                elapsed = now - pending_ts
+                if elapsed < CLOSE_PENDING_TIMEOUT_S:
+                    log.debug("skipping %s — close pending (%.0fs ago)",
+                              coin, elapsed)
+                    continue
+                log.warning("close pending timeout for %s (%.0fs) — position "
+                            "still open, re-evaluating", coin, elapsed)
+                del self._close_pending[coin]
+
             is_long = szi > 0
             entry = float(pos.get("entryPx") or 0)
             upnl = float(pos.get("unrealizedPnl") or 0)
@@ -533,7 +562,26 @@ class RiskManager:
         for coin in list(self._pos_track):
             if coin not in seen:
                 del self._pos_track[coin]
+        # a close-pending coin that's no longer in the positions list is
+        # confirmed closed — clear the flag so a future re-entry can be managed.
+        for coin in list(self._close_pending):
+            if coin not in seen:
+                log.info("position confirmed closed for %s — clearing "
+                         "close-pending", coin)
+                del self._close_pending[coin]
         return actions
+
+    def mark_close_pending(self, coin: str):
+        """Record that a close order was accepted for coin. The in-trade guard
+        then suppresses further close attempts on it until the position state
+        refreshes (or CLOSE_PENDING_TIMEOUT_S expires). Primary defense against
+        duplicate close orders firing every cycle on a stale position."""
+        self._close_pending[coin] = time.time()
+        log.info("CLOSE_PENDING set for %s", coin)
+
+    def clear_close_pending(self, coin: str):
+        """Drop the close-pending flag (e.g. once the close is confirmed)."""
+        self._close_pending.pop(coin, None)
 
     # ------------------------------------------------------------------
     # manual controls (dashboard)
@@ -543,12 +591,27 @@ class RiskManager:
         self._close_all("manual halt from dashboard")
         self._halt(time.time() + 365 * 86_400, "manual halt from dashboard")
 
+    def manual_pause(self, reason: str = "manual pause from dashboard"):
+        """Soft pause: stop opening new entries (MANAGING), keep guards and
+        open-position management running. Reversible with manual_resume."""
+        if self.state == BotState.ACTIVE:
+            self._set_state(BotState.MANAGING, reason)
+
+    def manual_close_all(self, reason: str = "manual close-all from dashboard"):
+        """Close every open position now and drop to MANAGING (no new entries
+        until resumed). Lighter than manual_halt — no long timed lockout."""
+        self._close_all(reason)
+        if self.state in (BotState.ACTIVE, BotState.CASCADE_BOUNCE_ACTIVE):
+            self._set_state(BotState.MANAGING, reason)
+
     def manual_resume(self):
         if self.state in (BotState.HALTED, BotState.COOLDOWN):
             self._halted_until = 0.0
             self._cooldown_until = 0.0
             self.db.set_state("risk_halted_until", "0")
             self.db.set_state("risk_cooldown_until", "0")
+            self._set_state(BotState.ACTIVE, "manual resume from dashboard")
+        elif self.state == BotState.MANAGING:
             self._set_state(BotState.ACTIVE, "manual resume from dashboard")
 
     # ------------------------------------------------------------------
@@ -566,6 +629,8 @@ class RiskManager:
             side = "LONG" if float(pos.get("szi") or 0) > 0 else "SHORT"
             res = with_retry(lambda c=coin: self.xc.market_close(c),
                              f"market_close({coin})")
+            if res:
+                self.mark_close_pending(coin)
             self.db.log_trade(coin, side, "CLOSE",
                               size=abs(float(pos.get("szi") or 0)),
                               status="ok" if res else "error",

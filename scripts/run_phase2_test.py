@@ -7,7 +7,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from reaper.risk.manager import RiskManager
+from reaper.risk.manager import CLOSE_PENDING_TIMEOUT_S, RiskManager
 from reaper.risk.state import BotState
 
 RISK_CFG = {
@@ -316,6 +316,68 @@ def main():
     acts = rm.check_open_positions([pos_entry(upnl=5)])
     report("time expiry -> CLOSE",
            any("hold" in a.get("reason", "") for a in acts), str(acts))
+
+    print("\nClose-pending guard (duplicate-close fix):")
+    # 1. after a close is marked pending, a stale position (still showing open)
+    #    is NOT re-evaluated -> no duplicate CLOSE action
+    rm, buf, db, xc = fresh()
+    rm.check()
+    rm.register_entry("BTC", 100.0, 97.0, 106.0, True)
+    buf.mid_px = 96.5                            # below SL -> would CLOSE
+    rm.mark_close_pending("BTC")
+    acts = rm.check_open_positions([pos_entry(upnl=-35)])
+    report("close-pending suppresses duplicate CLOSE on stale position",
+           not any(a["action"] == "CLOSE" for a in acts), str(acts))
+    report("close-pending retains the position tracker while suppressed",
+           "BTC" in rm._pos_track)
+
+    # 2. once the position is actually gone, the pending flag is cleared
+    acts = rm.check_open_positions([])           # position no longer present
+    report("close-pending cleared once position confirmed gone",
+           "BTC" not in rm._close_pending)
+
+    # 3. after the timeout, a still-open position is re-evaluated (stuck retry)
+    rm, buf, db, xc = fresh()
+    rm.check()
+    rm.register_entry("BTC", 100.0, 97.0, 106.0, True)
+    buf.mid_px = 96.5
+    rm.mark_close_pending("BTC")
+    rm._close_pending["BTC"] = time.time() - (CLOSE_PENDING_TIMEOUT_S + 1)
+    acts = rm.check_open_positions([pos_entry(upnl=-35)])
+    report("close-pending timeout re-evaluates a genuinely stuck position",
+           any(a["action"] == "CLOSE" for a in acts)
+           and "BTC" not in rm._close_pending, str(acts))
+
+    # 4. no pending flag -> normal SL close still fires (regression)
+    rm, buf, db, xc = fresh()
+    rm.check()
+    rm.register_entry("BTC", 100.0, 97.0, 106.0, True)
+    buf.mid_px = 96.5
+    acts = rm.check_open_positions([pos_entry(upnl=-35)])
+    report("no pending flag -> SL close fires normally",
+           any(a["action"] == "CLOSE" for a in acts), str(acts))
+
+    print("\nTrades-table CLOSE dedup:")
+    import tempfile
+    from reaper.db import DB as RealDB
+    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    tmp.close()
+    rdb = RealDB(tmp.name)
+    rdb.log_trade("ETH", "SHORT", "CLOSE", note="stop loss @ 1867.3714")
+    rdb.log_trade("ETH", "SHORT", "CLOSE", note="stop loss @ 1867.3714")
+    rdb.log_trade("ETH", "SHORT", "CLOSE", note="stop loss @ 1867.3714")
+    n_dup = rdb._conn().execute(
+        "SELECT COUNT(*) FROM trades WHERE coin='ETH' AND action='CLOSE'"
+    ).fetchone()[0]
+    report("identical CLOSE within 60s logged only once", n_dup == 1,
+           f"rows={n_dup}")
+    rdb.log_trade("ETH", "SHORT", "CLOSE", note="take profit @ 1900.0")
+    n_diff = rdb._conn().execute(
+        "SELECT COUNT(*) FROM trades WHERE coin='ETH' AND action='CLOSE'"
+    ).fetchone()[0]
+    report("a different CLOSE reason is still logged", n_diff == 2,
+           f"rows={n_diff}")
+    Path(tmp.name).unlink(missing_ok=True)
 
     print(f"\n{'=' * 40}")
     passed, total = sum(RESULTS), len(RESULTS)
