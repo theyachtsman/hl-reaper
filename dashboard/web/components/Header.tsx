@@ -5,7 +5,9 @@ import { useEffect } from "react";
 import clsx from "clsx";
 import { api } from "@/lib/api";
 import { useStatusStore } from "@/lib/store";
+import DirectionBadge from "./DirectionBadge";
 import ModeBadge from "./ModeBadge";
+import PresetBadge from "./PresetBadge";
 import StateBadge from "./StateBadge";
 
 const NAV = [
@@ -59,6 +61,8 @@ export default function Header() {
                 ♥ {status.heartbeat_age_s != null ? `${status.heartbeat_age_s}s` : "—"}
               </span>
               <ModeBadge mode={status.trading_mode} />
+              <PresetBadge />
+              <DirectionBadge directions={status.directions} />
               <StateBadge state={status.risk_state} />
             </>
           )}
