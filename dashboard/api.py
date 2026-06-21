@@ -274,10 +274,33 @@ def _fills_sync_loop():
 threading.Thread(target=_fills_sync_loop, daemon=True).start()
 
 
+def _attach_bands(trips: list[dict]) -> list[dict]:
+    """Best-effort band attribution for reconstructed round-trips. Fills carry
+    no band (the exchange doesn't know our bands); the band lives on our
+    trades-table OPEN rows. Match each round-trip to the nearest same-coin,
+    same-direction OPEN within a 10-minute window and copy its band. Anything
+    unmatched (legacy/manual entries) gets band=None -> shown as '—'."""
+    opens: dict[tuple, list[tuple]] = {}
+    for o in rows("SELECT ts, coin, side, band FROM trades "
+                  "WHERE action='OPEN' AND band IS NOT NULL ORDER BY ts"):
+        opens.setdefault((o["coin"], o["side"]), []).append((o["ts"], o["band"]))
+    for t in trips:
+        cands = opens.get((t["coin"], t["direction"]), [])
+        best_band, best_d = None, None
+        for ts, band in cands:
+            d = abs(ts - t["entry_ts"])
+            if best_d is None or d < best_d:
+                best_d, best_band = d, band
+        t["band"] = best_band if (best_d is not None and best_d <= 600_000) \
+            else None
+    return trips
+
+
 def _history_trades() -> list[dict]:
-    """All reconstructed round-trip trades from the durable archive."""
+    """All reconstructed round-trip trades from the durable archive, with
+    best-effort per-band attribution from the trades table."""
     conn = fills_store.connect()
-    return fills_store.reconstruct_trades(conn)
+    return _attach_bands(fills_store.reconstruct_trades(conn))
 
 
 # ---------------------------------------------------------------------------
@@ -358,6 +381,12 @@ def pulse():
 def positions():
     u = cache.user or {}
     ms = u.get("marginSummary", {})
+    # band attribution: one band owns a coin at a time, so the latest OPEN row
+    # for the coin tells us which band the live position belongs to.
+    last_band: dict[str, str] = {}
+    for r in rows("SELECT coin, band FROM trades WHERE action='OPEN' "
+                  "AND band IS NOT NULL ORDER BY ts DESC LIMIT 200"):
+        last_band.setdefault(r["coin"], r["band"])
     pos = []
     for p in u.get("assetPositions", []):
         q = p.get("position", {})
@@ -365,6 +394,7 @@ def positions():
             continue
         pos.append({
             "coin": q.get("coin"),
+            "band": last_band.get(q.get("coin")),
             "szi": float(q.get("szi") or 0),
             "entry_px": float(q.get("entryPx") or 0),
             "position_value": float(q.get("positionValue") or 0),
@@ -404,7 +434,7 @@ SKIP_STATUSES = (
 @app.get("/api/trades")
 def trades(limit: int = 200, coin: str | None = None,
            action: str | None = None, status: str | None = None,
-           include_skips: bool = False):
+           band: str | None = None, include_skips: bool = False):
     """Trade audit log: real OPEN/CLOSE/TEST actions. Skip statuses are
     excluded by default. Returns {total, trades} so the UI can show how many
     rows matched the active filters vs how many are displayed."""
@@ -425,6 +455,9 @@ def trades(limit: int = 200, coin: str | None = None,
     if status:
         clauses.append("status = ?")
         params.append(status)
+    if band:
+        clauses.append("band = ?")
+        params.append(band)
     where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
     total = rows(f"SELECT COUNT(*) AS n FROM trades{where}", *params)[0]["n"]
     out = rows(f"SELECT * FROM trades{where} ORDER BY ts DESC LIMIT ?",
@@ -453,14 +486,43 @@ def tickets():
     """
     eff = effective_config()
     risk_cfg = eff.get("risk", {}) or {}
-    # the effective config already has live_config overrides merged in, so the
-    # gates shown are exactly what the bot enforces this loop (no mode toggle).
+    trading_cfg = eff.get("trading", {}) or {}
+    # Dual band (2026-06-20): the bot publishes a per-band verdict per coin —
+    # {coin: {scalp: {...}, trend: {...}}} — each already aggregated with the
+    # band's fixed weight set (and, for scalp, the 1h regime bias already
+    # applied). The bridge does NOT re-aggregate (that would drop the band
+    # weights + bias); it reads the published verdict and only computes
+    # would_fire against each band's gate.
+    scalp_struct = (bool(risk_cfg.get("scalp_structural_gates_enabled", True)))
     gates = {
-        "min_confidence": float(risk_cfg.get("min_confidence", 0.62)),
-        "min_model_agreement": int(risk_cfg.get("min_model_agreement", 4)),
+        "scalp": {
+            "min_confidence": float(risk_cfg.get("scalp_min_confidence", 0.40)),
+            "min_model_agreement": int(
+                risk_cfg.get("scalp_min_model_agreement", 2)),
+            "structural_gates_enabled": scalp_struct,
+            "long_structural_gate_enabled": bool(
+                trading_cfg.get("long_structural_gate_enabled", True)),
+            "short_structural_gate_enabled": bool(
+                trading_cfg.get("short_structural_gate_enabled", True)),
+        },
+        "trend": {
+            "min_confidence": float(risk_cfg.get("trend_min_confidence", 0.55)),
+            "min_model_agreement": int(
+                risk_cfg.get("trend_min_model_agreement", 3)),
+            "structural_gates_enabled": False,
+        },
+        "funding_hard_block_enabled": bool(
+            risk_cfg.get("funding_hard_block_enabled", True)),
+        "regime_counter_trend_penalty": float(
+            risk_cfg.get("regime_counter_trend_penalty", 0.7)),
         "mode": "live_config",
     }
-    empty = {"ts": None, "coins": {}, "verdicts": {}, "gates": gates}
+    bands_enabled = {
+        "scalp": bool(trading_cfg.get("scalp_band_enabled", True)),
+        "trend": bool(trading_cfg.get("trend_band_enabled", True)),
+    }
+    empty = {"ts": None, "coins": {}, "verdicts": {}, "gates": gates,
+             "bands": bands_enabled}
     raw = get_state("live_tickets")
     if not raw:
         return empty
@@ -469,162 +531,135 @@ def tickets():
     except Exception:
         return empty
 
-    from reaper.aggregator import SignalAggregator
-    from reaper.models import Ticket
-
-    trading_cfg = eff.get("trading", {}) or {}
-    agg = SignalAggregator(
-        funding_hard_block_enabled=bool(
-            risk_cfg.get("funding_hard_block_enabled", True)),
-        funding_hard_block_conf=float(
-            risk_cfg.get("funding_hard_block_conf", 0.75)),
-        funding_hard_block_short_enabled=bool(
-            risk_cfg.get("funding_hard_block_short_enabled", False)),
-        funding_hard_block_short_conf=float(
-            risk_cfg.get("funding_hard_block_short_conf", 0.75)))
-    long_conf_enabled = bool(trading_cfg.get("long_confirmation_enabled", True))
-    long_conf_models = set(trading_cfg.get(
-        "long_confirmation_models",
-        ["OrderbookImbalanceModel", "VWAPModel"]))
-    long_conf_min = int(trading_cfg.get("long_confirmation_min", 1))
-    short_conf_enabled = bool(
-        trading_cfg.get("short_confirmation_enabled", False))
-    short_conf_models = set(trading_cfg.get(
-        "short_confirmation_models",
-        ["OrderbookImbalanceModel", "VWAPModel"]))
-    short_conf_min = int(trading_cfg.get("short_confirmation_min", 1))
-    # LONG structural gate (2026-06-17) — the bot publishes its per-coin
-    # spot/OI/book status each loop (it needs the live MarketBuffer to compute
-    # it; the bridge can't recompute it from tickets alone). We read it through.
-    long_struct_enabled = bool(
-        trading_cfg.get("long_structural_gate_enabled", True))
     long_gates_pub = data.get("long_gates") or {}
+    short_gates_pub = data.get("short_gates") or {}
     STRUCT_REASON = {
         "spot_not_leading": "LONG blocked (spot not leading perp)",
         "oi_not_rising": "LONG blocked (OI not rising)",
         "book_not_bid_heavy": "LONG blocked (book not bid-heavy)",
         "recent_pump": "LONG blocked (recent pump — cooldown)",
     }
-    # SHORT structural gate (2026-06-19) — mirror of the LONG gate
-    short_struct_enabled = bool(
-        trading_cfg.get("short_structural_gate_enabled", True))
-    short_gates_pub = data.get("short_gates") or {}
     SHORT_STRUCT_REASON = {
         "spot_not_lagging": "SHORT blocked (spot not lagging perp)",
         "oi_not_rising": "SHORT blocked (OI not rising w/ falling price)",
         "book_not_ask_heavy": "SHORT blocked (book not ask-heavy)",
         "recent_dump": "SHORT blocked (recent dump — cooldown)",
     }
-    verdicts: dict = {}
-    for coin, tks in (data.get("coins") or {}).items():
-        try:
-            objs = [Ticket(model=t["model"], direction=t["direction"],
-                           confidence=float(t.get("confidence") or 0),
-                           meta=t.get("meta") or {}) for t in tks]
-            sig = agg.aggregate(coin, objs)
-            agreement = (sig.long_votes if sig.direction == "LONG"
-                         else sig.short_votes if sig.direction == "SHORT"
-                         else 0)
-            fund = next((t for t in objs
-                         if t.model == "FundingRateModel"), None)
-            veto = bool(fund and sig.direction in ("LONG", "SHORT")
-                        and fund.direction in ("LONG", "SHORT")
-                        and fund.direction != sig.direction)
-            # LONG structural gate (run_bot, 2026-06-17): would this LONG be
-            # blocked for lack of {spot leading, OI rising, book bid-heavy}?
-            # The bot publishes the computed status per coin. Funding hard-block
-            # already lands inside sig (FLAT + meta.block_reason).
-            gate = long_gates_pub.get(coin) or {}
-            long_blocked = bool(
-                long_struct_enabled and sig.direction == "LONG"
-                and gate and not gate.get("allowed"))
-            # SHORT structural gate (run_bot, 2026-06-19): would this SHORT be
-            # blocked for lack of {spot lagging, OI rising w/ falling price,
-            # book ask-heavy, dump cooldown}?
+
+    # parked non-voters (+ the meta router) are excluded from the reported vote
+    # tally so the dashboard shows the real active-voter count (e.g. 1/1/3, not
+    # 1/1/5). Recomputed here from the published tickets so it's correct even
+    # before the bot restarts onto the matching aggregator change.
+    NON_VOTERS = {"MLForecastModel", "LiquidationHeatmapModel",
+                  "RegimeDetectorModel"}
+
+    def _band_verdict(coin: str, band: str, packed: dict) -> dict:
+        g = gates[band]
+        direction = packed.get("direction", "FLAT")
+        confidence = float(packed.get("confidence") or 0)
+        meta = packed.get("meta") or {}
+        tks = packed.get("tickets") or []
+        active = [t for t in tks if t.get("model") not in NON_VOTERS]
+        if active:
+            long_votes = sum(1 for t in active if t.get("direction") == "LONG")
+            short_votes = sum(1 for t in active if t.get("direction") == "SHORT")
+            flat_votes = sum(1 for t in active if t.get("direction") == "FLAT")
+        else:  # no ticket list published — fall back to the packed counts
+            long_votes = int(packed.get("long") or 0)
+            short_votes = int(packed.get("short") or 0)
+            flat_votes = int(packed.get("flat") or 0)
+        agreement = (long_votes if direction == "LONG"
+                     else short_votes if direction == "SHORT" else 0)
+        fund = next((t for t in tks if t["model"] == "FundingRateModel"), None)
+        veto = bool(fund and direction in ("LONG", "SHORT")
+                    and fund["direction"] in ("LONG", "SHORT")
+                    and fund["direction"] != direction)
+        block_reason = meta.get("block_reason")
+        long_gate = short_gate = None
+        long_blocked = short_blocked = False
+        # structural gates apply to the SCALP band only
+        if band == "scalp" and g["structural_gates_enabled"]:
+            long_gate = long_gates_pub.get(coin) or {}
             short_gate = short_gates_pub.get(coin) or {}
-            short_blocked = bool(
-                short_struct_enabled and sig.direction == "SHORT"
-                and short_gate and not short_gate.get("allowed"))
-            # legacy OB/VWAP confirmation (kept for the SHORT mirror display)
-            long_unconfirmed = False
-            if long_conf_enabled and sig.direction == "LONG":
-                confirming = sum(
-                    1 for t in objs
-                    if t.model in long_conf_models and t.direction == "LONG")
-                long_unconfirmed = confirming < long_conf_min
-            short_unconfirmed = False
-            if short_conf_enabled and sig.direction == "SHORT":
-                confirming = sum(
-                    1 for t in objs
-                    if t.model in short_conf_models and t.direction == "SHORT")
-                short_unconfirmed = confirming < short_conf_min
-            block_reason = sig.meta.get("block_reason")
-            if long_blocked:
+            if (g["long_structural_gate_enabled"] and direction == "LONG"
+                    and long_gate and not long_gate.get("allowed")):
+                long_blocked = True
                 block_reason = STRUCT_REASON.get(
-                    gate.get("block_reason"), "LONG blocked (structural gate)")
-            elif short_blocked:
+                    long_gate.get("block_reason"),
+                    "LONG blocked (structural gate)")
+            elif (g["short_structural_gate_enabled"] and direction == "SHORT"
+                    and short_gate and not short_gate.get("allowed")):
+                short_blocked = True
                 block_reason = SHORT_STRUCT_REASON.get(
                     short_gate.get("block_reason"),
                     "SHORT blocked (structural gate)")
-            elif long_unconfirmed:
-                block_reason = "LONG skipped (no microstructure confirmation)"
-            elif short_unconfirmed:
-                block_reason = "SHORT skipped (no microstructure confirmation)"
+        would_fire = (bands_enabled[band] and direction in ("LONG", "SHORT")
+                      and not long_blocked and not short_blocked
+                      and confidence >= g["min_confidence"]
+                      and agreement >= g["min_model_agreement"])
+        return {
+            "direction": direction,
+            "confidence": round(confidence, 3),
+            "long_votes": long_votes, "short_votes": short_votes,
+            "flat_votes": flat_votes, "agreement": agreement,
+            "regime": packed.get("regime"), "veto": veto,
+            "block_reason": block_reason,
+            "regime_bias": meta.get("regime_bias"),
+            "long_gate": long_gate or None, "short_gate": short_gate or None,
+            "would_fire": would_fire, "enabled": bands_enabled[band],
+        }
+
+    verdicts: dict = {}
+    for coin, bands in (data.get("coins") or {}).items():
+        try:
+            # tolerate the legacy flat-list shape during a bot/bridge restart
+            if isinstance(bands, list):
+                continue
             verdicts[coin] = {
-                "direction": sig.direction,
-                "confidence": round(sig.confidence, 3),
-                "long_votes": sig.long_votes,
-                "short_votes": sig.short_votes,
-                "flat_votes": sig.flat_votes,
-                "agreement": agreement,
-                "regime": sig.regime,
-                "veto": veto,
-                "block_reason": block_reason,
-                "long_gate": gate or None,
-                "short_gate": short_gate or None,
-                "would_fire": (sig.direction in ("LONG", "SHORT")
-                               and not long_blocked
-                               and not short_blocked
-                               and not long_unconfirmed
-                               and not short_unconfirmed
-                               and sig.confidence >= gates["min_confidence"]
-                               and agreement >= gates["min_model_agreement"]),
+                "scalp": _band_verdict(coin, "scalp", bands.get("scalp") or {}),
+                "trend": _band_verdict(coin, "trend", bands.get("trend") or {}),
             }
         except Exception as e:
             log.warning("verdict aggregation failed for %s: %s", coin, e)
     data["verdicts"] = verdicts
     data["gates"] = gates
+    data["bands"] = bands_enabled
     return _json_safe(data)
 
 
 @app.get("/api/fills")
 def fills():
-    """Realized per-coin PnL + win rate from exchange fill history."""
+    """Realized per-coin PnL + win rate from reconstructed ROUND-TRIP trades.
+
+    Same source of truth as the History page (reaper.data.fills_store) — one
+    win/loss per round-trip, net of fees. NOT per-fill: counting each partial
+    closing fill's closedPnl separately double-counts a single profitable close
+    and inflates the win streak / win-rate (the documented per-fill artifact).
+    Response shape is unchanged so the Profit Deck and Risk page need no edits;
+    `recent` is now newest-first round-trip closes, `closed_pnl` is net realized.
+    """
     try:
-        fl = cache.info.user_fills(cfg.account_address) or []
+        trades = _history_trades()
     except Exception as e:
-        raise HTTPException(502, f"user_fills failed: {e}")
+        raise HTTPException(502, f"fills reconstruct failed: {e}")
     per: dict[str, dict] = {}
-    recent = []
-    for f in fl:
-        coin = f.get("coin")
-        pnl = float(f.get("closedPnl") or 0)
-        fee = float(f.get("fee") or 0)
-        s = per.setdefault(coin, {"realized_pnl": 0.0, "fees": 0.0,
-                                  "closes": 0, "wins": 0})
-        s["realized_pnl"] += pnl
-        s["fees"] += fee
-        if pnl != 0:
-            s["closes"] += 1
-            s["wins"] += 1 if pnl > 0 else 0
-        if len(recent) < 50:
-            recent.append({"ts": f.get("time"), "coin": coin,
-                           "side": f.get("side"), "px": f.get("px"),
-                           "sz": f.get("sz"), "closed_pnl": pnl, "fee": fee})
+    for t in trades:
+        s = per.setdefault(t["coin"], {"realized_pnl": 0.0, "fees": 0.0,
+                                       "closes": 0, "wins": 0})
+        s["realized_pnl"] += t["realized_pnl"]
+        s["fees"] += t["fees"]
+        s["closes"] += 1
+        s["wins"] += 1 if t["realized_pnl"] > 0 else 0
     for s in per.values():
         s["win_rate"] = (s["wins"] / s["closes"]) if s["closes"] else None
         s["realized_pnl"] = round(s["realized_pnl"], 4)
         s["fees"] = round(s["fees"], 4)
+    # newest-first round-trip closes for the deck's streak / stack / popups
+    recent = [{
+        "ts": t["exit_ts"], "coin": t["coin"], "side": t["direction"],
+        "px": t.get("exit_px"), "sz": round(t["qty"], 6),
+        "closed_pnl": round(t["realized_pnl"], 4), "fee": round(t["fees"], 4),
+    } for t in sorted(trades, key=lambda x: x["exit_ts"], reverse=True)[:50]]
     return {"per_coin": per, "recent": recent}
 
 
@@ -704,8 +739,8 @@ def chart(coin: str, interval: str = "5m", limit: int = 200):
     since = int((time.time() - 48 * 3600) * 1000)
     _skip_ph = ",".join("?" * len(SKIP_STATUSES))
     trs = rows(
-        "SELECT ts, side, action, size, price, status, note FROM trades "
-        "WHERE coin=? AND ts>=? AND action IN ('OPEN','CLOSE') "
+        "SELECT ts, side, action, size, price, status, note, band FROM trades "
+        "WHERE coin=? AND ts>=? AND action IN ('OPEN','CLOSE','BE_LOCK') "
         f"AND (status IS NULL OR status NOT IN ({_skip_ph})) "
         "AND (status IS NULL OR status NOT LIKE 'long_blocked%') "
         "ORDER BY ts ASC",
@@ -736,10 +771,19 @@ def chart(coin: str, interval: str = "5m", limit: int = 200):
                 "size": float(t["size"]) if t["size"] is not None else None,
                 "conf": float(conf.group(1)) if conf else None,
                 "votes": int(votes.group(1)) if votes else None,
-                "note": note,
+                "band": t["band"], "note": note,
             }
             markers.append(entry)
             open_stack.append(entry)
+        elif t["action"] == "BE_LOCK":
+            # breakeven profit lock fired — SL snapped to entry+buffer. Does not
+            # touch open_stack pairing; just a visual "BE" marker on the chart.
+            markers.append({
+                "time": bucket(t["ts"]), "type": "be",
+                "direction": t["side"],
+                "price": float(t["price"]) if t["price"] is not None else None,
+                "band": t["band"], "note": note,
+            })
         else:  # CLOSE
             px = _EXIT_PX_RE.search(note)
             exit_px = float(px.group(1)) if px else None
@@ -753,7 +797,9 @@ def chart(coin: str, interval: str = "5m", limit: int = 200):
             markers.append({
                 "time": bucket(t["ts"]), "type": "exit",
                 "direction": direction, "price": exit_px,
-                "result": _exit_result(note), "pnl": pnl, "note": note,
+                "result": _exit_result(note), "pnl": pnl,
+                "band": t["band"] or (matched.get("band") if matched else None),
+                "note": note,
             })
 
     # open position (if any) from the account-state poller.
@@ -788,12 +834,14 @@ def chart(coin: str, interval: str = "5m", limit: int = 200):
 # History page — round-trip trade archive (corrected per-trade PnL)
 # ---------------------------------------------------------------------------
 def _filter_sort(trades: list[dict], coin, direction, result,
-                 start, end, sort, order):
+                 start, end, sort, order, band=None):
     out = trades
     if coin:
         out = [t for t in out if t["coin"] == coin]
     if direction:
         out = [t for t in out if t["direction"] == direction.upper()]
+    if band:
+        out = [t for t in out if (t.get("band") or "") == band]
     if result == "win":
         out = [t for t in out if t["realized_pnl"] > 0]
     elif result == "loss":
@@ -830,6 +878,19 @@ def _summarize(trades: list[dict]) -> dict:
         s["net"] = round(s["net"], 4)
         s["fees"] = round(s["fees"], 4)
         s["win_rate"] = s["wins"] / s["n"] if s["n"] else None
+    # per-band breakdown (scalp / trend / unattributed) for the History page
+    per_band: dict[str, dict] = {}
+    for t in trades:
+        b = t.get("band") or "unattributed"
+        s = per_band.setdefault(b, {"n": 0, "net": 0.0, "wins": 0, "fees": 0.0})
+        s["n"] += 1
+        s["net"] += t["realized_pnl"]
+        s["fees"] += t["fees"]
+        s["wins"] += 1 if t["realized_pnl"] > 0 else 0
+    for s in per_band.values():
+        s["net"] = round(s["net"], 4)
+        s["fees"] = round(s["fees"], 4)
+        s["win_rate"] = s["wins"] / s["n"] if s["n"] else None
     best = max(trades, key=lambda t: t["realized_pnl"])
     worst = min(trades, key=lambda t: t["realized_pnl"])
     return {
@@ -847,6 +908,7 @@ def _summarize(trades: list[dict]) -> dict:
         "first_ts": min(t["entry_ts"] for t in trades),
         "last_ts": max(t["exit_ts"] for t in trades),
         "per_coin": per_coin,
+        "per_band": per_band,
         "best": {"coin": best["coin"], "pnl": round(best["realized_pnl"], 4),
                  "ts": best["exit_ts"]},
         "worst": {"coin": worst["coin"], "pnl": round(worst["realized_pnl"], 4),
@@ -861,14 +923,21 @@ def history_summary():
 
 
 @app.get("/api/history/daily")
-def history_daily():
-    """Realized PnL per UTC day (by exit date) + running cumulative."""
+def history_daily(tz_offset: int = 0):
+    """Realized PnL per day (by exit date) + running cumulative.
+
+    tz_offset is the viewer's JS getTimezoneOffset() in minutes (UTC minus
+    local; e.g. EDT = 240). Shifting the timestamp by -tz_offset buckets trades
+    on the viewer's LOCAL calendar day instead of UTC, so the table matches the
+    local timestamps shown everywhere else. Default 0 = UTC.
+    """
     import datetime as _dt
     trades = _history_trades()
+    shift = tz_offset * 60_000
     days: dict[str, dict] = {}
     for t in trades:
         day = _dt.datetime.utcfromtimestamp(
-            t["exit_ts"] / 1000).strftime("%Y-%m-%d")
+            (t["exit_ts"] - shift) / 1000).strftime("%Y-%m-%d")
         d = days.setdefault(day, {"date": day, "net": 0.0, "gross": 0.0,
                                   "fees": 0.0, "n": 0, "wins": 0})
         d["net"] += t["realized_pnl"]
@@ -894,10 +963,11 @@ def history_daily():
 def history_trades(coin: str | None = None, direction: str | None = None,
                    result: str | None = None, start: int | None = None,
                    end: int | None = None, sort: str = "exit_ts",
-                   order: str = "desc", limit: int = 500, offset: int = 0):
+                   order: str = "desc", limit: int = 500, offset: int = 0,
+                   band: str | None = None):
     """Filtered/sorted/paginated round-trip trades."""
     flt = _filter_sort(_history_trades(), coin, direction, result, start, end,
-                       sort, order)
+                       sort, order, band)
     page = flt[offset:offset + limit]
     for t in page:
         t["realized_pnl"] = round(t["realized_pnl"], 4)
@@ -911,29 +981,73 @@ def history_trades(coin: str | None = None, direction: str | None = None,
 def history_export(coin: str | None = None, direction: str | None = None,
                    result: str | None = None, start: int | None = None,
                    end: int | None = None, sort: str = "exit_ts",
-                   order: str = "desc"):
+                   order: str = "desc", band: str | None = None):
     """CSV of round-trip trades honoring the same filters as the table —
     hand this to evaluation."""
     import csv as _csv
     import datetime as _dt
     import io as _io
     flt = _filter_sort(_history_trades(), coin, direction, result, start, end,
-                       sort, order)
+                       sort, order, band)
     buf = _io.StringIO()
     w = _csv.writer(buf)
-    w.writerow(["entry_utc", "exit_utc", "coin", "direction", "hold_minutes",
-                "entry_px", "exit_px", "qty", "n_fills", "gross_pnl", "fees",
-                "net_pnl"])
+    w.writerow(["entry_utc", "exit_utc", "coin", "direction", "band",
+                "hold_minutes", "entry_px", "exit_px", "qty", "n_fills",
+                "gross_pnl", "fees", "net_pnl"])
     iso = lambda ms: _dt.datetime.utcfromtimestamp(ms / 1000).strftime(
         "%Y-%m-%d %H:%M:%S")  # noqa: E731
     for t in flt:
         w.writerow([iso(t["entry_ts"]), iso(t["exit_ts"]), t["coin"],
-                    t["direction"], t["hold_minutes"],
+                    t["direction"], t.get("band") or "",
+                    t["hold_minutes"],
                     round(t.get("entry_px", 0), 6), round(t.get("exit_px", 0), 6),
                     round(t.get("qty", 0), 6), t["n_fills"],
                     round(t["gross_pnl"], 4), round(t["fees"], 4),
                     round(t["realized_pnl"], 4)])
     fname = f"hl_reaper_trades_{int(time.time())}.csv"
+    return Response(buf.getvalue(), media_type="text/csv",
+                    headers={"Content-Disposition":
+                             f'attachment; filename="{fname}"'})
+
+
+@app.get("/api/trades/export.csv")
+def trades_export(coin: str | None = None, action: str | None = None,
+                  status: str | None = None, include_skips: bool = False):
+    """CSV of the raw trade audit log (OPEN/CLOSE/TEST actions), honoring the
+    same filters as the audit table. Separate from the round-trip trades CSV —
+    this is the per-action bot log, not reconstructed PnL. No row limit: exports
+    every matching action."""
+    import csv as _csv
+    import datetime as _dt
+    import io as _io
+    clauses, params = [], []
+    if not include_skips:
+        ph = ",".join("?" * len(SKIP_STATUSES))
+        clauses.append(f"(status IS NULL OR status NOT IN ({ph}))")
+        params.extend(SKIP_STATUSES)
+        clauses.append("(status IS NULL OR status NOT LIKE 'long_blocked%')")
+    if coin:
+        clauses.append("coin = ?")
+        params.append(coin)
+    if action:
+        clauses.append("action = ?")
+        params.append(action)
+    if status:
+        clauses.append("status = ?")
+        params.append(status)
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    out = rows(f"SELECT * FROM trades{where} ORDER BY ts DESC", *params)
+    buf = _io.StringIO()
+    w = _csv.writer(buf)
+    w.writerow(["ts_utc", "coin", "side", "action", "size", "price",
+                "leverage", "status", "note"])
+    iso = lambda ms: _dt.datetime.utcfromtimestamp(ms / 1000).strftime(
+        "%Y-%m-%d %H:%M:%S")  # noqa: E731
+    for t in out:
+        w.writerow([iso(t["ts"]), t["coin"], t["side"], t["action"],
+                    t.get("size"), t.get("price"), t.get("leverage"),
+                    t.get("status"), t.get("note")])
+    fname = f"hl_reaper_audit_{int(time.time())}.csv"
     return Response(buf.getvalue(), media_type="text/csv",
                     headers={"Content-Disposition":
                              f'attachment; filename="{fname}"'})
@@ -1097,6 +1211,10 @@ CONFIG_SCHEMA: dict[str, dict] = {
     "risk.funding_hard_block_short_enabled": {"type": "bool"},
     "risk.funding_hard_block_short_conf": {"type": "float", "min": 0.0,
                                            "max": 1.0},
+    # FundingRateModel mapping A/B switch (2026-06-20). false = original binary
+    # zones (fallback), true = smoothed continuous mapping. Stamped on OPEN
+    # trade notes as fmap=binary|smooth for attribution.
+    "risk.funding_smooth_mapping_enabled": {"type": "bool"},
     "trading.short_confirmation_enabled": {"type": "bool"},
     "trading.short_confirmation_min": {"type": "int", "min": 0, "max": 5},
     # SHORT structural gate (2026-06-19) — mirror of the LONG gate
@@ -1121,6 +1239,10 @@ CONFIG_SCHEMA: dict[str, dict] = {
     "risk.atr_sl_multiplier": {"type": "float", "min": 0.5, "max": 3.0},
     "risk.take_profit_r": {"type": "float", "min": 1.0, "max": 4.0},
     "risk.trail_activation_r": {"type": "float", "min": 0.5, "max": 3.0},
+    # breakeven profit lock (2026-06-20) — move SL to entry+buffer at this R
+    "risk.breakeven_lock_enabled": {"type": "bool"},
+    "risk.breakeven_lock_r": {"type": "float", "min": 0.0, "max": 2.0},
+    "risk.breakeven_lock_buffer_pct": {"type": "float", "min": 0.0, "max": 0.5},
     "risk.max_hold_hours_scalp": {"type": "float", "min": 0.5, "max": 48},
     # Section 6 — taker fallback
     "trading.maker_timeout_fallback_enabled": {"type": "bool"},
@@ -1137,6 +1259,39 @@ CONFIG_SCHEMA: dict[str, dict] = {
     "risk.cascade_oi_drop_pct": {"type": "float", "min": 0.05, "max": 0.50},
     "risk.cascade_window_minutes": {"type": "float", "min": 1, "max": 60},
     "risk.cascade_price_move_pct": {"type": "float", "min": 0.01, "max": 0.20},
+    # ---- Dual band (2026-06-20): 5m SCALP + 1h TREND -----------------------
+    # Band master switches (at least one must stay enabled — both-false rejected
+    # in set_config, same as longs/shorts) and per-band direction toggles.
+    "trading.scalp_band_enabled": {"type": "bool"},
+    "trading.trend_band_enabled": {"type": "bool"},
+    "trading.scalp_longs_enabled": {"type": "bool"},
+    "trading.scalp_shorts_enabled": {"type": "bool"},
+    "trading.trend_longs_enabled": {"type": "bool"},
+    "trading.trend_shorts_enabled": {"type": "bool"},
+    # SCALP band geometry + gate
+    "risk.scalp_min_confidence": {"type": "float", "min": 0.30, "max": 0.80},
+    "risk.scalp_min_model_agreement": {"type": "int", "min": 1, "max": 6},
+    "risk.scalp_atr_sl_multiplier": {"type": "float", "min": 0.5, "max": 3.0},
+    "risk.scalp_take_profit_r": {"type": "float", "min": 1.0, "max": 4.0},
+    "risk.scalp_trail_activation_r": {"type": "float", "min": 0.5, "max": 3.0},
+    "risk.scalp_max_hold_hours": {"type": "float", "min": 0.1, "max": 12.0},
+    "risk.scalp_breakeven_lock_r": {"type": "float", "min": 0.0, "max": 2.0},
+    "risk.scalp_max_concurrent_positions": {"type": "int", "min": 1, "max": 7},
+    "risk.scalp_position_size_usd": {"type": "float", "min": 10, "max": 500},
+    "risk.scalp_structural_gates_enabled": {"type": "bool"},
+    # TREND band geometry + gate (wider/longer than scalp)
+    "risk.trend_min_confidence": {"type": "float", "min": 0.30, "max": 0.80},
+    "risk.trend_min_model_agreement": {"type": "int", "min": 1, "max": 6},
+    "risk.trend_atr_sl_multiplier": {"type": "float", "min": 0.5, "max": 5.0},
+    "risk.trend_take_profit_r": {"type": "float", "min": 1.0, "max": 8.0},
+    "risk.trend_trail_activation_r": {"type": "float", "min": 0.5, "max": 5.0},
+    "risk.trend_max_hold_hours": {"type": "float", "min": 1.0, "max": 168.0},
+    "risk.trend_breakeven_lock_r": {"type": "float", "min": 0.0, "max": 3.0},
+    "risk.trend_max_concurrent_positions": {"type": "int", "min": 1, "max": 7},
+    "risk.trend_position_size_usd": {"type": "float", "min": 10, "max": 1000},
+    # Regime bias connector: 1h regime dampens counter-trend scalp confidence
+    "risk.regime_counter_trend_penalty": {"type": "float", "min": 0.3,
+                                          "max": 1.0},
 }
 
 # ---------------------------------------------------------------------------
@@ -1151,106 +1306,148 @@ CONFIG_SCHEMA: dict[str, dict] = {
 ACTIVE_PRESET_KEY = "system.active_preset"
 LAST_PRESET_KEY = "system.last_preset"
 
+# Shared per-band fragments (dual-band redesign 2026-06-20). Presets spread
+# these and then override what makes them distinct. Keys are the real
+# risk.scalp_*/trend_* CONFIG_SCHEMA keys the bot honors.
+_SCALP_TIGHT = {
+    "risk.scalp_min_confidence": 0.40,
+    "risk.scalp_min_model_agreement": 2,
+    "risk.scalp_atr_sl_multiplier": 1.0,
+    "risk.scalp_take_profit_r": 1.5,
+    "risk.scalp_trail_activation_r": 1.0,
+    "risk.scalp_max_hold_hours": 0.5,
+    "risk.scalp_breakeven_lock_r": 0.4,
+    "risk.scalp_max_concurrent_positions": 3,
+    "risk.scalp_position_size_usd": 30,
+    "risk.scalp_structural_gates_enabled": True,
+}
+_TREND_WIDE = {
+    "risk.trend_min_confidence": 0.55,
+    "risk.trend_min_model_agreement": 3,
+    "risk.trend_atr_sl_multiplier": 2.5,
+    "risk.trend_take_profit_r": 4.0,
+    "risk.trend_trail_activation_r": 2.0,
+    "risk.trend_max_hold_hours": 48.0,
+    "risk.trend_breakeven_lock_r": 0.8,
+    "risk.trend_max_concurrent_positions": 2,
+    "risk.trend_position_size_usd": 75,
+}
+
 PRESETS: dict[str, dict] = {
-    "BASELINE": {
-        "display_name": "BASELINE",
-        "description": "Pre-gate config. Max frequency. Best for strong trends.",
-        "warning": ("This disables structural gates and increases trade "
-                    "frequency. Use only in trending markets."),
+    "DUAL_BAND": {
+        "display_name": "DUAL BAND",
+        "description": "Both bands active — 5m scalp + 1h trend simultaneously. "
+                       "The flagship dual-band configuration.",
+        "warning": None,
         "settings": {
-            "risk.min_confidence": 0.35,
-            "risk.min_model_agreement": 3,
+            "trading.scalp_band_enabled": True,
+            "trading.trend_band_enabled": True,
             "trading.longs_enabled": True,
             "trading.shorts_enabled": True,
-            "risk.atr_sl_multiplier": 1.5,
-            "risk.take_profit_r": 2.0,
-            "risk.trail_activation_r": 1.5,
-            "risk.max_hold_hours_scalp": 4.0,
-            "trading.long_structural_gate_enabled": False,
-            "trading.short_structural_gate_enabled": False,
+            "trading.scalp_longs_enabled": True,
+            "trading.scalp_shorts_enabled": True,
+            "trading.trend_longs_enabled": True,
+            "trading.trend_shorts_enabled": True,
+            **_SCALP_TIGHT, **_TREND_WIDE,
+            "risk.regime_counter_trend_penalty": 0.7,
             "risk.funding_hard_block_enabled": True,
-            "trading.long_pump_cooldown_enabled": False,
-            "trading.short_dump_cooldown_enabled": False,
         },
     },
     "SCALPER": {
         "display_name": "SCALPER",
-        "description": "Tight stops, fast exits. Current configuration.",
+        "description": "Pure 5m scalp band. Trend band disabled. Tight stops, "
+                       "fast exits, high frequency.",
         "warning": None,
         "settings": {
-            "risk.min_confidence": 0.40,
-            "risk.min_model_agreement": 3,
+            "trading.scalp_band_enabled": True,
+            "trading.trend_band_enabled": False,
             "trading.longs_enabled": True,
             "trading.shorts_enabled": True,
-            "risk.atr_sl_multiplier": 1.0,
-            "risk.take_profit_r": 1.5,
-            "risk.trail_activation_r": 1.0,
-            "risk.max_hold_hours_scalp": 0.5,
-            "trading.long_structural_gate_enabled": True,
-            "trading.short_structural_gate_enabled": True,
+            "trading.scalp_longs_enabled": True,
+            "trading.scalp_shorts_enabled": True,
+            **_SCALP_TIGHT,
             "risk.funding_hard_block_enabled": True,
-            "trading.long_pump_cooldown_enabled": True,
-            "trading.short_dump_cooldown_enabled": True,
-        },
-    },
-    "SHORT_HUNTER": {
-        "display_name": "SHORT HUNTER",
-        "description": "Shorts only. Optimized for downtrending markets.",
-        "warning": None,
-        "settings": {
-            "risk.min_confidence": 0.40,
-            "risk.min_model_agreement": 3,
-            "trading.longs_enabled": False,
-            "trading.shorts_enabled": True,
-            "risk.atr_sl_multiplier": 1.2,
-            "risk.take_profit_r": 2.0,
-            "risk.trail_activation_r": 1.5,
-            "risk.max_hold_hours_scalp": 2.0,
-            "trading.long_structural_gate_enabled": False,
-            "trading.short_structural_gate_enabled": True,
-            "risk.funding_hard_block_enabled": True,
-            "trading.long_pump_cooldown_enabled": False,
-            "trading.short_dump_cooldown_enabled": True,
         },
     },
     "TREND_RIDER": {
         "display_name": "TREND RIDER",
-        "description": "Wider stops, lets winners run. Lower frequency.",
+        "description": "Pure 1h trend band. Scalp band disabled. Wide stops, "
+                       "lets winners run, low frequency.",
         "warning": None,
         "settings": {
-            "risk.min_confidence": 0.50,
-            "risk.min_model_agreement": 4,
+            "trading.scalp_band_enabled": False,
+            "trading.trend_band_enabled": True,
             "trading.longs_enabled": True,
             "trading.shorts_enabled": True,
-            "risk.atr_sl_multiplier": 2.0,
-            "risk.take_profit_r": 3.0,
-            "risk.trail_activation_r": 2.0,
-            "risk.max_hold_hours_scalp": 8.0,
-            "trading.long_structural_gate_enabled": True,
-            "trading.short_structural_gate_enabled": True,
+            "trading.trend_longs_enabled": True,
+            "trading.trend_shorts_enabled": True,
+            **_TREND_WIDE,
             "risk.funding_hard_block_enabled": True,
-            "trading.long_pump_cooldown_enabled": True,
-            "trading.short_dump_cooldown_enabled": True,
+        },
+    },
+    "SHORT_HUNTER": {
+        "display_name": "SHORT HUNTER",
+        "description": "Both bands, shorts only. Optimized for downtrends.",
+        "warning": None,
+        "settings": {
+            "trading.scalp_band_enabled": True,
+            "trading.trend_band_enabled": True,
+            "trading.longs_enabled": False,    # global master: no longs
+            "trading.shorts_enabled": True,
+            "trading.scalp_shorts_enabled": True,
+            "trading.trend_shorts_enabled": True,
+            **_SCALP_TIGHT, **_TREND_WIDE,
+            "risk.regime_counter_trend_penalty": 0.7,
+            "risk.funding_hard_block_enabled": True,
         },
     },
     "CONSERVATIVE": {
         "display_name": "CONSERVATIVE",
-        "description": "Highest quality entries only. Minimal losses.",
+        "description": "Both bands, highest-quality entries only. Higher "
+                       "confidence/agreement bars on each band.",
         "warning": None,
         "settings": {
-            "risk.min_confidence": 0.62,
-            "risk.min_model_agreement": 4,
+            "trading.scalp_band_enabled": True,
+            "trading.trend_band_enabled": True,
             "trading.longs_enabled": True,
             "trading.shorts_enabled": True,
-            "risk.atr_sl_multiplier": 1.5,
-            "risk.take_profit_r": 2.0,
-            "risk.trail_activation_r": 1.5,
-            "risk.max_hold_hours_scalp": 2.0,
-            "trading.long_structural_gate_enabled": True,
-            "trading.short_structural_gate_enabled": True,
+            "trading.scalp_longs_enabled": True,
+            "trading.scalp_shorts_enabled": True,
+            "trading.trend_longs_enabled": True,
+            "trading.trend_shorts_enabled": True,
+            **_SCALP_TIGHT, **_TREND_WIDE,
+            "risk.scalp_min_confidence": 0.55,
+            "risk.scalp_min_model_agreement": 3,
+            "risk.trend_min_confidence": 0.62,
+            "risk.trend_min_model_agreement": 4,
+            "risk.regime_counter_trend_penalty": 0.6,
             "risk.funding_hard_block_enabled": True,
-            "trading.long_pump_cooldown_enabled": True,
-            "trading.short_dump_cooldown_enabled": True,
+        },
+    },
+    "BASELINE": {
+        "display_name": "BASELINE",
+        "description": "Both bands, structural gates off. Max frequency. Best "
+                       "for strong trends only.",
+        "warning": ("This disables structural gates and increases trade "
+                    "frequency. Use only in trending markets."),
+        "settings": {
+            "trading.scalp_band_enabled": True,
+            "trading.trend_band_enabled": True,
+            "trading.longs_enabled": True,
+            "trading.shorts_enabled": True,
+            "trading.scalp_longs_enabled": True,
+            "trading.scalp_shorts_enabled": True,
+            "trading.trend_longs_enabled": True,
+            "trading.trend_shorts_enabled": True,
+            **_SCALP_TIGHT, **_TREND_WIDE,
+            "risk.scalp_min_confidence": 0.35,
+            "risk.scalp_structural_gates_enabled": False,
+            "trading.long_structural_gate_enabled": False,
+            "trading.short_structural_gate_enabled": False,
+            "trading.long_pump_cooldown_enabled": False,
+            "trading.short_dump_cooldown_enabled": False,
+            "risk.regime_counter_trend_penalty": 0.85,
+            "risk.funding_hard_block_enabled": True,
         },
     },
 }
@@ -1350,6 +1547,18 @@ def set_config(body: ConfigBody,
             raise HTTPException(
                 400, "at least one direction (LONG or SHORT) must stay "
                      "enabled — re-enable the other side first")
+    # safety: at least one BAND must stay enabled — disabling both halts all new
+    # entries (use pause for that). Mirrors the direction guard above.
+    if body.key in ("trading.scalp_band_enabled", "trading.trend_band_enabled") \
+            and coerced is False:
+        other = ("trading.trend_band_enabled"
+                 if body.key == "trading.scalp_band_enabled"
+                 else "trading.scalp_band_enabled")
+        other_val = _flatten(effective_config()).get(other, True)
+        if not other_val:
+            raise HTTPException(
+                400, "at least one band (SCALP or TREND) must stay enabled — "
+                     "re-enable the other band first, or use pause")
     old = live_overrides().get(body.key, _flatten(cfg._raw).get(body.key))
     with db() as c:
         c.execute(
