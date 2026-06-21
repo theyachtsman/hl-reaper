@@ -1,0 +1,21 @@
+[Unit]
+Description=HL Reaper dashboard frontend (Next.js, 0.0.0.0:8888)
+After=network-online.target hl-dashboard.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=veilcerpin
+WorkingDirectory=/opt/hl-reaper/dashboard/web
+# node/npm live under nvm, which systemd does not source — call the Next.js CLI
+# directly with the absolute node binary so there's no PATH/nvm dependency.
+Environment=NODE_ENV=production
+Environment=PATH=/home/veilcerpin/.nvm/versions/node/v20.20.2/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/veilcerpin/.nvm/versions/node/v20.20.2/bin/node /opt/hl-reaper/dashboard/web/node_modules/next/dist/bin/next start -p 8888 -H 0.0.0.0
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
