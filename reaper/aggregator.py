@@ -68,6 +68,20 @@ TREND_WEIGHTS = {
 REGIME_NAMES = ("TRENDING_UP", "TRENDING_DOWN", "RANGING", "HIGH_VOL")
 FUNDING_VETO_FACTOR = 0.6
 
+# A ticket is treated as an abstention (FLAT) — and therefore excluded from BOTH
+# the directional numerator AND the weight denominator — if it has no direction
+# OR its confidence sits at/near zero. Genuine opposing votes (a LONG when the
+# net is SHORT) are NOT abstentions; they still count and reduce net conf.
+FLAT_CONF_EPS = 0.05
+
+# BOOK regime dampening (2026-06-22): a bid/ask-imbalance vote that OPPOSES the
+# confirmed 1h trend is usually absorption (large size distributing into the
+# trend), not a reversal. Down-weight such a counter-trend BOOK vote to 40% so
+# it can't cancel several trend-aligned voters, without zeroing it (a very
+# strong opposing imbalance can still register as a weak contrarian signal).
+# Agreeing BOOK votes and RANGING/UNKNOWN regimes are untouched.
+BOOK_REGIME_DAMPEN = 0.40
+
 # Permanently non-voting models (ML: direction classification not viable;
 # LiqHeatmap: inert on normal tape). Both carry 0 weight, so excluding them from
 # the vote tally is DISPLAY-ONLY — no effect on score, confidence, or
@@ -179,7 +193,8 @@ class SignalAggregator:
 
     def aggregate(self, coin: str, tickets: list[Ticket],
                   weights: dict | None = None,
-                  regime_routing: bool = True) -> AggregatedSignal:
+                  regime_routing: bool = True,
+                  book_regime: str | None = None) -> AggregatedSignal:
         """Aggregate model tickets into one directional signal.
 
         weights: optional fixed weight set (e.g. SCALP_WEIGHTS / TREND_WEIGHTS).
@@ -189,6 +204,9 @@ class SignalAggregator:
             the supplied weight set is used as-is, just renormalized — band
             weight sets are fixed and trend-awareness is applied separately via
             apply_regime_bias(). The regime string is still computed/returned.
+        book_regime: optional confirmed (1h) regime used to dampen a
+            counter-trend OrderbookImbalanceModel vote (see BOOK_REGIME_DAMPEN).
+            When None, no BOOK dampening is applied (legacy/backtest callers).
         """
         votes = {t.model: t for t in tickets}
 
@@ -204,8 +222,14 @@ class SignalAggregator:
         else:
             weights = self.adjusted_weights(regime, base=weights)
 
-        # 3/4. weighted directional score in [-1, +1]
+        # 3/4. weighted directional score, normalized over ACTIVE voters only.
+        # Abstaining models (FLAT / near-zero conf) are dropped from both the
+        # numerator and the denominator so a model sitting out (e.g.
+        # MeanReversion in a trending regime) can't dilute the conviction of the
+        # models that actually voted. Opposing directional votes still count.
+        meta: dict = {}
         score = 0.0
+        active_weight = 0.0
         long_votes = short_votes = flat_votes = 0
         for t in tickets:
             # RegimeDetector is a meta-router; ML/LiqHeatmap are parked
@@ -213,17 +237,37 @@ class SignalAggregator:
             # ones carry 0 weight, so the score is unaffected either way).
             if t.model == "RegimeDetectorModel" or t.model in INACTIVE_MODELS:
                 continue
+            # genuine abstention — excluded from the weight denominator too.
+            if t.direction not in (LONG, SHORT) or t.confidence < FLAT_CONF_EPS:
+                flat_votes += 1
+                continue
+
+            conf = t.confidence
+            # BOOK regime dampening: a counter-1h-trend imbalance vote is
+            # absorption, not reversal — shrink it so it can't cancel the
+            # trend-aligned voters. Agreeing votes / RANGING are untouched.
+            if (t.model == "OrderbookImbalanceModel" and book_regime is not None
+                    and ((book_regime == "TRENDING_DOWN" and t.direction == LONG)
+                         or (book_regime == "TRENDING_UP"
+                             and t.direction == SHORT))):
+                conf *= BOOK_REGIME_DAMPEN
+                meta["book_dampen"] = (
+                    f"OB {t.direction} {t.confidence:.2f}->{conf:.2f} "
+                    f"x{BOOK_REGIME_DAMPEN:.2f} vs 1h {book_regime}")
+
+            w = weights.get(t.model, 0.0)
+            active_weight += w
             if t.direction == LONG:
                 long_votes += 1
-                score += weights.get(t.model, 0.0) * t.confidence
-            elif t.direction == SHORT:
-                short_votes += 1
-                score -= weights.get(t.model, 0.0) * t.confidence
+                score += w * conf
             else:
-                flat_votes += 1
+                short_votes += 1
+                score -= w * conf
 
         direction = FLAT
-        confidence = abs(score)
+        confidence = abs(score) / active_weight if active_weight > 0 else 0.0
+        if active_weight <= 0:
+            score = 0.0
         if score > 1e-9:
             direction = LONG
         elif score < -1e-9:
@@ -241,7 +285,6 @@ class SignalAggregator:
         # >= hard-block confidence) blocks LONG entries outright — crowded longs
         # get squeezed. A hard override AFTER aggregation, not a weight change.
         # SHORTs are never touched.
-        meta: dict = {}
         if (self.funding_hard_block_enabled and direction == LONG
                 and funding is not None and funding.direction == SHORT
                 and funding.confidence >= self.funding_hard_block_conf):

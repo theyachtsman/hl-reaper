@@ -266,6 +266,7 @@ export default function CoinCard3D({ coin, mid, verdict, tickets, position, gate
         gatesEnabled={gatesEnabled}
         position={position ?? null}
         wouldFire={!!verdict?.would_fire}
+        confGate={gC}
       />
     </div>
   );

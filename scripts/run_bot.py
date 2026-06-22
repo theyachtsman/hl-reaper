@@ -15,8 +15,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from reaper import alerts
-from reaper.aggregator import (SCALP_WEIGHTS, TREND_WEIGHTS, SignalAggregator,
-                               apply_regime_bias)
+from reaper.aggregator import (REGIME_NAMES, SCALP_WEIGHTS, TREND_WEIGHTS,
+                               SignalAggregator, apply_regime_bias)
 from reaper.config import PROJECT_ROOT, Config
 from reaper.data.buffer import MarketBuffer
 from reaper.data.rest_pollers import RestPollers
@@ -1203,17 +1203,25 @@ def main():
                 for coin in coins_active:
                     if coin in coins_disabled:
                         continue
-                    # dual aggregation
+                    # dual aggregation — TREND first so its (1h) regime can
+                    # dampen counter-trend OrderbookImbalance votes in BOTH
+                    # bands (bid-heavy book in a downtrend = absorption, not a
+                    # reversal — see BOOK_REGIME_DAMPEN).
+                    trend_tickets = [m.compute(coin, buf, interval=trend_interval)
+                                     for m in models]
+                    trend_rt = next((t for t in trend_tickets
+                                     if t.model == "RegimeDetectorModel"), None)
+                    trend_regime = (trend_rt.direction
+                                    if trend_rt and trend_rt.direction in REGIME_NAMES
+                                    else "UNKNOWN")
+                    trend_sig = aggregator.aggregate(
+                        coin, trend_tickets, weights=TREND_WEIGHTS,
+                        regime_routing=False, book_regime=trend_regime)
                     scalp_tickets = [m.compute(coin, buf, interval=scalp_interval)
                                      for m in models]
                     scalp_sig = aggregator.aggregate(
                         coin, scalp_tickets, weights=SCALP_WEIGHTS,
-                        regime_routing=False)
-                    trend_tickets = [m.compute(coin, buf, interval=trend_interval)
-                                     for m in models]
-                    trend_sig = aggregator.aggregate(
-                        coin, trend_tickets, weights=TREND_WEIGHTS,
-                        regime_routing=False)
+                        regime_routing=False, book_regime=trend_regime)
                     # regime bias: 1h (trend) regime DAMPENS counter-trend scalp
                     # confidence (never blocks). Trend signal is never modified.
                     apply_regime_bias(scalp_sig, trend_sig.regime, penalty)

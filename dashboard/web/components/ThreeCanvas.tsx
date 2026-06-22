@@ -33,11 +33,24 @@ const ACCENT: Record<ColorMode, number> = {
 const rgb = (hex: number) =>
   new THREE.Color(hex);
 
-const CHART_W = 9.0;   // span the full card width (was 5.5 — looked narrow)
 const CHART_H = 2.6;   // taller ribbon (was 1.8)
 const CHART_Y0 = -1.3; // baseline (was -0.9)
 
-function buildRibbonGeometry(prices: number[], mode: ColorMode) {
+// widest ribbon that still leaves a slight horizontal margin inside the camera
+// frustum at the ribbon's depth — keeps the chart near-full-width without the
+// ends clipping at the card edges. A fixed CHART_W=9 overran narrower cards;
+// this fits the actual aspect so there's always a little breathing room.
+const RIBBON_Z = -0.8, CAM_Z = 4.5, FOV_DEG = 55, CAM_X_DRIFT = 0.25;
+function fitChartW(aspect: number): number {
+  const dist = CAM_Z - RIBBON_Z;                       // ~5.3 world units
+  const vHalf = dist * Math.tan((FOV_DEG * Math.PI / 180) / 2);
+  const hHalf = vHalf * aspect;                         // visible half-width
+  // back off the camera x-parallax, then ~8% breathing room each side
+  const usable = (hHalf - CAM_X_DRIFT) * 0.92;
+  return Math.max(4.5, Math.min(8.4, usable * 2));      // cap keeps a margin
+}
+
+function buildRibbonGeometry(prices: number[], mode: ColorMode, chartW: number) {
   const geo = new THREE.BufferGeometry();
   if (prices.length < 2) return geo;
   const mn = Math.min(...prices);
@@ -46,7 +59,7 @@ function buildRibbonGeometry(prices: number[], mode: ColorMode) {
   const verts: number[] = [], cols: number[] = [], idxs: number[] = [];
 
   prices.forEach((p, i) => {
-    const x = (i / (prices.length - 1)) * CHART_W - CHART_W / 2;
+    const x = (i / (prices.length - 1)) * chartW - chartW / 2;
     const y = ((p - mn) / range) * CHART_H + CHART_Y0;
     const isUp = i === 0 || p >= prices[i - 1];
 
@@ -75,11 +88,11 @@ function buildRibbonGeometry(prices: number[], mode: ColorMode) {
   return geo;
 }
 
-function buildLineGeometry(prices: number[]) {
+function buildLineGeometry(prices: number[], chartW: number) {
   if (prices.length < 2) return new THREE.BufferGeometry();
   const mn = Math.min(...prices), mx = Math.max(...prices);
   const pts = prices.map((p, i) => new THREE.Vector3(
-    (i / (prices.length - 1)) * CHART_W - CHART_W / 2,
+    (i / (prices.length - 1)) * chartW - chartW / 2,
     ((p - mn) / (mx - mn || 1)) * CHART_H + CHART_Y0,
     -0.78,
   ));
@@ -177,6 +190,7 @@ type SceneRefs = {
   wire: THREE.Mesh;
   wireMat: THREE.MeshBasicMaterial;
   rings: THREE.Mesh[];
+  chartW: number;
   raf: number;
 };
 
@@ -188,6 +202,8 @@ export default function ThreeCanvas({
   const refs = useRef<SceneRefs | null>(null);
   const live = useRef({ colorMode, intensity, hovered });
   live.current = { colorMode, intensity, hovered };
+  const pricesRef = useRef(prices);
+  pricesRef.current = prices;
 
   const dirOf = (cm: ColorMode) => cm === "long" ? 1 : cm === "short" ? -1 : 0;
   const opacityOf = (it: Intensity) => it === "position" ? 0.8 : it === "armed" ? 0.6 : 0.42;
@@ -198,6 +214,7 @@ export default function ThreeCanvas({
     const wrap = wrapRef.current!;
     const accent = ACCENT[colorMode];
     const calm = intensity === "neutral";
+    let chartW = fitChartW((wrap.clientWidth || 1) / (wrap.clientHeight || 1));
 
     const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
     const pr = Math.min(window.devicePixelRatio, 2);
@@ -220,14 +237,14 @@ export default function ThreeCanvas({
     const ribbonMat = new THREE.MeshBasicMaterial({
       vertexColors: true, transparent: true, opacity: 0.72, side: THREE.DoubleSide,
     });
-    const ribbon = new THREE.Mesh(buildRibbonGeometry(prices, colorMode), ribbonMat);
+    const ribbon = new THREE.Mesh(buildRibbonGeometry(prices, colorMode, chartW), ribbonMat);
     scene.add(ribbon);
 
     // glowing price line
     const priceLineMat = new THREE.LineBasicMaterial({
       color: accent, transparent: true, opacity: 0.95,
     });
-    const priceLine = new THREE.Line(buildLineGeometry(prices), priceLineMat);
+    const priceLine = new THREE.Line(buildLineGeometry(prices, chartW), priceLineMat);
     scene.add(priceLine);
 
     // chaotic frustum-filling particle field (GPU-animated)
@@ -265,7 +282,7 @@ export default function ThreeCanvas({
     refs.current = {
       renderer, scene, camera, ribbon, ribbonMat, priceLine, priceLineMat,
       particles: P.points, particleGeo: P.geo, particleMat: P.mat, pUniforms: P.uniforms,
-      orb, orbMat, wire, wireMat, rings, raf: 0,
+      orb, orbMat, wire, wireMat, rings, chartW, raf: 0,
     };
 
     const resize = () => {
@@ -274,6 +291,17 @@ export default function ThreeCanvas({
       renderer.setSize(w, h, false);
       camera.aspect = w / h;
       camera.updateProjectionMatrix();
+      // refit the ribbon to the new aspect so the margin stays consistent
+      const nw = fitChartW(w / h);
+      const r = refs.current;
+      if (r && Math.abs(nw - r.chartW) > 0.05) {
+        r.chartW = nw;
+        const pr = pricesRef.current;
+        r.ribbon.geometry.dispose();
+        r.ribbon.geometry = buildRibbonGeometry(pr, live.current.colorMode, nw);
+        r.priceLine.geometry.dispose();
+        r.priceLine.geometry = buildLineGeometry(pr, nw);
+      }
     };
     resize();
     const ro = new ResizeObserver(resize);
@@ -340,9 +368,9 @@ export default function ThreeCanvas({
     const r = refs.current;
     if (!r) return;
     r.ribbon.geometry.dispose();
-    r.ribbon.geometry = buildRibbonGeometry(prices, colorMode);
+    r.ribbon.geometry = buildRibbonGeometry(prices, colorMode, r.chartW);
     r.priceLine.geometry.dispose();
-    r.priceLine.geometry = buildLineGeometry(prices);
+    r.priceLine.geometry = buildLineGeometry(prices, r.chartW);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [prices]);
 
@@ -367,7 +395,7 @@ export default function ThreeCanvas({
       (ring.material as THREE.MeshBasicMaterial).color.setHex(accent);
     });
     r.ribbon.geometry.dispose();
-    r.ribbon.geometry = buildRibbonGeometry(prices, colorMode);
+    r.ribbon.geometry = buildRibbonGeometry(prices, colorMode, r.chartW);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [colorMode, intensity]);
 

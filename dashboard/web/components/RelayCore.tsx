@@ -76,12 +76,12 @@ type GateRefs = {
 
 export default function RelayCore({
   direction, confidence, agreement, activeModels = 5, tickets,
-  longGate, shortGate, gatesEnabled, position, wouldFire,
+  longGate, shortGate, gatesEnabled, position, wouldFire, confGate = 0.4,
 }: {
   direction: string; confidence: number; agreement: number; activeModels?: number;
   tickets: Ticket[]; longGate?: Gate; shortGate?: Gate;
   gatesEnabled?: { long: boolean; short: boolean };
-  position?: "LONG" | "SHORT" | null; wouldFire?: boolean;
+  position?: "LONG" | "SHORT" | null; wouldFire?: boolean; confGate?: number;
 }) {
   const wrapRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -97,21 +97,34 @@ export default function RelayCore({
   const shortOff = !!gatesEnabled && !gatesEnabled.short;
   const armedDir = position ?? (wouldFire ? direction : null);
 
-  const target = useRef({
-    direction, confidence, agreement,
-    voteHex: tickets.map((t) => dirHex(t.direction)),
-    longProg: longOff ? 0 : longSig.filter(Boolean).length / 4,
-    shortProg: shortOff ? 0 : shortSig.filter(Boolean).length / 4,
-    longOff, shortOff, armedDir,
-  });
+  // the core leans toward whichever side the ensemble is tilting WHILE voting:
+  // the verdict's own direction if it has resolved one, else the majority of the
+  // live model votes (so the core fills even before a hard verdict forms / when
+  // a gate is switched off — gates only gate firing, not the consensus lean).
   const voteByModel = new Map(tickets.map((t) => [t.model, t.direction]));
-  target.current = {
-    direction, confidence, agreement,
+  const slotVotes = SLOTS.map((s) => voteByModel.get(s.model));
+  const longV = slotVotes.filter((d) => d === "LONG").length;
+  const shortV = slotVotes.filter((d) => d === "SHORT").length;
+  const coreDir = direction !== "FLAT" ? direction
+    : longV > shortV ? "LONG" : shortV > longV ? "SHORT" : "FLAT";
+  // how full it reads: blend confidence-toward-gate with the vote share, with a
+  // floor, so a forming lean is visibly non-zero (raw confidence sits low).
+  const leanV = Math.max(longV, shortV);
+  const confProg = confidence / Math.max(0.05, confGate);
+  const coreFill = coreDir === "FLAT" ? 0
+    : Math.min(1, 0.15 + 0.85 * Math.max(confProg, leanV / Math.max(1, activeModels)));
+
+  const targetVal = {
+    direction, confidence, agreement, coreDir, coreFill,
     voteHex: SLOTS.map((s) => dirHex(voteByModel.get(s.model))),
-    longProg: longOff ? 0 : longSig.filter(Boolean).length / 4,
-    shortProg: shortOff ? 0 : shortSig.filter(Boolean).length / 4,
+    // fill from the real structural signals even when a gate is OFF (the bridge
+    // always sends the detail) — a disabled gate still shows consensus building.
+    longProg: longSig.filter(Boolean).length / 4,
+    shortProg: shortSig.filter(Boolean).length / 4,
     longOff, shortOff, armedDir,
   };
+  const target = useRef(targetVal);
+  target.current = targetVal;
 
   // ---- shock trigger on entering armed ----
   const prevArmed = useRef<string | null>(null);
@@ -253,7 +266,7 @@ export default function RelayCore({
       const r = sceneRef.current; if (!r) return;
       const t = clock.getElapsedTime(), d = clock.getDelta();
       const st = target.current;
-      const dc = dirHex(st.direction);
+      const dc = dirHex(st.coreDir);
 
       // nodes orbit + colour
       const rot = t * 0.12;
@@ -270,38 +283,34 @@ export default function RelayCore({
         const pulse = 0.5 + 0.5 * Math.sin(t * 4);
         coreTarget = new THREE.Color(dirHex(st.armedDir)).lerp(new THREE.Color(GOLD), pulse * 0.7);
       } else {
-        coreTarget = new THREE.Color(DIM).lerp(new THREE.Color(dc), st.direction === "FLAT" ? 0 : Math.min(1, st.confidence));
+        coreTarget = new THREE.Color(DIM).lerp(new THREE.Color(dc), st.coreFill);
       }
       r.curC.lerp(coreTarget, 0.1);
       r.coreWireMat.color.copy(r.curC); r.coreSolidMat.color.copy(r.curC);
       (r.coreGlow.material as THREE.SpriteMaterial).color.copy(r.curC);
-      r.core.scale.setScalar(1 + Math.sin(t * (armed ? 4 : 2)) * 0.04);
+      r.core.scale.setScalar(1 + (armed ? 0 : st.coreFill * 0.14)
+        + Math.sin(t * (armed ? 4 : 2)) * 0.04);
       r.core.rotation.y += d * 0.15; r.core.rotation.x += d * 0.03;
 
       // gates
       const applyGate = (gate: GateRefs, prog: number, off: boolean, baseHex: number,
                          active: boolean, cur: THREE.Color) => {
-        if (off) {
-          cur.lerp(new THREE.Color(DIM), 0.1);
-          gate.ringMat.color.copy(cur); gate.ringMat.opacity = 0.3;
-          gate.discMat.opacity += (0 - gate.discMat.opacity) * 0.15;
-          gate.disc.scale.setScalar(0.01);
-          gate.glow.scale.setScalar(0.1);
-          gate.titleMat.opacity = 0.35;
-          gate.group.rotation.z = 0;
-          return;
-        }
         const open = prog >= 1;
+        // a disabled gate still FILLS with its structural progress (so you can
+        // watch consensus build exactly like an enabled gate), just dimmer and
+        // without the firing spin/extra glow since it can't actually fire.
+        const dim = off ? 0.5 : 1;
         cur.lerp(new THREE.Color(DIM).lerp(new THREE.Color(baseHex), prog), 0.1);
         gate.ringMat.color.copy(cur);
-        gate.ringMat.opacity = 0.5 + prog * 0.45;
+        gate.ringMat.opacity = (0.5 + prog * 0.45) * dim;
         gate.discMat.color.setHex(baseHex);
-        gate.discMat.opacity += (prog * 0.7 - gate.discMat.opacity) * 0.12;
+        gate.discMat.opacity += (prog * 0.7 * dim - gate.discMat.opacity) * 0.12;
         gate.disc.scale.setScalar(0.2 + prog * 0.78);
         (gate.glow.material as THREE.SpriteMaterial).color.setHex(baseHex);
-        gate.glow.scale.setScalar(0.1 + prog * (active ? 2.2 : 1.0));
-        gate.titleMat.opacity = 0.5 + prog * 0.5;
-        if (open && active) gate.group.rotation.z += d * 0.4;
+        gate.glow.scale.setScalar(0.1 + prog * (active && !off ? 2.2 : 1.0));
+        gate.titleMat.opacity = (0.5 + prog * 0.5) * (off ? 0.7 : 1);
+        if (open && active && !off) gate.group.rotation.z += d * 0.4;
+        else if (off) gate.group.rotation.z = 0;
       };
       const dir = st.direction;
       applyGate(r.gateShort, st.shortProg, st.shortOff, RED, dir === "SHORT", r.curShort);
@@ -385,12 +394,23 @@ export default function RelayCore({
   return (
     <div ref={wrapRef} className="relative h-[300px] bg-[#070a0e] border-t border-edge overflow-hidden">
       <canvas ref={canvasRef} className="block w-full h-full" />
-      {/* tally */}
+      {/* tally + prominent confidence — the "so what" of the consensus core */}
       <div className="absolute top-2 left-0 right-0 text-center pointer-events-none">
-        <span className="text-[10px] mono uppercase tracking-[0.14em]"
+        <div className="text-[10px] mono uppercase tracking-[0.14em]"
           style={{ color: direction === "LONG" ? "#2de8b0" : direction === "SHORT" ? "#f0625f" : "#9fb0c3" }}>
           consensus {agreement}/{activeModels} {direction === "FLAT" ? "scanning" : direction}
-        </span>
+        </div>
+        <div className="mt-0.5 flex items-baseline justify-center gap-1.5 leading-none">
+          <span className="text-[22px] font-bold mono tabular-nums"
+            style={{ color: direction === "LONG" ? "#2de8b0" : direction === "SHORT" ? "#f0625f" : "#cbd5e1",
+                     textShadow: direction === "FLAT" ? "none"
+                       : `0 0 12px ${direction === "LONG" ? "#2de8b066" : "#f0625f66"}` }}>
+            {confidence.toFixed(2)}
+          </span>
+          <span className="text-[8px] mono uppercase tracking-wider text-slate-500">
+            conf · gate {confGate.toFixed(2)}
+          </span>
+        </div>
       </div>
       {/* armed flash */}
       <div ref={flashRef} className="relay-flash absolute left-0 right-0 top-[38%] text-center

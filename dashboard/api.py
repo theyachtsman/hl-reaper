@@ -577,22 +577,26 @@ def tickets():
         block_reason = meta.get("block_reason")
         long_gate = short_gate = None
         long_blocked = short_blocked = False
-        # structural gates apply to the SCALP band only
-        if band == "scalp" and g["structural_gates_enabled"]:
-            long_gate = long_gates_pub.get(coin) or {}
-            short_gate = short_gates_pub.get(coin) or {}
-            if (g["long_structural_gate_enabled"] and direction == "LONG"
-                    and long_gate and not long_gate.get("allowed")):
-                long_blocked = True
-                block_reason = STRUCT_REASON.get(
-                    long_gate.get("block_reason"),
-                    "LONG blocked (structural gate)")
-            elif (g["short_structural_gate_enabled"] and direction == "SHORT"
-                    and short_gate and not short_gate.get("allowed")):
-                short_blocked = True
-                block_reason = SHORT_STRUCT_REASON.get(
-                    short_gate.get("block_reason"),
-                    "SHORT blocked (structural gate)")
+        # structural gates apply to the SCALP band only. The signal DETAIL is
+        # always surfaced (the bot computes it every loop regardless of the
+        # toggle) so the dashboard gate rings fill as consensus forms even when a
+        # gate is switched off — only the BLOCKING is gated on the enabled flags.
+        if band == "scalp":
+            long_gate = long_gates_pub.get(coin) or None
+            short_gate = short_gates_pub.get(coin) or None
+            if g["structural_gates_enabled"]:
+                if (g["long_structural_gate_enabled"] and direction == "LONG"
+                        and long_gate and not long_gate.get("allowed")):
+                    long_blocked = True
+                    block_reason = STRUCT_REASON.get(
+                        long_gate.get("block_reason"),
+                        "LONG blocked (structural gate)")
+                elif (g["short_structural_gate_enabled"] and direction == "SHORT"
+                        and short_gate and not short_gate.get("allowed")):
+                    short_blocked = True
+                    block_reason = SHORT_STRUCT_REASON.get(
+                        short_gate.get("block_reason"),
+                        "SHORT blocked (structural gate)")
         would_fire = (bands_enabled[band] and direction in ("LONG", "SHORT")
                       and not long_blocked and not short_blocked
                       and confidence >= g["min_confidence"]

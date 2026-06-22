@@ -72,8 +72,12 @@ function Spark({ pts, id }: { pts: number[]; id: string }) {
   if (!pts || pts.length < 2) return <div className="h-12" />;
   const min = Math.min(...pts), max = Math.max(...pts);
   const r = max - min || max * 0.0001 || 1;
+  // slight horizontal inset (viewBox-x units) so the stroke + pulsing end-dot
+  // never clip against the SVG edges — stays effectively full width
+  const PAD = 3;
   const xy = (v: number, i: number): [number, number] =>
-    [(i / (pts.length - 1)) * 100, 30 - ((v - min) / r) * 24 - 3];
+    [PAD + (i / (pts.length - 1)) * (100 - 2 * PAD),
+     30 - ((v - min) / r) * 24 - 3];
   const path = pts.map((v, i) => xy(v, i).join(",")).join(" ");
   const [lx, ly] = xy(pts[pts.length - 1], pts.length - 1);
   const up = pts[pts.length - 1] >= pts[0];
@@ -86,7 +90,7 @@ function Spark({ pts, id }: { pts: number[]; id: string }) {
           <stop offset="100%" stopColor={c} stopOpacity="0" />
         </linearGradient>
       </defs>
-      <polygon points={`0,32 ${path} 100,32`} fill={`url(#area-${id})`} />
+      <polygon points={`${PAD},32 ${path} ${100 - PAD},32`} fill={`url(#area-${id})`} />
       <polyline points={path} fill="none" stroke={c} strokeWidth="1.3"
         vectorEffect="non-scaling-stroke" opacity="0.9" />
       <polyline points={path} fill="none" stroke={c} strokeWidth="4"
