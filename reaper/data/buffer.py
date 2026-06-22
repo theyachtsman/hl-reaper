@@ -24,6 +24,12 @@ class MarketBuffer:
         # lead/lag — additive, written by the spot poller, read by future
         # signal code. {"px": float, "ts": ms}
         self.spot = {c: {} for c in coins}
+        # rolling history for the LONG structural gate (2026-06-17). Spot poller
+        # fires ~every 10s and ctx poller ~every 60s, so 60 samples covers ~10min
+        # of spot and ~60min of OI — enough to look back 5 minutes either way.
+        # Entries are (wall_ts_seconds, value).
+        self.spot_history = {c: deque(maxlen=60) for c in coins}
+        self.oi_history = {c: deque(maxlen=60) for c in coins}
         # staleness tracking
         self.last_msg_ts = 0.0
         self.msg_count = 0
@@ -60,12 +66,16 @@ class MarketBuffer:
     def on_ctx(self, coin: str, ctx: dict):
         with self._lock:
             self.ctx[coin] = ctx
+            oi = ctx.get("open_interest")
+            if oi:
+                self.oi_history[coin].append((time.time(), float(oi)))
 
     def on_spot(self, coin: str, px: float, ts: int):
         """External spot reference price (Binance spot). Additive — does not
         affect existing readers."""
         with self._lock:
             self.spot[coin] = {"px": px, "ts": ts}
+            self.spot_history[coin].append((time.time(), float(px)))
 
     def _touch(self):
         self.last_msg_ts = time.time()
@@ -82,6 +92,33 @@ class MarketBuffer:
     def spot_price(self, coin: str) -> float | None:
         with self._lock:
             return (self.spot.get(coin) or {}).get("px")
+
+    @staticmethod
+    def _value_n_minutes_ago(hist, minutes: float, tol_s: float = 120):
+        """Closest recorded value to ~`minutes` ago. None if no sample within
+        `tol_s` of the target (insufficient / stale history -> fail safe)."""
+        target_ts = time.time() - minutes * 60
+        best = None
+        best_gap = None
+        for ts, val in hist:
+            gap = abs(ts - target_ts)
+            if best_gap is None or gap < best_gap:
+                best_gap, best = gap, val
+        if best is None or best_gap > tol_s:
+            return None
+        return best
+
+    def spot_price_n_minutes_ago(self, coin: str, minutes: float = 5):
+        """Spot price from ~N minutes ago, or None if insufficient history."""
+        with self._lock:
+            return self._value_n_minutes_ago(
+                list(self.spot_history.get(coin, [])), minutes)
+
+    def oi_n_minutes_ago(self, coin: str, minutes: float = 5):
+        """Open interest from ~N minutes ago, or None if insufficient history."""
+        with self._lock:
+            return self._value_n_minutes_ago(
+                list(self.oi_history.get(coin, [])), minutes)
 
     def latest_candles(self, coin: str, interval: str, n: int = 100):
         with self._lock:

@@ -41,11 +41,24 @@ risk:
   max_per_symbol: 1
   max_leverage: 5.0
   min_confidence: 0.62
-  min_model_agreement: 5
+  # quorum is counted over the 5 active DIRECTIONAL voters (TA, MeanRev,
+  # Funding, OB, VWAP). ML + LiqHeatmap are permanently FLAT and RegimeDetector
+  # is a non-voting meta-router, so they never count. Was 5 (= unanimity of the
+  # 5 since the model deaths — effectively un-fireable); 4 of 5 = 80%, still
+  # strict and mainnet-cautious.
+  min_model_agreement: 4
   max_spread_pct: 0.0015
   atr_sl_multiplier: 1.5
   atr_trail_multiplier: 1.0
   trail_activation_r: 1.5
+  take_profit_r: 2.0           # TP at this multiple of the initial risk (R)
+  # breakeven profit lock (2026-06-20): once a position reaches breakeven_lock_r
+  # of unrealized profit, snap the SL to entry + a small fee-covering buffer so a
+  # winning trade can never give back into a loss. Earlier + tighter than the
+  # trailing stop (which only activates at trail_activation_r). Fires once.
+  breakeven_lock_enabled: true
+  breakeven_lock_r: 0.5        # move SL to breakeven once position reaches this R
+  breakeven_lock_buffer_pct: 0.05  # lock this % above entry (LONG) / below (SHORT)
   max_loss_per_trade_pct: 0.02
   emergency_loss_pct: 0.03
   max_hold_hours_scalp: 4
@@ -56,9 +69,59 @@ risk:
   cascade_halt_hours: 2
   extreme_funding_long_halt: 0.001
   extreme_funding_short_halt: -0.001
+  # funding HARD-block (2026-06-16): when FundingRateModel votes SHORT at >= this
+  # confidence (crowded-long extreme), LONG entries are blocked outright. Extends
+  # the existing 0.6x funding veto, which only dampens. SHORTs untouched.
+  funding_hard_block_enabled: true
+  funding_hard_block_conf: 0.75
+  # SHORT mirror of the funding hard-block — OFF by default (working side).
+  # When on, FundingRate LONG conf >= conf blocks SHORT entries.
+  funding_hard_block_short_enabled: false
+  funding_hard_block_short_conf: 0.75
+  # FundingRateModel direction mapping (2026-06-20). false = original binary
+  # zone rule (mild-positive funding -> LONG, SHORT only past the 0.001 extreme).
+  # true = smoothed continuous mapping (positive -> SHORT lean, negative -> LONG
+  # lean, conf ramps with magnitude) — widens funding's SHORT contribution. Hot-
+  # reloadable A/B switch; default false so the old mapping stays the fallback.
+  # The active mapping is stamped on each OPEN trade note (fmap=binary|smooth).
+  funding_smooth_mapping_enabled: false
+  # master switch for the Layer-3 liquidation-cascade kill switch
+  cascade_detection_enabled: true
   flash_crash_candle_pct: 0.05
   weekly_drawdown_limit: 0.10
   cooldown_hours: 48
+
+  # ---- Dual-band geometry (2026-06-20) -------------------------------------
+  # Two independent bands trade simultaneously: SCALP (5m, tight/fast/frequent)
+  # and TREND (1h, wide/patient/rare). One-way exchange nets per coin, so a coin
+  # is owned by at most ONE band at a time (the other is blocked on that coin);
+  # dual-band still runs portfolio-wide. The scalar risk values above remain the
+  # legacy fallback for any band param left unset. SL/TP/trail/hold/breakeven and
+  # the entry gate (confidence/agreement) are per band; cascade detection,
+  # drawdown circuit breakers and max_leverage stay GLOBAL across both bands.
+  # SCALP band — tight & fast
+  scalp_min_confidence: 0.40
+  scalp_min_model_agreement: 2       # lower bar — frequent small trades
+  scalp_atr_sl_multiplier: 1.0
+  scalp_take_profit_r: 1.5
+  scalp_trail_activation_r: 1.0
+  scalp_max_hold_hours: 0.5
+  scalp_breakeven_lock_r: 0.4
+  scalp_max_concurrent_positions: 3
+  scalp_position_size_usd: 30
+  scalp_structural_gates_enabled: true   # LONG/SHORT structural gates apply here only
+  # TREND band — wide & patient (no structural gates: its own 1h signal IS the gate)
+  trend_min_confidence: 0.55
+  trend_min_model_agreement: 3       # higher bar — fewer, higher-conviction trades
+  trend_atr_sl_multiplier: 2.5
+  trend_take_profit_r: 4.0
+  trend_trail_activation_r: 2.0
+  trend_max_hold_hours: 48.0
+  trend_breakeven_lock_r: 0.8
+  trend_max_concurrent_positions: 2
+  trend_position_size_usd: 75
+  # regime bias: 1h regime dampens (never blocks) counter-trend scalp confidence
+  regime_counter_trend_penalty: 0.7  # 0.3x–1.0x; lower = harder to fade the trend
 
 # ---- Phase 8.6: cascade bounce (event-driven track, separate from ensemble)
 cascade_bounce:
@@ -85,13 +148,99 @@ models:
 
 # ---- Phase 4/5: trading loop ----
 trading:
-  # conservative = mainnet-safe gates from the risk section (0.62 / 5 / 3)
-  # paper_aggressive = TESTNET ONLY: 0.35 confidence, 3-model quorum,
-  #                    5 concurrent positions — for data collection
-  mode: "paper_aggressive"
+  # The legacy paper_aggressive/conservative "mode" toggle is gone. The risk
+  # section above is the mainnet-safe FLOOR (conf 0.62 / quorum 4-of-5 / 3
+  # positions); every gate is now an individual live_config override set from
+  # the Controls page (takes effect next loop, no restart). Clearing all
+  # overrides restores this floor.
   loop_interval_seconds: 10
   default_usd_size: 50
   default_leverage: 3.0
+  # direction master switches — one-click live toggles from the Controls page
+  # (hot-reload, no restart). 2026-06-17: the LONG side has no structural edge
+  # (214 trades, 37% win, net -$6.14) while SHORT carries the account (+$21.33),
+  # so LONGs can be switched off entirely until a real LONG edge is found.
+  # The dashboard refuses to disable BOTH (that would halt all new entries).
+  longs_enabled: true
+  shorts_enabled: true
+  # ---- Dual-band master switches (2026-06-20) ------------------------------
+  # Each band can be turned off independently from the Controls page (hot-
+  # reload). At least one must stay enabled — disabling both halts all new
+  # entries (use pause for that). The candle resolution each band aggregates on.
+  scalp_band_enabled: true
+  trend_band_enabled: true
+  scalp_interval: "5m"
+  trend_interval: "1h"
+  # Per-band direction toggles. Effective direction = global (longs/shorts_enabled)
+  # AND the band flag — so a band can run LONG-only while the other runs both.
+  scalp_longs_enabled: true
+  scalp_shorts_enabled: true
+  trend_longs_enabled: true
+  trend_shorts_enabled: true
   coins_active: ["BTC", "ETH", "SOL", "ARB", "AVAX", "DOGE", "WIF"]
   entry_style: "maker"        # maker = post-only limit, skip if unfilled; taker = market
   entry_timeout_seconds: 30
+  # intelligent taker fallback: on a maker-timeout STREAK (sharp directional
+  # move outrunning the limit), re-validate the live signal + move and convert
+  # to a taker market order instead of missing the trade. Maker stays the
+  # default; this only fires after repeated timeouts, never on the first.
+  maker_timeout_fallback_enabled: true    # master switch; false = old behavior
+  maker_timeout_fallback_n: 3             # consecutive maker timeouts before check
+  maker_timeout_fallback_window_s: 180    # window to count the streak within
+  maker_timeout_exhaustion_atr_mult: 1.5  # price already moved this*ATR our way = skip
+  # LONG structural gate (2026-06-17): supersedes the old OB/VWAP confirmation
+  # (Change B). A LONG must clear ALL THREE structural signals — spot LEADING
+  # perp (real demand, not leverage), OI RISING (fresh longs entering), and the
+  # book BID-HEAVY (live buy pressure). Targets the LONG bleed (210 trades, 37%
+  # win, gross -$0.01). Any signal that can't be computed FAILS (block the LONG).
+  # SHORTs are never gated — the working side stays untouched.
+  long_structural_gate_enabled: true
+  long_spot_lead_threshold: 0.0002   # min spot return to count as leading (0.02%)
+  long_oi_rise_threshold: 0.001      # min OI increase to count as rising (0.1%)
+  long_ob_bid_threshold: 0.20        # min top-of-book bid imbalance (60/40)
+  long_spot_lookback_minutes: 5      # how far back to compare spot vs perp
+  long_oi_lookback_minutes: 5        # how far back to compare OI
+  # LONG momentum cooldown (2026-06-18, anti-pump-top): 4th structural signal.
+  # Even with spot/OI/book all green, entering right after a sharp upward move
+  # catches the top — losing LONGs have a 4.6m MEDIAN hold (stopped on the
+  # retrace). Block new LONGs when price ran up past any threshold recently and
+  # let the consolidation happen first. The symmetric SHORT dump-cooldown is
+  # deliberately NOT added (SHORT side works: 57% win, +$21.46). Tunable live.
+  long_pump_cooldown_enabled: true
+  long_pump_threshold_1: 0.005       # block if price up >0.5% in last 5m
+  long_pump_threshold_2: 0.008       # block if price up >0.8% in last 10m
+  long_pump_threshold_3: 0.012       # block if price up >1.2% in last 15m
+  # Legacy Change B OB/VWAP confirmation — superseded by the structural gate
+  # above, kept OFF so it doesn't double-filter. Still read by the dashboard.
+  long_confirmation_enabled: false
+  long_confirmation_models: ["OrderbookImbalanceModel", "VWAPModel"]
+  long_confirmation_min: 1
+  # SHORT mirror of the microstructure confirmation gate — OFF by default
+  # (legacy; superseded by the SHORT structural gate below). Still read by the
+  # dashboard / regression suite.
+  short_confirmation_enabled: false
+  short_confirmation_models: ["OrderbookImbalanceModel", "VWAPModel"]
+  short_confirmation_min: 1
+  # SHORT structural gate (2026-06-19): mirror of the LONG gate for the SHORT
+  # side. Targets the SHORT drought (33 SHORTs on 6/17 -> 0 on 6/19) caused by
+  # the regime detector lagging into TRENDING_UP while real structure was DOWN.
+  # A SHORT must clear ALL FOUR signals — spot LAGGING perp (real selling, not a
+  # leverage bounce), OI RISING with FALLING price (fresh shorts entering), book
+  # ASK-HEAVY (live sell pressure), and the dump cooldown (no recent sharp drop,
+  # anti-dump-bottom). Any of signals 1-3 that can't be computed FAILS (block).
+  # ⚠ TESTNET: OI barely moves (0.01-0.04%/5m); set short_oi_rise_threshold=0.0
+  #   via live_config for testnet and CLEAR IT BEFORE MAINNET.
+  short_structural_gate_enabled: true
+  short_spot_lag_threshold: 0.0002    # min spot drop to count as lagging (0.02%)
+  short_oi_rise_threshold: 0.001      # min OI increase to count as rising (0.1%)
+  short_ob_ask_threshold: 0.20        # min top-of-book ask imbalance (60/40)
+  short_spot_lookback_minutes: 5      # how far back to compare spot vs perp
+  short_oi_lookback_minutes: 5        # how far back to compare OI
+  # SHORT dump cooldown (anti-dump-bottom): 4th structural signal. Even with
+  # spot/OI/book green, entering right after a sharp drop catches the bottom and
+  # gets stopped on the bounce. Block new SHORTs when price fell past any
+  # threshold recently and let the dump exhaust. Tunable live.
+  short_dump_cooldown_enabled: true
+  short_dump_threshold_1: 0.005       # block if price down >0.5% in last 5m
+  short_dump_threshold_2: 0.008       # block if price down >0.8% in last 10m
+  short_dump_threshold_3: 0.012       # block if price down >1.2% in last 15m

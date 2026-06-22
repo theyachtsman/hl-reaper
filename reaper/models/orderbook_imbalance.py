@@ -16,7 +16,7 @@ class OrderbookImbalanceModel(BaseModel):
         self.min_imbalance = min_imbalance
         self.max_age_s = max_age_s
 
-    def compute(self, coin: str, buf) -> Ticket:
+    def compute(self, coin: str, buf, interval: str | None = None) -> Ticket:
         try:
             book = buf.books.get(coin)
             if not book or not book.get("bids") or not book.get("asks"):

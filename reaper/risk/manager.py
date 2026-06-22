@@ -99,6 +99,11 @@ class RiskManager:
         self.atr_trail_multiplier = float(r.get("atr_trail_multiplier", 1.0))
         self.trail_activation_r = float(r.get("trail_activation_r", 1.5))
         self.take_profit_r = float(r.get("take_profit_r", 2.0))
+        # breakeven profit lock — earlier/tighter than the trailing stop
+        self.breakeven_lock_enabled = bool(r.get("breakeven_lock_enabled", True))
+        self.breakeven_lock_r = float(r.get("breakeven_lock_r", 0.5))
+        self.breakeven_lock_buffer_pct = float(
+            r.get("breakeven_lock_buffer_pct", 0.05))
         self.max_loss_per_trade_pct = float(r.get("max_loss_per_trade_pct", 0.02))
         self.emergency_loss_pct = float(r.get("emergency_loss_pct", 0.03))
         self.max_hold_hours_scalp = float(r.get("max_hold_hours_scalp", 4))
@@ -116,22 +121,104 @@ class RiskManager:
         self.weekly_drawdown_limit = float(r.get("weekly_drawdown_limit", 0.10))
         self.cooldown_hours = float(r.get("cooldown_hours", 48))
 
+        # --- Dual-band geometry (2026-06-20) -------------------------------
+        # Each band (scalp 5m / trend 1h) has its own entry gate, risk
+        # geometry, concurrency limit and position size. Defaults fall back to
+        # the legacy global values so a config without scalp_*/trend_* keys
+        # behaves like the single band it replaces. band_params() resolves a
+        # band name to its dict; an unknown/None band -> legacy globals.
+        self.scalp_band_enabled = bool(
+            (raw.get("trading", {}) or {}).get("scalp_band_enabled", True))
+        self.trend_band_enabled = bool(
+            (raw.get("trading", {}) or {}).get("trend_band_enabled", True))
+        self.regime_counter_trend_penalty = float(
+            r.get("regime_counter_trend_penalty", 0.7))
+        self.bands = {
+            "scalp": {
+                "min_confidence": float(r.get("scalp_min_confidence", 0.40)),
+                "min_model_agreement": int(
+                    r.get("scalp_min_model_agreement", 2)),
+                "atr_sl_multiplier": float(r.get("scalp_atr_sl_multiplier", 1.0)),
+                "take_profit_r": float(r.get("scalp_take_profit_r", 1.5)),
+                "trail_activation_r": float(
+                    r.get("scalp_trail_activation_r", 1.0)),
+                "max_hold_hours": float(r.get("scalp_max_hold_hours", 0.5)),
+                "breakeven_lock_r": float(r.get("scalp_breakeven_lock_r", 0.4)),
+                "max_concurrent_positions": int(
+                    r.get("scalp_max_concurrent_positions", 3)),
+                "position_size_usd": float(
+                    r.get("scalp_position_size_usd", 30)),
+                "structural_gates_enabled": bool(
+                    r.get("scalp_structural_gates_enabled", True)),
+            },
+            "trend": {
+                "min_confidence": float(r.get("trend_min_confidence", 0.55)),
+                "min_model_agreement": int(
+                    r.get("trend_min_model_agreement", 3)),
+                "atr_sl_multiplier": float(r.get("trend_atr_sl_multiplier", 2.5)),
+                "take_profit_r": float(r.get("trend_take_profit_r", 4.0)),
+                "trail_activation_r": float(
+                    r.get("trend_trail_activation_r", 2.0)),
+                "max_hold_hours": float(r.get("trend_max_hold_hours", 48.0)),
+                "breakeven_lock_r": float(r.get("trend_breakeven_lock_r", 0.8)),
+                "max_concurrent_positions": int(
+                    r.get("trend_max_concurrent_positions", 2)),
+                "position_size_usd": float(
+                    r.get("trend_position_size_usd", 75)),
+                "structural_gates_enabled": False,  # trend's own signal IS its gate
+            },
+        }
+
+    def band_params(self, band: str | None) -> dict:
+        """Resolve a band name to its param dict. None/unknown band -> legacy
+        global values (so band=None callers keep pre-dual-band behavior)."""
+        if band in self.bands:
+            return self.bands[band]
+        return {
+            "min_confidence": self.min_confidence,
+            "min_model_agreement": self.min_model_agreement,
+            "atr_sl_multiplier": self.atr_sl_multiplier,
+            "take_profit_r": self.take_profit_r,
+            "trail_activation_r": self.trail_activation_r,
+            "max_hold_hours": self.max_hold_hours_scalp,
+            "breakeven_lock_r": self.breakeven_lock_r,
+            "max_concurrent_positions": self.max_concurrent_positions,
+            "position_size_usd": float(
+                (getattr(self.cfg, "_raw", {}) or {}).get("trading", {})
+                .get("default_usd_size", 50)),
+            "structural_gates_enabled": True,
+        }
+
     def refresh_params(self) -> dict:
         """Re-read all tunable guard params from the (already override-merged)
         config. Returns {param: (old, new)} for values that changed, so the
         loop can log an audit line. Called once per cycle by run_bot.py."""
-        before = {k: getattr(self, k) for k in (
+        scalar_keys = (
             "daily_drawdown_limit", "severe_drawdown_limit",
             "max_concurrent_positions", "max_leverage", "min_confidence",
             "min_model_agreement", "max_spread_pct", "atr_sl_multiplier",
             "atr_trail_multiplier", "trail_activation_r", "take_profit_r",
+            "breakeven_lock_enabled", "breakeven_lock_r",
+            "breakeven_lock_buffer_pct",
             "max_loss_per_trade_pct", "emergency_loss_pct",
             "max_hold_hours_scalp", "cascade_detection_enabled",
             "cascade_oi_drop_pct", "cascade_price_move_pct",
-            "cascade_window_minutes", "weekly_drawdown_limit")}
+            "cascade_window_minutes", "weekly_drawdown_limit",
+            "scalp_band_enabled", "trend_band_enabled",
+            "regime_counter_trend_penalty")
+        before = {k: getattr(self, k) for k in scalar_keys}
+        # flatten per-band params as "scalp.<key>" / "trend.<key>"
+        before_bands = {f"{b}.{k}": v
+                        for b, d in self.bands.items() for k, v in d.items()}
         self._load_params()
-        return {k: (before[k], getattr(self, k))
-                for k in before if before[k] != getattr(self, k)}
+        changed = {k: (before[k], getattr(self, k))
+                   for k in before if before[k] != getattr(self, k)}
+        after_bands = {f"{b}.{k}": v
+                       for b, d in self.bands.items() for k, v in d.items()}
+        changed.update({k: (before_bands[k], after_bands[k])
+                        for k in before_bands
+                        if before_bands.get(k) != after_bands.get(k)})
+        return changed
 
     # ------------------------------------------------------------------
     # state helpers
@@ -342,19 +429,35 @@ class RiskManager:
     # ------------------------------------------------------------------
     # Layer 1: pre-trade gate
     # ------------------------------------------------------------------
+    def _band_open_count(self, positions: list, band: str) -> int:
+        """How many currently-open positions belong to `band` (via the
+        per-coin tracker). Untracked/adopted coins aren't counted toward a
+        band's concurrency limit but still block re-entry via max_per_symbol."""
+        n = 0
+        for p in positions:
+            c = (p.get("position") or {}).get("coin")
+            if c and self._pos_track.get(c, {}).get("band") == band:
+                n += 1
+        return n
+
     def can_open(self, coin: str, direction: str, confidence: float,
-                 model_agreement: int, leverage: float) -> tuple[bool, str]:
-        """Returns (allowed, reason). Checks all pre-trade guards."""
+                 model_agreement: int, leverage: float,
+                 band: str | None = None) -> tuple[bool, str]:
+        """Returns (allowed, reason). Checks all pre-trade guards. With `band`
+        set, the confidence/agreement gate and the concurrency limit are the
+        band's; coin ownership (max_per_symbol) is enforced across ALL bands so
+        a coin is held by at most one band at a time (one-way exchange)."""
+        bp = self.band_params(band)
         if self.state != BotState.ACTIVE:
             return False, f"state={self.state.value}"
         if direction not in ("LONG", "SHORT"):
             return False, f"no tradeable direction ({direction})"
-        if confidence < self.min_confidence:
+        if confidence < bp["min_confidence"]:
             return False, (f"confidence {confidence:.2f} < "
-                           f"{self.min_confidence:.2f}")
-        if model_agreement < self.min_model_agreement:
+                           f"{bp['min_confidence']:.2f}")
+        if model_agreement < bp["min_model_agreement"]:
             return False, (f"model agreement {model_agreement} < "
-                           f"{self.min_model_agreement}")
+                           f"{bp['min_model_agreement']}")
         if direction == "LONG" and coin in self._long_halt:
             return False, "extreme positive funding — longs halted"
         if direction == "SHORT" and coin in self._short_halt:
@@ -363,13 +466,23 @@ class RiskManager:
             return False, "flash-crash pause active"
 
         positions = with_retry(self.xc.positions, "positions") or []
-        if len(positions) >= self.max_concurrent_positions:
+        if band in self.bands:
+            band_count = self._band_open_count(positions, band)
+            if band_count >= bp["max_concurrent_positions"]:
+                return False, (f"{band} max concurrent positions "
+                               f"({bp['max_concurrent_positions']}) reached")
+        elif len(positions) >= self.max_concurrent_positions:
             return False, (f"max concurrent positions "
                            f"({self.max_concurrent_positions}) reached")
+        # coin ownership: one-way exchange nets per coin, so a coin can hold at
+        # most one position regardless of band. A second band wanting the same
+        # coin is blocked here ("already holding" -> owned by the other band).
         per_sym = sum(1 for p in positions
                       if p.get("position", {}).get("coin") == coin)
         if per_sym >= self.max_per_symbol:
-            return False, f"already holding {coin}"
+            held_band = self._pos_track.get(coin, {}).get("band")
+            owner = f" (held by {held_band} band)" if held_band else ""
+            return False, f"already holding {coin}{owner}"
 
         book = self.buf.books.get(coin)
         if not book or not book.get("bids") or not book.get("asks"):
@@ -430,28 +543,35 @@ class RiskManager:
     # Layer 2: stops & targets
     # ------------------------------------------------------------------
     def calc_sl_tp(self, coin: str, entry_px: float, is_long: bool,
-                   atr: float) -> tuple[float, float]:
+                   atr: float, band: str | None = None) -> tuple[float, float]:
         """Returns (stop_loss_px, take_profit_px). SL at atr_sl_multiplier*ATR,
-        TP at take_profit_r * the initial risk (R)."""
-        r = atr * self.atr_sl_multiplier
-        tp_r = self.take_profit_r
+        TP at take_profit_r * the initial risk (R). Uses the band's geometry
+        (scalp tight / trend wide) when band is given; legacy globals when not."""
+        bp = self.band_params(band)
+        r = atr * bp["atr_sl_multiplier"]
+        tp_r = bp["take_profit_r"]
         if is_long:
             return entry_px - r, entry_px + tp_r * r
         return entry_px + r, entry_px - tp_r * r
 
     def register_entry(self, coin: str, entry_px: float, sl: float, tp: float,
-                       is_long: bool, hold_hours: float | None = None):
+                       is_long: bool, hold_hours: float | None = None,
+                       band: str | None = None):
         """Seed the in-trade tracker right after an order fills, so SL/TP/
-        trailing/expiry are enforced from the first tick."""
+        trailing/expiry are enforced from the first tick. `band` selects the
+        max-hold (and, in check_open_positions, the trail/breakeven geometry)."""
+        bp = self.band_params(band)
         self._pos_track[coin] = {
             "entry_px": entry_px,
             "sl": sl,
             "tp": tp,
             "is_long": is_long,
+            "band": band,
             "opened_ts": time.time(),
             "r_px": abs(entry_px - sl),
             "trailing": False,
-            "max_hold_s": (hold_hours or self.max_hold_hours_scalp) * 3600,
+            "breakeven_locked": False,
+            "max_hold_s": (hold_hours or bp["max_hold_hours"]) * 3600,
         }
 
     def check_open_positions(self, positions: list) -> list[dict]:
@@ -508,15 +628,17 @@ class RiskManager:
 
             ctx = self.buf.ctx.get(coin) or {}
             mid = self.buf.mid(coin) or float(ctx.get("mark_px") or 0) or entry
+            band = tr.get("band")
+            bp = self.band_params(band)
 
             # hard $ loss floors (account-relative)
             if equity > 0 and upnl <= -self.emergency_loss_pct * equity:
-                actions.append({"coin": coin, "action": "CLOSE",
+                actions.append({"coin": coin, "band": band, "action": "CLOSE",
                                 "reason": f"EMERGENCY loss {upnl:.2f} "
                                           f"<= -{self.emergency_loss_pct:.0%} equity"})
                 continue
             if equity > 0 and upnl <= -self.max_loss_per_trade_pct * equity:
-                actions.append({"coin": coin, "action": "CLOSE",
+                actions.append({"coin": coin, "band": band, "action": "CLOSE",
                                 "reason": f"max per-trade loss {upnl:.2f}"})
                 continue
 
@@ -525,36 +647,63 @@ class RiskManager:
             hit_tp = mid >= tr["tp"] if is_long else mid <= tr["tp"]
             if hit_sl:
                 label = "trailing stop" if tr["trailing"] else "stop loss"
-                actions.append({"coin": coin, "action": "CLOSE",
+                actions.append({"coin": coin, "band": band, "action": "CLOSE",
                                 "reason": f"{label} @ {tr['sl']:.4f}"})
                 continue
             if hit_tp:
-                actions.append({"coin": coin, "action": "CLOSE",
+                actions.append({"coin": coin, "band": band, "action": "CLOSE",
                                 "reason": f"take profit @ {tr['tp']:.4f}"})
                 continue
 
             # time expiry
             if now - tr["opened_ts"] > tr["max_hold_s"]:
-                actions.append({"coin": coin, "action": "CLOSE",
+                actions.append({"coin": coin, "band": band, "action": "CLOSE",
                                 "reason": "max hold time expired"})
                 continue
 
-            # trailing stop: activate at >= 1.5R unrealized, trail at 1*ATR
             r_px = tr["r_px"]
             if r_px > 0:
                 unreal_r = ((mid - tr["entry_px"]) if is_long
                             else (tr["entry_px"] - mid)) / r_px
-                if unreal_r >= self.trail_activation_r:
+
+                # breakeven profit lock: once the position reaches
+                # breakeven_lock_r of unrealized profit, snap the SL to entry +
+                # a small fee-covering buffer so a winning trade can't give back
+                # into a loss. Fires once (breakeven_locked latch), sits BELOW
+                # the trailing-stop activation, and only ever tightens the stop.
+                if (self.breakeven_lock_enabled
+                        and not tr["breakeven_locked"]
+                        and unreal_r >= bp["breakeven_lock_r"]):
+                    buf_px = tr["entry_px"] * (
+                        self.breakeven_lock_buffer_pct / 100.0)
+                    be_sl = (tr["entry_px"] + buf_px if is_long
+                             else tr["entry_px"] - buf_px)
+                    improved = ((be_sl > tr["sl"]) if is_long
+                                else (be_sl < tr["sl"]))
+                    if improved:
+                        tr["sl"] = be_sl
+                        tr["breakeven_locked"] = True
+                        actions.append({"coin": coin, "band": band,
+                                        "action": "BREAKEVEN",
+                                        "new_sl": be_sl,
+                                        "reason": f"breakeven lock @ "
+                                                  f"{unreal_r:.2f}R "
+                                                  f"(SL -> {be_sl:.4f})"})
+
+                # trailing stop: activate at >= trail_activation_r unrealized,
+                # trail at atr_trail_multiplier * ATR
+                if unreal_r >= bp["trail_activation_r"]:
                     atr = (atr_from_candles(
                         self.buf.latest_candles(coin, "1m", 60))
-                        or r_px / self.atr_sl_multiplier)
+                        or r_px / bp["atr_sl_multiplier"])
                     new_sl = (mid - atr * self.atr_trail_multiplier if is_long
                               else mid + atr * self.atr_trail_multiplier)
                     improved = (new_sl > tr["sl"]) if is_long else (new_sl < tr["sl"])
                     if improved:
                         tr["sl"] = new_sl
                         tr["trailing"] = True
-                        actions.append({"coin": coin, "action": "UPDATE_SL",
+                        actions.append({"coin": coin, "band": band,
+                                        "action": "UPDATE_SL",
                                         "new_sl": new_sl,
                                         "reason": f"trailing @ {unreal_r:.2f}R"})
 
@@ -627,6 +776,7 @@ class RiskManager:
             if not coin:
                 continue
             side = "LONG" if float(pos.get("szi") or 0) > 0 else "SHORT"
+            band = self._pos_track.get(coin, {}).get("band")
             res = with_retry(lambda c=coin: self.xc.market_close(c),
                              f"market_close({coin})")
             if res:
@@ -634,5 +784,5 @@ class RiskManager:
             self.db.log_trade(coin, side, "CLOSE",
                               size=abs(float(pos.get("szi") or 0)),
                               status="ok" if res else "error",
-                              note=f"risk: {reason}")
+                              band=band, note=f"risk: {reason}")
         self._pos_track.clear()

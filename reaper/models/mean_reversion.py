@@ -12,14 +12,15 @@ class MeanReversionModel(BaseModel):
     Z_ENTRY = 2.0
     Z_FLAT = 1.0
 
-    def compute(self, coin: str, buf) -> Ticket:
+    def compute(self, coin: str, buf, interval: str | None = None) -> Ticket:
         try:
             # only fires when regime detector says RANGING (if regime set)
             regime = (buf.ctx.get(coin) or {}).get("regime")
             if regime and regime != "RANGING":
                 return self.flat(reason="non_ranging_regime", regime=regime)
 
-            df = candles_to_df(buf.latest_candles(coin, "1m", self.WINDOW + 10))
+            df = candles_to_df(
+                buf.latest_candles(coin, interval or "1m", self.WINDOW + 10))
             if len(df) < self.WINDOW + 1:
                 return self.flat(reason="insufficient_candles", n=len(df))
             close = df["c"]

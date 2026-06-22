@@ -17,11 +17,14 @@ class RegimeDetectorModel(BaseModel):
     ADX_TREND = 25.0
     ATR_HIGH_VOL = 0.03
 
-    def compute(self, coin: str, buf) -> Ticket:
+    def compute(self, coin: str, buf, interval: str | None = None) -> Ticket:
         try:
-            # prefer 5m candles for a stable regime read; fall back to 1m
-            candles = buf.latest_candles(coin, "5m", 60)
-            interval = "5m"
+            # prefer the requested resolution (5m scalp / 1h trend) for a stable
+            # regime read; fall back to 1m if too few candles. Default 5m keeps
+            # legacy single-band behavior.
+            primary = interval or "5m"
+            candles = buf.latest_candles(coin, primary, 60)
+            interval = primary
             if len(candles) < 30:
                 candles = buf.latest_candles(coin, "1m", 100)
                 interval = "1m"

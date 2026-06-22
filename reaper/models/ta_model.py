@@ -30,9 +30,9 @@ class TAModel(BaseModel):
         self.rsi_low = rsi_low
         self.rsi_high = rsi_high
 
-    def compute(self, coin: str, buf) -> Ticket:
+    def compute(self, coin: str, buf, interval: str | None = None) -> Ticket:
         try:
-            df = candles_to_df(buf.latest_candles(coin, "1m", 100))
+            df = candles_to_df(buf.latest_candles(coin, interval or "1m", 100))
             if len(df) < 30:
                 return self.flat(reason="insufficient_candles", n=len(df))
             close = df["c"]

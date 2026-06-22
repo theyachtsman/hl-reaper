@@ -26,8 +26,14 @@ class BaseModel(ABC):
     name: str = "BaseModel"
 
     @abstractmethod
-    def compute(self, coin: str, buf: MarketBuffer) -> Ticket:
-        """Compute and return a Ticket. Must never raise — catch internally."""
+    def compute(self, coin: str, buf: MarketBuffer,
+                interval: str | None = None) -> Ticket:
+        """Compute and return a Ticket. Must never raise — catch internally.
+
+        interval: optional candle resolution to evaluate on (dual-band: "5m"
+        for the scalp band, "1h" for the trend band). When None each model uses
+        its own historical default — preserves all legacy single-band callers.
+        Interval-agnostic models (orderbook, funding) accept and ignore it."""
 
     def flat(self, **meta) -> Ticket:
         return Ticket(self.name, FLAT, 0.0, meta)

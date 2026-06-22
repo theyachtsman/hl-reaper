@@ -11,7 +11,8 @@ CREATE TABLE IF NOT EXISTS trades (
     side TEXT NOT NULL,             -- LONG | SHORT
     action TEXT NOT NULL,           -- OPEN | CLOSE | TEST
     size REAL, price REAL, leverage REAL,
-    order_id TEXT, status TEXT, note TEXT
+    order_id TEXT, status TEXT, note TEXT,
+    band TEXT                       -- scalp | trend | NULL (legacy/manual)
 );
 CREATE TABLE IF NOT EXISTS signals (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -62,6 +63,15 @@ class DB:
         self._local = threading.local()
         with self._conn() as c:
             c.executescript(_SCHEMA)
+            self._migrate(c)
+
+    @staticmethod
+    def _migrate(c: sqlite3.Connection):
+        """Idempotent additive migrations for DBs created before a column
+        existed. ALTER TABLE ADD COLUMN is a no-op-safe schema bump."""
+        cols = {r[1] for r in c.execute("PRAGMA table_info(trades)").fetchall()}
+        if "band" not in cols:
+            c.execute("ALTER TABLE trades ADD COLUMN band TEXT")
 
     def _conn(self) -> sqlite3.Connection:
         if not hasattr(self._local, "conn"):
@@ -70,7 +80,8 @@ class DB:
         return self._local.conn
 
     def log_trade(self, coin, side, action, size=None, price=None,
-                  leverage=None, order_id=None, status=None, note=None):
+                  leverage=None, order_id=None, status=None, note=None,
+                  band=None):
         now_ms = int(time.time() * 1000)
         with self._conn() as c:
             # Dedup ghost close re-evaluations: a single on-chain close can be
@@ -87,9 +98,10 @@ class DB:
                     return
             c.execute(
                 "INSERT INTO trades (ts,coin,side,action,size,price,leverage,"
-                "order_id,status,note) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                "order_id,status,note,band) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (now_ms, coin, side, action, size, price,
-                 leverage, str(order_id) if order_id else None, status, note),
+                 leverage, str(order_id) if order_id else None, status, note,
+                 band),
             )
 
     def insert_funding(self, coin: str, rows: list[dict]):

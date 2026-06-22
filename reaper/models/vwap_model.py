@@ -11,9 +11,9 @@ log = get_logger("model.vwap")
 class VWAPModel(BaseModel):
     name = "VWAPModel"
 
-    def compute(self, coin: str, buf) -> Ticket:
+    def compute(self, coin: str, buf, interval: str | None = None) -> Ticket:
         try:
-            df = candles_to_df(buf.latest_candles(coin, "1m", 1440))
+            df = candles_to_df(buf.latest_candles(coin, interval or "1m", 1440))
             if df.empty:
                 return self.flat(reason="no_candles")
             midnight_ms = int(datetime.now(timezone.utc).replace(

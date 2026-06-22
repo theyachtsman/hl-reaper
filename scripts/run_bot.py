@@ -15,10 +15,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from reaper import alerts
-from reaper.aggregator import SignalAggregator
+from reaper.aggregator import (SCALP_WEIGHTS, TREND_WEIGHTS, SignalAggregator,
+                               apply_regime_bias)
 from reaper.config import PROJECT_ROOT, Config
 from reaper.data.buffer import MarketBuffer
 from reaper.data.rest_pollers import RestPollers
+from reaper.data.spot_poller import SpotPoller
 from reaper.data.websocket_feed import WebSocketFeed
 from reaper.db import DB
 from reaper.execution.exchange_client import ExchangeClient
@@ -65,10 +67,368 @@ class SignalWriter:
 
 
 def long_confirmation_count(model_votes: dict, models: set) -> int:
-    """How many of `models` are actively voting LONG (Change B gate). Used by
-    the entry loop and the dashboard verdict so they never drift apart."""
+    """How many of `models` are actively voting LONG (legacy Change B gate).
+    Superseded by long_structural_gate() for live entries; retained for the
+    dashboard SHORT-mirror display and the regression suite."""
     return sum(1 for t in model_votes.values()
                if t.model in models and t.direction == LONG)
+
+
+def _momentum_cooldown_ok(coin: str, buf, params: dict) -> tuple[bool, str, dict]:
+    """Signal 4 — momentum cooldown (no recent sharp pump).
+
+    Blocks LONG entry if price moved sharply UPWARD over a recent short window.
+    Even with all three structural signals green, those signals ARE the
+    consequence of a pump (spot leads + OI rises + book turns bid-heavy as the
+    move runs); by the time all three confirm the move is largely done and the
+    entry catches the top. The losing-LONG signature in 374 round-trips is a
+    4.6-minute MEDIAN hold — enter near the top, stopped on the retrace within
+    minutes. Letting the post-pump consolidation happen first fixes the TIMING;
+    the structural signals themselves stay valid.
+
+    Checks three lookback windows on 5m candles (5m / 10m / 15m) and blocks if
+    ANY exceeds its threshold. Returns (ok, reason, moves) where `moves` carries
+    the three % moves for logging + the dashboard. Fail-OPEN during warmup
+    (too few candles): momentum can't be judged, so it must not block.
+
+    NOTE: the symmetric SHORT dump-cooldown (block SHORT after a sharp DROP —
+    catching the bottom) is deliberately NOT added here. The SHORT side is
+    working (57% win, +$21.46 net); mirror this with inverted moves only if
+    SHORT entry quality degrades.
+    """
+    moves = {"move_5m": None, "move_10m": None, "move_15m": None}
+    if not params.get("pump_cooldown_enabled", True):
+        return True, "cooldown_disabled", moves
+    candles = buf.latest_candles(coin, "5m", 6)  # last ~30 minutes
+    if len(candles) < 3:
+        return True, "insufficient_candles", moves  # fail-open during warmup
+
+    thr_1 = float(params.get("pump_threshold_1", 0.005))   # 0.5% in 5m
+    thr_2 = float(params.get("pump_threshold_2", 0.008))   # 0.8% in 10m
+    thr_3 = float(params.get("pump_threshold_3", 0.012))   # 1.2% in 15m
+
+    current = float(candles[-1]["c"])
+    prev_1 = float(candles[-2]["c"])                       # 5m ago
+    prev_2 = float(candles[-3]["c"])                       # 10m ago
+    prev_3 = float(candles[-4]["c"]) if len(candles) >= 4 else prev_2  # 15m ago
+
+    move_1 = (current - prev_1) / prev_1 if prev_1 else 0.0
+    move_2 = (current - prev_2) / prev_2 if prev_2 else 0.0
+    move_3 = (current - prev_3) / prev_3 if prev_3 else 0.0
+    moves["move_5m"], moves["move_10m"], moves["move_15m"] = (
+        move_1, move_2, move_3)
+
+    if move_1 > thr_1:
+        return (False, f"pump_5m:+{move_1*100:.3f}%>{thr_1*100:.1f}%", moves)
+    if move_2 > thr_2:
+        return (False, f"pump_10m:+{move_2*100:.3f}%>{thr_2*100:.1f}%", moves)
+    if move_3 > thr_3:
+        return (False, f"pump_15m:+{move_3*100:.3f}%>{thr_3*100:.1f}%", moves)
+    return (True, f"momentum_ok:5m={move_1*100:.3f}% 10m={move_2*100:.3f}% "
+            f"15m={move_3*100:.3f}%", moves)
+
+
+def long_structural_gate(coin: str, buf, params: dict) -> tuple[bool, dict]:
+    """Strong structural LONG gate (2026-06-17), supersedes Change B.
+
+    A LONG entry must clear ALL of these signals, each independently confirmed
+    in this project's research as pointing the right way:
+      1. SPOT LEADING perp  — real demand, not leverage-driven (spot return
+         over the lookback exceeds perp return and is itself positive).
+      2. OI RISING with price — fresh longs entering, structural participation
+         (not short-covering / liquidation exhaustion).
+      3. ORDERBOOK BID-HEAVY — live microstructure confirms buy pressure now.
+      4. MOMENTUM COOLDOWN — no recent sharp pump (2026-06-18, anti-pump-top):
+         the three signals above flash green AS a pump runs; entering then
+         catches the top. Block if price ran up past threshold in the last
+         5m/10m/15m and let the consolidation happen first.
+
+    Fail-safe: if any of signals 1-3 can't be computed (missing/stale history,
+    no book) that signal FAILS and the LONG is blocked. Better to miss a good
+    LONG than take a bad one — matters most during startup before history
+    accumulates. Signal 4 instead fails OPEN during warmup: momentum can't be
+    judged with too few candles, so it must not block on its own.
+
+    Returns (allowed, detail) where detail carries each signal's pass/fail and
+    the underlying numbers for logging + the dashboard. SHORTs never call this.
+    """
+    spot_lead_thr = float(params.get("spot_lead_threshold", 0.0002))
+    oi_rise_thr = float(params.get("oi_rise_threshold", 0.001))
+    ob_bid_thr = float(params.get("ob_bid_threshold", 0.20))
+    spot_lookback = float(params.get("spot_lookback_minutes", 5))
+    oi_lookback = float(params.get("oi_lookback_minutes", 5))
+    top_n = int(params.get("ob_top_levels", 10))
+
+    detail = {
+        "spot_leading": False, "oi_rising": False, "ob_bid_heavy": False,
+        "momentum_ok": False,
+        "spot_ret": None, "perp_ret": None, "oi_change": None,
+        "imbalance": None,
+        "move_5m": None, "move_10m": None, "move_15m": None, "pump_detail": "",
+        "allowed": False, "block_reason": "",
+    }
+
+    # --- Signal 1: spot leadership over the lookback window -----------------
+    spot_now = buf.spot_price(coin)
+    spot_then = buf.spot_price_n_minutes_ago(coin, spot_lookback)
+    perp_now = buf.mid(coin)
+    c5 = buf.latest_candles(coin, "5m", 2)
+    perp_then = float(c5[-2]["c"]) if len(c5) >= 2 else None
+    if all(v is not None and v > 0 for v in
+           (spot_now, spot_then, perp_now, perp_then)):
+        spot_ret = (spot_now - spot_then) / spot_then
+        perp_ret = (perp_now - perp_then) / perp_then
+        detail["spot_ret"] = spot_ret
+        detail["perp_ret"] = perp_ret
+        detail["spot_leading"] = spot_ret > perp_ret and spot_ret > spot_lead_thr
+
+    # --- Signal 2: OI rising (fresh buying) ---------------------------------
+    oi_now = (buf.ctx.get(coin) or {}).get("open_interest")
+    oi_then = buf.oi_n_minutes_ago(coin, oi_lookback)
+    if oi_now and oi_then:
+        detail["oi_change"] = (oi_now - oi_then) / oi_then
+        detail["oi_rising"] = oi_now > oi_then * (1 + oi_rise_thr)
+
+    # --- Signal 3: orderbook bid-heavy --------------------------------------
+    book = buf.books.get(coin)
+    if book and book.get("bids") and book.get("asks"):
+        bid_vol = sum(sz for _px, sz in book["bids"][:top_n])
+        ask_vol = sum(sz for _px, sz in book["asks"][:top_n])
+        total = bid_vol + ask_vol
+        if total > 0:
+            imb = (bid_vol - ask_vol) / total
+            detail["imbalance"] = imb
+            detail["ob_bid_heavy"] = imb >= ob_bid_thr
+
+    # --- Signal 4: momentum cooldown (no recent sharp pump) -----------------
+    m_ok, m_reason, m_moves = _momentum_cooldown_ok(coin, buf, params)
+    detail["momentum_ok"] = m_ok
+    detail["pump_detail"] = m_reason
+    detail.update(m_moves)
+
+    if not detail["spot_leading"]:
+        detail["block_reason"] = "spot_not_leading"
+    elif not detail["oi_rising"]:
+        detail["block_reason"] = "oi_not_rising"
+    elif not detail["ob_bid_heavy"]:
+        detail["block_reason"] = "book_not_bid_heavy"
+    elif not detail["momentum_ok"]:
+        detail["block_reason"] = "recent_pump"
+    else:
+        detail["allowed"] = True
+    return detail["allowed"], detail
+
+
+def _dump_cooldown_ok(coin: str, buf, params: dict) -> tuple[bool, str, dict]:
+    """SHORT Signal 4 — dump cooldown (no recent sharp DROP).
+
+    Mirror of _momentum_cooldown_ok for the SHORT side (2026-06-19). The three
+    structural SHORT signals (spot lagging + OI rising with falling price + book
+    ask-heavy) all flash green AS a dump runs; entering then catches the BOTTOM
+    and gets stopped on the bounce — the SHORT analogue of the losing-LONG
+    pump-top signature. Block SHORT entry if price dropped sharply over a recent
+    short window and let the dump exhaust first; the structural signals stay
+    valid, only the TIMING is corrected.
+
+    Checks three lookback windows on 5m candles (5m / 10m / 15m) and blocks if
+    ANY exceeds its (downward) threshold. Returns (ok, reason, moves) where
+    `moves` carries the three % moves for logging + the dashboard. Fail-OPEN
+    during warmup (too few candles): momentum can't be judged, so it must not
+    block.
+    """
+    moves = {"move_5m": None, "move_10m": None, "move_15m": None}
+    if not params.get("dump_cooldown_enabled", True):
+        return True, "cooldown_disabled", moves
+    candles = buf.latest_candles(coin, "5m", 6)  # last ~30 minutes
+    if len(candles) < 3:
+        return True, "insufficient_candles", moves  # fail-open during warmup
+
+    thr_1 = float(params.get("dump_threshold_1", 0.005))   # 0.5% in 5m
+    thr_2 = float(params.get("dump_threshold_2", 0.008))   # 0.8% in 10m
+    thr_3 = float(params.get("dump_threshold_3", 0.012))   # 1.2% in 15m
+
+    current = float(candles[-1]["c"])
+    prev_1 = float(candles[-2]["c"])                       # 5m ago
+    prev_2 = float(candles[-3]["c"])                       # 10m ago
+    prev_3 = float(candles[-4]["c"]) if len(candles) >= 4 else prev_2  # 15m ago
+
+    move_1 = (current - prev_1) / prev_1 if prev_1 else 0.0
+    move_2 = (current - prev_2) / prev_2 if prev_2 else 0.0
+    move_3 = (current - prev_3) / prev_3 if prev_3 else 0.0
+    moves["move_5m"], moves["move_10m"], moves["move_15m"] = (
+        move_1, move_2, move_3)
+
+    if move_1 < -thr_1:
+        return (False, f"dump_5m:{move_1*100:.3f}%<-{thr_1*100:.1f}%", moves)
+    if move_2 < -thr_2:
+        return (False, f"dump_10m:{move_2*100:.3f}%<-{thr_2*100:.1f}%", moves)
+    if move_3 < -thr_3:
+        return (False, f"dump_15m:{move_3*100:.3f}%<-{thr_3*100:.1f}%", moves)
+    return (True, f"momentum_ok:5m={move_1*100:.3f}% 10m={move_2*100:.3f}% "
+            f"15m={move_3*100:.3f}%", moves)
+
+
+def short_structural_gate(coin: str, buf, params: dict) -> tuple[bool, dict]:
+    """Strong structural SHORT gate (2026-06-19), mirror of long_structural_gate.
+
+    A SHORT entry must clear ALL of these signals, each the inverse of the LONG
+    gate's and each pointing the right way for genuine downside participation:
+      1. SPOT LAGGING perp — real selling, not a leverage-driven bounce (spot
+         return over the lookback is below perp return AND itself negative; spot
+         falling faster than perp, or perp trying to bounce while spot still
+         falls).
+      2. OI RISING with FALLING price — fresh shorts entering, structural
+         participation (not short-covering / long-liquidation exhaustion). This
+         is the new_shorts signal from the Phase 4.6 OI decomposition.
+      3. ORDERBOOK ASK-HEAVY — live microstructure confirms sell pressure now.
+      4. DUMP COOLDOWN — no recent sharp drop: the three signals above flash
+         green AS a dump runs; entering then catches the bottom. Block if price
+         fell past threshold in the last 5m/10m/15m and let the dump exhaust.
+
+    Fail-safe (mirror of the LONG gate): if any of signals 1-3 can't be computed
+    (missing/stale spot or OI history, no book) that signal FAILS and the SHORT
+    is blocked. Signal 4 fails OPEN during warmup. The drought this targets
+    (33 SHORTs on 6/17 -> 0 on 6/19) comes from the regime detector lagging into
+    TRENDING_UP; this gate reads live microstructure instead and fires SHORTs on
+    confirmed downside structure regardless of the regime/TA bias.
+
+    Returns (allowed, detail) — same shape as long_structural_gate — so the
+    dashboard, logging and tests treat both gates identically. LONGs never call
+    this.
+    """
+    spot_lag_thr = float(params.get("spot_lag_threshold", 0.0002))
+    oi_rise_thr = float(params.get("oi_rise_threshold", 0.001))
+    ob_ask_thr = float(params.get("ob_ask_threshold", 0.20))
+    spot_lookback = float(params.get("spot_lookback_minutes", 5))
+    oi_lookback = float(params.get("oi_lookback_minutes", 5))
+    top_n = int(params.get("ob_top_levels", 10))
+
+    detail = {
+        "spot_lagging": False, "oi_rising": False, "ob_ask_heavy": False,
+        "momentum_ok": False,
+        "spot_ret": None, "perp_ret": None, "oi_change": None,
+        "imbalance": None,
+        "move_5m": None, "move_10m": None, "move_15m": None, "dump_detail": "",
+        "allowed": False, "block_reason": "",
+    }
+
+    # --- Signal 1: spot lagging perp over the lookback window ---------------
+    spot_now = buf.spot_price(coin)
+    spot_then = buf.spot_price_n_minutes_ago(coin, spot_lookback)
+    perp_now = buf.mid(coin)
+    c5 = buf.latest_candles(coin, "5m", 2)
+    perp_then = float(c5[-2]["c"]) if len(c5) >= 2 else None
+    if all(v is not None and v > 0 for v in
+           (spot_now, spot_then, perp_now, perp_then)):
+        spot_ret = (spot_now - spot_then) / spot_then
+        perp_ret = (perp_now - perp_then) / perp_then
+        detail["spot_ret"] = spot_ret
+        detail["perp_ret"] = perp_ret
+        # spot falling faster than perp (real selling) OR perp bouncing while
+        # spot still falls (leverage-driven bounce) — both are spot < perp with
+        # spot itself negative past the threshold.
+        detail["spot_lagging"] = (spot_ret < perp_ret
+                                  and spot_ret < -spot_lag_thr)
+
+    # --- Signal 2: OI rising WITH falling price (fresh shorts) --------------
+    oi_now = (buf.ctx.get(coin) or {}).get("open_interest")
+    oi_then = buf.oi_n_minutes_ago(coin, oi_lookback)
+    if oi_now and oi_then and detail["perp_ret"] is not None:
+        detail["oi_change"] = (oi_now - oi_then) / oi_then
+        detail["oi_rising"] = (oi_now > oi_then * (1 + oi_rise_thr)
+                               and detail["perp_ret"] < -0.0001)
+
+    # --- Signal 3: orderbook ask-heavy -------------------------------------
+    book = buf.books.get(coin)
+    if book and book.get("bids") and book.get("asks"):
+        bid_vol = sum(sz for _px, sz in book["bids"][:top_n])
+        ask_vol = sum(sz for _px, sz in book["asks"][:top_n])
+        total = bid_vol + ask_vol
+        if total > 0:
+            imb = (bid_vol - ask_vol) / total
+            detail["imbalance"] = imb
+            detail["ob_ask_heavy"] = imb <= -ob_ask_thr
+
+    # --- Signal 4: dump cooldown (no recent sharp drop) --------------------
+    m_ok, m_reason, m_moves = _dump_cooldown_ok(coin, buf, params)
+    detail["momentum_ok"] = m_ok
+    detail["dump_detail"] = m_reason
+    detail.update(m_moves)
+
+    if not detail["spot_lagging"]:
+        detail["block_reason"] = "spot_not_lagging"
+    elif not detail["oi_rising"]:
+        detail["block_reason"] = "oi_not_rising"
+    elif not detail["ob_ask_heavy"]:
+        detail["block_reason"] = "book_not_ask_heavy"
+    elif not detail["momentum_ok"]:
+        detail["block_reason"] = "recent_dump"
+    else:
+        detail["allowed"] = True
+    return detail["allowed"], detail
+
+
+def long_structural_params(t_raw: dict, m_raw: dict) -> dict:
+    """Collect the LONG structural-gate tunables (config + live overrides) so
+    the initial read and the per-loop hot-reload stay in sync."""
+    return {
+        "enabled": bool(t_raw.get("long_structural_gate_enabled", True)),
+        "spot_lead_threshold": float(
+            t_raw.get("long_spot_lead_threshold", 0.0002)),
+        "oi_rise_threshold": float(t_raw.get("long_oi_rise_threshold", 0.001)),
+        "ob_bid_threshold": float(t_raw.get("long_ob_bid_threshold", 0.20)),
+        "spot_lookback_minutes": float(
+            t_raw.get("long_spot_lookback_minutes", 5)),
+        "oi_lookback_minutes": float(t_raw.get("long_oi_lookback_minutes", 5)),
+        "ob_top_levels": int(m_raw.get("ob_top_levels", 10)),
+        # Signal 4 — momentum cooldown (anti-pump-top, 2026-06-18)
+        "pump_cooldown_enabled": bool(
+            t_raw.get("long_pump_cooldown_enabled", True)),
+        "pump_threshold_1": float(t_raw.get("long_pump_threshold_1", 0.005)),
+        "pump_threshold_2": float(t_raw.get("long_pump_threshold_2", 0.008)),
+        "pump_threshold_3": float(t_raw.get("long_pump_threshold_3", 0.012)),
+    }
+
+
+def short_structural_params(t_raw: dict, m_raw: dict) -> dict:
+    """Collect the SHORT structural-gate tunables (config + live overrides) so
+    the initial read and the per-loop hot-reload stay in sync. Mirror of
+    long_structural_params (2026-06-19)."""
+    return {
+        "enabled": bool(t_raw.get("short_structural_gate_enabled", True)),
+        "spot_lag_threshold": float(
+            t_raw.get("short_spot_lag_threshold", 0.0002)),
+        "oi_rise_threshold": float(t_raw.get("short_oi_rise_threshold", 0.001)),
+        "ob_ask_threshold": float(t_raw.get("short_ob_ask_threshold", 0.20)),
+        "spot_lookback_minutes": float(
+            t_raw.get("short_spot_lookback_minutes", 5)),
+        "oi_lookback_minutes": float(t_raw.get("short_oi_lookback_minutes", 5)),
+        "ob_top_levels": int(m_raw.get("ob_top_levels", 10)),
+        # Signal 4 — dump cooldown (anti-dump-bottom, 2026-06-19)
+        "dump_cooldown_enabled": bool(
+            t_raw.get("short_dump_cooldown_enabled", True)),
+        "dump_threshold_1": float(t_raw.get("short_dump_threshold_1", 0.005)),
+        "dump_threshold_2": float(t_raw.get("short_dump_threshold_2", 0.008)),
+        "dump_threshold_3": float(t_raw.get("short_dump_threshold_3", 0.012)),
+    }
+
+
+# Throttle high-frequency skip logging. The structural gate and the direction
+# switches reject the same coin every loop (~10s); without this the trades table
+# grows ~15k near-duplicate skip rows/day. Persist at most one skip row per
+# (coin, category) per SKIP_LOG_THROTTLE_S — enough to audit that a side is being
+# held without flooding the table. In-memory, resets on restart.
+SKIP_LOG_THROTTLE_S = 300
+_last_skip_log: dict = {}
+
+
+def _should_log_skip(coin: str, category: str) -> bool:
+    now = time.time()
+    key = (coin, category)
+    if now - _last_skip_log.get(key, 0.0) >= SKIP_LOG_THROTTLE_S:
+        _last_skip_log[key] = now
+        return True
+    return False
 
 
 def parse_fill(res: dict) -> tuple[float | None, str]:
@@ -117,19 +477,24 @@ class MakerTimeoutTracker:
 
 def run_taker_fallback(coin, is_long, usd_size, *, models, aggregator, buf, xc,
                        db, min_confidence, min_model_agreement,
-                       exhaustion_atr_mult, start_mid) -> dict:
+                       exhaustion_atr_mult, start_mid, interval=None,
+                       weights=None, regime_routing=True, band=None) -> dict:
     """Maker-timeout streak hit N: re-validate the signal on the CURRENT
     buffer (never the cached one from streak start) and confirm the move is
     still live, then take the market only if both hold. Every decision —
     fired or skipped — is logged to the trades table for later audit.
 
+    Re-aggregates on the band's resolution + weight set so the re-validation
+    matches the band that requested the entry.
+
     Returns {"status": taker_fallback|taker_skipped_degraded|
     taker_skipped_exhausted|taker_failed, "fill_px", "sig", "agreement"}."""
     direction = LONG if is_long else SHORT
 
-    # Step 2 — re-validate the signal on current buffer state
-    tickets = [m.compute(coin, buf) for m in models]
-    sig = aggregator.aggregate(coin, tickets)
+    # Step 2 — re-validate the signal on current buffer state (band resolution)
+    tickets = [m.compute(coin, buf, interval=interval) for m in models]
+    sig = aggregator.aggregate(coin, tickets, weights=weights,
+                               regime_routing=regime_routing)
     agreement = (sig.long_votes if sig.direction == LONG else sig.short_votes)
     degraded = None
     if sig.direction != direction:
@@ -142,6 +507,7 @@ def run_taker_fallback(coin, is_long, usd_size, *, models, aggregator, buf, xc,
         log.info("taker fallback %s %s SKIP — signal degraded: %s",
                  direction, coin, degraded)
         db.log_trade(coin, direction, "OPEN", status="taker_skipped_degraded",
+                     band=band,
                      note=f"maker:taker_skipped_degraded ({degraded})")
         return {"status": "taker_skipped_degraded", "fill_px": None,
                 "sig": sig, "agreement": agreement}
@@ -172,6 +538,7 @@ def run_taker_fallback(coin, is_long, usd_size, *, models, aggregator, buf, xc,
         log.info("taker fallback %s %s SKIP — move exhausted: %s",
                  direction, coin, exhausted)
         db.log_trade(coin, direction, "OPEN", status="taker_skipped_exhausted",
+                     band=band,
                      note=f"maker:taker_skipped_exhausted ({exhausted})")
         return {"status": "taker_skipped_exhausted", "fill_px": None,
                 "sig": sig, "agreement": agreement}
@@ -187,14 +554,32 @@ def run_taker_fallback(coin, is_long, usd_size, *, models, aggregator, buf, xc,
         return {"status": "taker_failed", "fill_px": None, "sig": sig,
                 "agreement": agreement}
     fill_px, st_note = parse_fill(res)
+    fmap = "smooth" if next(
+        (m.smooth_mapping for m in models if m.name == "FundingRateModel"),
+        False) else "binary"
     db.log_trade(coin, direction, "OPEN",
                  size=usd_size / (fill_px or cur_mid or 1),
-                 price=fill_px,
+                 price=fill_px, band=band,
                  status="taker_fallback" if fill_px else "taker_failed",
                  note=(f"maker:taker_fallback conf={sig.confidence:.2f} "
-                       f"votes={agreement} {st_note}"))
+                       f"votes={agreement} fmap={fmap} {st_note}"))
     return {"status": "taker_fallback" if fill_px else "taker_failed",
             "fill_px": fill_px, "sig": sig, "agreement": agreement}
+
+
+def _pack_band(tickets: list, sig) -> dict:
+    """Serialize one band's model tickets + aggregated verdict for the
+    dashboard (single overwritten live_tickets key, zero table growth)."""
+    return {
+        "tickets": [{"model": t.model, "direction": t.direction,
+                     "confidence": round(t.confidence, 3), "meta": t.meta}
+                    for t in tickets],
+        "direction": sig.direction,
+        "confidence": round(sig.confidence, 3),
+        "regime": sig.regime,
+        "long": sig.long_votes, "short": sig.short_votes,
+        "flat": sig.flat_votes, "meta": sig.meta,
+    }
 
 
 def acquire_singleton_lock() -> object:
@@ -231,16 +616,25 @@ def main():
     fallback_window_s = float(t_raw.get("maker_timeout_fallback_window_s", 180))
     fallback_exhaustion_mult = float(
         t_raw.get("maker_timeout_exhaustion_atr_mult", 1.5))
-    # LONG-only microstructure confirmation gate (Change B, 2026-06-16): a LONG
-    # verdict must be confirmed by at least N of the listed live models actively
-    # voting LONG, else skip. SHORTs (the working side) are never gated.
-    long_conf_enabled = bool(t_raw.get("long_confirmation_enabled", True))
-    long_conf_models = set(t_raw.get(
-        "long_confirmation_models",
-        ["OrderbookImbalanceModel", "VWAPModel"]))
-    long_conf_min = int(t_raw.get("long_confirmation_min", 1))
-    # SHORT mirror — OFF by default (working side stays untouched); exposable
-    # for testing via the controls page.
+    # LONG structural gate (2026-06-17): supersedes the old Change B OB/VWAP
+    # confirmation. A LONG must clear ALL of {spot leading, OI rising, book
+    # bid-heavy}, else skip. SHORTs (the working side) are never gated.
+    long_struct = long_structural_params(t_raw, m_raw)
+    # SHORT structural gate (2026-06-19): mirror of the LONG gate for the SHORT
+    # side. A SHORT must clear ALL of {spot lagging, OI rising with falling
+    # price, book ask-heavy} plus the dump cooldown. Targets the SHORT drought
+    # (33->0 SHORTs as the regime detector lagged into TRENDING_UP).
+    short_struct = short_structural_params(t_raw, m_raw)
+    # Dual-band (2026-06-20): two aggregations per coin per cycle — SCALP on the
+    # fast resolution, TREND on the slow one. Each band has its own weight set,
+    # entry gate, risk geometry and concurrency (see RiskManager.bands). One-way
+    # exchange nets per coin, so a coin is owned by at most one band at a time.
+    scalp_band_enabled = bool(t_raw.get("scalp_band_enabled", True))
+    trend_band_enabled = bool(t_raw.get("trend_band_enabled", True))
+    scalp_interval = str(t_raw.get("scalp_interval", "5m"))
+    trend_interval = str(t_raw.get("trend_interval", "1h"))
+    # Legacy SHORT OB/VWAP mirror — OFF by default; superseded by short_struct
+    # above but still read for the dashboard / regression suite.
     short_conf_enabled = bool(t_raw.get("short_confirmation_enabled", False))
     short_conf_models = set(t_raw.get(
         "short_confirmation_models",
@@ -259,16 +653,27 @@ def main():
     feed = WebSocketFeed(cfg.api_url, buf, cfg.candle_intervals,
                          cfg.stale_feed_seconds)
     pollers = RestPollers(cfg.api_url, cfg, buf, db)
+    # in-process Binance spot poller feeding THIS buffer (record=False — the
+    # standalone hl-spot-poller.service owns the disk recordings). The LONG
+    # structural gate reads buf.spot_price() / spot_history from here; without
+    # it spot data never reaches the bot and every LONG fails the gate's
+    # spot-leading check. Best-effort: a spot outage just fails LONGs safe.
+    spot_poller = SpotPoller(cfg.coins, PROJECT_ROOT / "data" / "recorded",
+                             buf=buf, poll_s=5.0, record=False)
     feed.start()
     pollers.start()
+    spot_poller.start()
 
     # 2-4. models, aggregator, risk
     xc = ExchangeClient(cfg)
+    funding_model = FundingRateModel(
+        db, smooth_mapping=bool(r_raw.get("funding_smooth_mapping_enabled",
+                                          False)))
     models = [
         RegimeDetectorModel(),   # first: publishes regime for the others
         TAModel(),
         MeanReversionModel(),
-        FundingRateModel(db),
+        funding_model,
         OrderbookImbalanceModel(
             top_levels=int(m_raw.get("ob_top_levels", 10)),
             min_imbalance=float(m_raw.get("ob_min_imbalance", 0.30))),
@@ -290,9 +695,25 @@ def main():
     if aggregator.funding_hard_block_enabled:
         log.info("funding HARD-block ENABLED — FundingRate SHORT conf >= %.2f "
                  "blocks all LONG entries", aggregator.funding_hard_block_conf)
-    if long_conf_enabled:
-        log.info("LONG confirmation gate ENABLED — need >=%d of %s voting LONG",
-                 long_conf_min, sorted(long_conf_models))
+    log.info("funding mapping: %s (risk.funding_smooth_mapping_enabled=%s)",
+             "SMOOTH (continuous)" if funding_model.smooth_mapping
+             else "BINARY (original fallback)", funding_model.smooth_mapping)
+    if not (cfg.longs_enabled and cfg.shorts_enabled):
+        log.warning("DIRECTION MODE — longs_enabled=%s shorts_enabled=%s "
+                    "(toggle live from the Controls page)",
+                    cfg.longs_enabled, cfg.shorts_enabled)
+    if long_struct["enabled"]:
+        log.info("LONG STRUCTURAL gate ENABLED — need spot leading (>%.4f) + "
+                 "OI rising (>%.3f) + book bid-heavy (>=%.2f)",
+                 long_struct["spot_lead_threshold"],
+                 long_struct["oi_rise_threshold"],
+                 long_struct["ob_bid_threshold"])
+    if short_struct["enabled"]:
+        log.info("SHORT STRUCTURAL gate ENABLED — need spot lagging (<-%.4f) + "
+                 "OI rising w/ falling price (>%.3f) + book ask-heavy (<=-%.2f)",
+                 short_struct["spot_lag_threshold"],
+                 short_struct["oi_rise_threshold"],
+                 short_struct["ob_ask_threshold"])
     maker_streaks = MakerTimeoutTracker(fallback_n, fallback_window_s)
     if entry_style == "maker" and fallback_enabled:
         log.info("maker timeout->taker fallback ENABLED — fire after %d "
@@ -338,8 +759,156 @@ def main():
             log.warning("close order FAILED for %s (%s) — will retry next cycle",
                         coin, reason)
         db.log_trade(coin, side, "CLOSE", status="ok" if res else "error",
-                     note=reason)
+                     band=risk._pos_track.get(coin, {}).get("band"), note=reason)
         return bool(res)
+
+    def open_entry(coin: str, sig, band: str, g_allowed: bool, g_detail: dict,
+                   s_allowed: bool, s_detail: dict) -> bool:
+        """Attempt ONE band entry for coin given its aggregated signal. Returns
+        True iff a position was opened (so the caller skips the other band on
+        this coin — one-way exchange owns one position per coin). Mirrors the
+        legacy single-band entry flow, scoped to the band's gate/geometry/size.
+        Structural gates apply to the SCALP band only."""
+        bp = risk.band_params(band)
+        is_long = sig.direction == LONG
+
+        # per-band direction toggles: effective = global master AND band flag
+        if is_long:
+            if not (cfg.longs_enabled
+                    and bool(t_raw.get(f"{band}_longs_enabled", True))):
+                if _should_log_skip(coin, f"{band}_dir_disabled_LONG"):
+                    db.log_trade(coin, LONG, "OPEN", band=band,
+                                 status="direction_disabled",
+                                 note=f"{band} longs disabled")
+                return False
+        else:
+            if not (cfg.shorts_enabled
+                    and bool(t_raw.get(f"{band}_shorts_enabled", True))):
+                if _should_log_skip(coin, f"{band}_dir_disabled_SHORT"):
+                    db.log_trade(coin, SHORT, "OPEN", band=band,
+                                 status="direction_disabled",
+                                 note=f"{band} shorts disabled")
+                return False
+
+        # structural gates — SCALP band only (trend's own 1h signal is its gate)
+        if band == "scalp" and bp["structural_gates_enabled"]:
+            if is_long and long_struct["enabled"] and not g_allowed:
+                reason = g_detail["block_reason"]
+                why = (g_detail["pump_detail"] if reason == "recent_pump"
+                       else f"imb={g_detail['imbalance']}")
+                log.info("scalp LONG skipped on %s: long_blocked (%s)",
+                         coin, reason)
+                if _should_log_skip(coin, "long_blocked"):
+                    db.log_trade(coin, LONG, "OPEN", band=band,
+                                 status=f"long_blocked_{reason}",
+                                 note=f"skip: structural gate ({reason}) {why}")
+                return False
+            if not is_long and short_struct["enabled"] and not s_allowed:
+                reason = s_detail["block_reason"]
+                why = (s_detail["dump_detail"] if reason == "recent_dump"
+                       else f"imb={s_detail['imbalance']}")
+                log.info("scalp SHORT skipped on %s: short_blocked (%s)",
+                         coin, reason)
+                if _should_log_skip(coin, "short_blocked"):
+                    db.log_trade(coin, SHORT, "OPEN", band=band,
+                                 status=f"short_blocked_{reason}",
+                                 note=f"skip: structural gate ({reason}) {why}")
+                return False
+
+        # sizing — per-band size; per-coin override (Controls) wins when set
+        pc = (cfg._raw.get("per_coin", {}) or {}).get(coin, {}) or {}
+        coin_usd = float(pc.get("usd_size") or bp["position_size_usd"])
+        coin_lev = float(pc.get("leverage") or default_lev)
+        agreement = sig.long_votes if is_long else sig.short_votes
+        ok, reason = risk.can_open(coin, sig.direction, sig.confidence,
+                                   agreement, coin_lev, band=band)
+        if not ok:
+            log.debug("skip %s %s [%s]: %s", coin, sig.direction, band, reason)
+            return False
+
+        lev = risk.clamp_leverage(coin_lev)
+        atr = atr_from_candles(buf.latest_candles(coin, "1m", 60))
+        entry_ref = buf.mid(coin)
+        if not atr or not entry_ref:
+            log.warning("skip %s [%s]: no ATR/mid for stops", coin, band)
+            return False
+        sl, tp = risk.calc_sl_tp(coin, entry_ref, is_long, atr, band=band)
+        weights = SCALP_WEIGHTS if band == "scalp" else TREND_WEIGHTS
+        interval = scalp_interval if band == "scalp" else trend_interval
+        fmap = "smooth" if funding_smooth else "binary"
+
+        log.warning("ENTRY %s %s [%s] conf=%.2f votes=%d regime=%s "
+                    "sl=%.4f tp=%.4f", sig.direction, coin, band,
+                    sig.confidence, agreement, sig.regime, sl, tp)
+
+        if entry_style == "maker":
+            mres = xc.try_limit_entry(coin, is_long, coin_usd,
+                                      timeout_s=entry_timeout)
+            fill_px = mres.get("avg_px")
+            note = f"maker:{mres['status']}"
+            if mres["status"] not in ("filled", "partial"):
+                triggered = False
+                streak_count = 0
+                if fallback_enabled:
+                    streak = maker_streaks.record_timeout(
+                        coin, sig.direction, entry_ref)
+                    streak_count = streak["count"]
+                    if streak_count >= fallback_n:
+                        triggered = True
+                        fb = run_taker_fallback(
+                            coin, is_long, coin_usd, models=models,
+                            aggregator=aggregator, buf=buf, xc=xc, db=db,
+                            min_confidence=bp["min_confidence"],
+                            min_model_agreement=bp["min_model_agreement"],
+                            exhaustion_atr_mult=fallback_exhaustion_mult,
+                            start_mid=streak["start_mid"], interval=interval,
+                            weights=weights, regime_routing=False, band=band)
+                        maker_streaks.reset(coin)
+                        if fb["status"] == "taker_fallback" and fb["fill_px"]:
+                            fill_px = fb["fill_px"]
+                            sl, tp = risk.calc_sl_tp(
+                                coin, fill_px, is_long, atr, band=band)
+                            risk.register_entry(coin, fill_px, sl, tp, is_long,
+                                                band=band)
+                            alerts.send(
+                                f"TAKER FALLBACK {sig.direction} {coin} "
+                                f"[{band}] @ {fill_px}\n"
+                                f"conf={fb['sig'].confidence:.2f} "
+                                f"votes={fb['agreement']} "
+                                f"(maker timed out {streak['count']}x)\n"
+                                f"sl={sl:.4f} tp={tp:.4f}")
+                            return True
+                if not triggered:
+                    log.info("maker entry %s on %s [%s] — skipped "
+                             "(timeout streak=%d/%d)", mres["status"], coin,
+                             band, streak_count, fallback_n)
+                    db.log_trade(coin, sig.direction, "OPEN", band=band,
+                                 status=mres["status"], note=note)
+                return False
+            maker_streaks.reset(coin)
+        else:
+            res = with_retry(lambda: xc.market_open(coin, is_long, coin_usd),
+                             f"market_open({coin})")
+            if not res:
+                db.log_trade(coin, sig.direction, "OPEN", band=band,
+                             status="error", note="order failed")
+                return False
+            fill_px, note = parse_fill(res)
+
+        if fill_px:
+            sl, tp = risk.calc_sl_tp(coin, fill_px, is_long, atr, band=band)
+            risk.register_entry(coin, fill_px, sl, tp, is_long, band=band)
+            alerts.send(
+                f"OPEN {sig.direction} {coin} [{band}] @ {fill_px}\n"
+                f"conf={sig.confidence:.2f} votes={agreement} "
+                f"regime={sig.regime}\nsl={sl:.4f} tp={tp:.4f}")
+        db.log_trade(coin, sig.direction, "OPEN",
+                     size=coin_usd / (fill_px or entry_ref),
+                     price=fill_px, leverage=lev, band=band,
+                     status="filled" if fill_px else "failed",
+                     note=f"conf={sig.confidence:.2f} votes={agreement} "
+                          f"fmap={fmap} {note}")
+        return bool(fill_px)
 
     def handle_command(command: str) -> str:
         """Execute one queued dashboard control command; return a status note."""
@@ -432,12 +1001,14 @@ def main():
                 t_raw.get("maker_timeout_exhaustion_atr_mult", 1.5))
             maker_streaks.n = fallback_n
             maker_streaks.window_s = fallback_window_s
-            long_conf_enabled = bool(
-                t_raw.get("long_confirmation_enabled", True))
-            long_conf_models = set(t_raw.get(
-                "long_confirmation_models",
-                ["OrderbookImbalanceModel", "VWAPModel"]))
-            long_conf_min = int(t_raw.get("long_confirmation_min", 1))
+            long_struct = long_structural_params(
+                t_raw, cfg._raw.get("models", {}) or {})
+            short_struct = short_structural_params(
+                t_raw, cfg._raw.get("models", {}) or {})
+            scalp_band_enabled = bool(t_raw.get("scalp_band_enabled", True))
+            trend_band_enabled = bool(t_raw.get("trend_band_enabled", True))
+            scalp_interval = str(t_raw.get("scalp_interval", "5m"))
+            trend_interval = str(t_raw.get("trend_interval", "1h"))
             short_conf_enabled = bool(
                 t_raw.get("short_confirmation_enabled", False))
             short_conf_models = set(t_raw.get(
@@ -454,6 +1025,14 @@ def main():
                 r_raw.get("funding_hard_block_short_enabled", False))
             aggregator.funding_hard_block_short_conf = float(
                 r_raw.get("funding_hard_block_short_conf", 0.75))
+            # funding mapping A/B switch — hot-reloaded onto the model and
+            # stamped on each OPEN trade note (fmap=) for clean attribution.
+            funding_smooth = bool(
+                r_raw.get("funding_smooth_mapping_enabled", False))
+            if funding_model.smooth_mapping != funding_smooth:
+                log.warning("funding mapping -> %s",
+                            "SMOOTH" if funding_smooth else "BINARY")
+            funding_model.smooth_mapping = funding_smooth
 
             # --- drain one-shot control commands (controls page) -----------
             for cmd_id, command in db.get_pending_commands():
@@ -495,14 +1074,33 @@ def main():
                 if positions:
                     for act in risk.check_open_positions(positions):
                         if act["action"] == "CLOSE":
-                            log.warning("CLOSE %s: %s", act["coin"],
-                                        act["reason"])
+                            log.warning("CLOSE %s [%s]: %s", act["coin"],
+                                        act.get("band"), act["reason"])
                             close_position(act["coin"], act["reason"])
-                            alerts.send(f"CLOSE {act['coin']} — "
+                            alerts.send(f"CLOSE {act['coin']} "
+                                        f"[{act.get('band')}] — "
                                         f"{act['reason']}")
                         elif act["action"] == "UPDATE_SL":
                             log.info("SL -> %.4f on %s (%s)", act["new_sl"],
                                      act["coin"], act["reason"])
+                        elif act["action"] == "BREAKEVEN":
+                            log.info("BREAKEVEN lock on %s: %s", act["coin"],
+                                     act["reason"])
+                            # persist a BE_LOCK row so the Live chart can place a
+                            # "BE" marker at the point protection kicked in.
+                            side = next(
+                                ("LONG" if float((p.get("position") or {}).get(
+                                    "szi") or 0) > 0 else "SHORT")
+                                for p in positions
+                                if (p.get("position") or {}).get("coin")
+                                == act["coin"])  # coin is guaranteed present
+                            # (the action was produced from this positions list)
+                            db.log_trade(act["coin"], side, "BE_LOCK",
+                                         price=act["new_sl"],
+                                         band=act.get("band"),
+                                         note=act["reason"])
+                            alerts.send(f"BREAKEVEN {act['coin']} — "
+                                        f"{act['reason']}")
 
             # c0. cascade bounce track (Phase 8.6) — event-driven, runs
             # outside the ensemble gate; one bounce position at a time.
@@ -590,173 +1188,87 @@ def main():
                             f"max_hold={risk.cb_max_hold_minutes:.0f}min")
                         break
 
-            # c. evaluate entries
+            # c. evaluate entries — DUAL BAND (2026-06-20)
+            # Two aggregations per coin: SCALP on the fast resolution + TREND on
+            # the slow one, each with its own fixed weight set (no regime weight
+            # shuffle — trend-awareness is the explicit bias dampener below).
+            # TREND is evaluated first (priority): a rare trend signal claims the
+            # coin and scalp is then blocked on it by coin ownership (one-way
+            # exchange nets per coin -> one band per coin at a time).
             if state == BotState.ACTIVE:
                 live_tickets: dict = {}
+                long_gates: dict = {}
+                short_gates: dict = {}
+                penalty = risk.regime_counter_trend_penalty
                 for coin in coins_active:
                     if coin in coins_disabled:
                         continue
-                    tickets = [m.compute(coin, buf) for m in models]
-                    # publish current model opinions for the dashboard —
-                    # single overwritten key, zero table growth
-                    live_tickets[coin] = [
-                        {"model": t.model, "direction": t.direction,
-                         "confidence": round(t.confidence, 3),
-                         "meta": t.meta} for t in tickets]
-                    sig = aggregator.aggregate(coin, tickets)
-                    if sig.direction == FLAT:
-                        continue
-                    signals.log(coin, "AGGREGATOR", sig.direction,
-                                sig.confidence,
-                                {"regime": sig.regime,
-                                 "long": sig.long_votes,
-                                 "short": sig.short_votes,
-                                 "flat": sig.flat_votes,
-                                 **sig.meta})
-                    # Change B: LONG entries require live microstructure
-                    # confirmation. SHORTs (the working side) are never gated.
-                    if long_conf_enabled and sig.direction == LONG:
-                        confirming = long_confirmation_count(
-                            sig.model_votes, long_conf_models)
-                        if confirming < long_conf_min:
-                            log.info("LONG entry skipped: no microstructure "
-                                     "confirmation (%d/%d of %s voting LONG) "
-                                     "on %s", confirming, long_conf_min,
-                                     sorted(long_conf_models), coin)
-                            db.log_trade(coin, sig.direction, "OPEN",
-                                         status="long_unconfirmed",
-                                         note=("skip: no microstructure "
-                                               f"confirmation ({confirming}/"
-                                               f"{long_conf_min})"))
-                            continue
-                    # SHORT mirror (OFF by default) — same OB/VWAP gate
-                    if short_conf_enabled and sig.direction == SHORT:
-                        confirming = sum(
-                            1 for t in sig.model_votes.values()
-                            if t.model in short_conf_models
-                            and t.direction == SHORT)
-                        if confirming < short_conf_min:
-                            log.info("SHORT entry skipped: no microstructure "
-                                     "confirmation (%d/%d of %s voting SHORT) "
-                                     "on %s", confirming, short_conf_min,
-                                     sorted(short_conf_models), coin)
-                            db.log_trade(coin, sig.direction, "OPEN",
-                                         status="short_unconfirmed",
-                                         note=("skip: no microstructure "
-                                               f"confirmation ({confirming}/"
-                                               f"{short_conf_min})"))
-                            continue
-                    # per-coin size/leverage overrides (controls page) fall back
-                    # to the global defaults when unset.
-                    pc = per_coin_cfg.get(coin, {}) or {}
-                    coin_usd = float(pc.get("usd_size") or usd_size)
-                    coin_lev = float(pc.get("leverage") or default_lev)
-                    agreement = (sig.long_votes if sig.direction == LONG
-                                 else sig.short_votes)
-                    ok, reason = risk.can_open(coin, sig.direction,
-                                               sig.confidence, agreement,
-                                               coin_lev)
-                    if not ok:
-                        log.debug("skip %s %s: %s", coin, sig.direction,
-                                  reason)
-                        continue
+                    # dual aggregation
+                    scalp_tickets = [m.compute(coin, buf, interval=scalp_interval)
+                                     for m in models]
+                    scalp_sig = aggregator.aggregate(
+                        coin, scalp_tickets, weights=SCALP_WEIGHTS,
+                        regime_routing=False)
+                    trend_tickets = [m.compute(coin, buf, interval=trend_interval)
+                                     for m in models]
+                    trend_sig = aggregator.aggregate(
+                        coin, trend_tickets, weights=TREND_WEIGHTS,
+                        regime_routing=False)
+                    # regime bias: 1h (trend) regime DAMPENS counter-trend scalp
+                    # confidence (never blocks). Trend signal is never modified.
+                    apply_regime_bias(scalp_sig, trend_sig.regime, penalty)
 
-                    lev = risk.clamp_leverage(coin_lev)
-                    atr = atr_from_candles(buf.latest_candles(coin, "1m", 60))
-                    entry_ref = buf.mid(coin)
-                    if not atr or not entry_ref:
-                        log.warning("skip %s: no ATR/mid for stops", coin)
-                        continue
-                    is_long = sig.direction == LONG
-                    sl, tp = risk.calc_sl_tp(coin, entry_ref, is_long, atr)
+                    # structural gates — SCALP band only; computed every loop for
+                    # the dashboard regardless of verdict, reused for scalp entry.
+                    g_allowed, g_detail = long_structural_gate(
+                        coin, buf, long_struct)
+                    long_gates[coin] = {**g_detail,
+                                        "enabled": long_struct["enabled"]}
+                    s_allowed, s_detail = short_structural_gate(
+                        coin, buf, short_struct)
+                    short_gates[coin] = {**s_detail,
+                                         "enabled": short_struct["enabled"]}
 
-                    log.warning("ENTRY %s %s conf=%.2f votes=%d regime=%s "
-                                "sl=%.4f tp=%.4f", sig.direction, coin,
-                                sig.confidence, agreement, sig.regime, sl, tp)
-                    for tk in tickets:   # full ticket breakdown for the journal
-                        signals.log(coin, tk.model, tk.direction,
-                                    tk.confidence, tk.meta)
-                    if entry_style == "maker":
-                        # post-only entry; maker stays the default. On repeated
-                        # timeouts (price outrunning the limit) the intelligent
-                        # taker fallback re-validates and may take the market —
-                        # otherwise the signal is skipped (never blind-chase).
-                        mres = xc.try_limit_entry(coin, is_long, coin_usd,
-                                                  timeout_s=entry_timeout)
-                        fill_px = mres.get("avg_px")
-                        note = f"maker:{mres['status']}"
-                        if mres["status"] not in ("filled", "partial"):
-                            triggered = False
-                            streak_count = 0
-                            if fallback_enabled:
-                                streak = maker_streaks.record_timeout(
-                                    coin, sig.direction, entry_ref)
-                                streak_count = streak["count"]
-                                if streak_count >= fallback_n:
-                                    triggered = True
-                                    fb = run_taker_fallback(
-                                        coin, is_long, coin_usd, models=models,
-                                        aggregator=aggregator, buf=buf, xc=xc,
-                                        db=db,
-                                        min_confidence=risk.min_confidence,
-                                        min_model_agreement=(
-                                            risk.min_model_agreement),
-                                        exhaustion_atr_mult=(
-                                            fallback_exhaustion_mult),
-                                        start_mid=streak["start_mid"])
-                                    # streak resolved either way — reset it
-                                    maker_streaks.reset(coin)
-                                    if fb["status"] == "taker_fallback" \
-                                            and fb["fill_px"]:
-                                        fill_px = fb["fill_px"]
-                                        sl, tp = risk.calc_sl_tp(
-                                            coin, fill_px, is_long, atr)
-                                        risk.register_entry(
-                                            coin, fill_px, sl, tp, is_long)
-                                        alerts.send(
-                                            f"TAKER FALLBACK {sig.direction} "
-                                            f"{coin} @ {fill_px}\n"
-                                            f"conf={fb['sig'].confidence:.2f} "
-                                            f"votes={fb['agreement']} "
-                                            f"(maker timed out {streak['count']}"
-                                            f"x)\nsl={sl:.4f} tp={tp:.4f}")
-                            if not triggered:
-                                log.info("maker entry %s on %s — skipped "
-                                         "(timeout streak=%d/%d)",
-                                         mres["status"], coin, streak_count,
-                                         fallback_n)
-                                db.log_trade(coin, sig.direction, "OPEN",
-                                             status=mres["status"], note=note)
-                            continue
-                        # maker filled — clear any prior timeout streak
-                        maker_streaks.reset(coin)
-                    else:
-                        res = with_retry(
-                            lambda: xc.market_open(coin, is_long, coin_usd),
-                            f"market_open({coin})")
-                        if not res:
-                            db.log_trade(coin, sig.direction, "OPEN",
-                                         status="error", note="order failed")
-                            continue
-                        fill_px, note = parse_fill(res)
-                    if fill_px:
-                        sl, tp = risk.calc_sl_tp(coin, fill_px, is_long, atr)
-                        risk.register_entry(coin, fill_px, sl, tp, is_long)
-                        alerts.send(
-                            f"OPEN {sig.direction} {coin} @ {fill_px}\n"
-                            f"conf={sig.confidence:.2f} votes={agreement} "
-                            f"regime={sig.regime}\nsl={sl:.4f} tp={tp:.4f}")
-                    db.log_trade(coin, sig.direction, "OPEN",
-                                 size=coin_usd / (fill_px or entry_ref),
-                                 price=fill_px, leverage=lev,
-                                 status="filled" if fill_px else "failed",
-                                 note=f"conf={sig.confidence:.2f} "
-                                      f"votes={agreement} {note}")
+                    # publish both bands' opinions for the dashboard
+                    live_tickets[coin] = {
+                        "scalp": _pack_band(scalp_tickets, scalp_sig),
+                        "trend": _pack_band(trend_tickets, trend_sig)}
+                    if scalp_sig.direction != FLAT:
+                        signals.log(coin, "AGGREGATOR_SCALP", scalp_sig.direction,
+                                    scalp_sig.confidence,
+                                    {"regime": scalp_sig.regime,
+                                     "long": scalp_sig.long_votes,
+                                     "short": scalp_sig.short_votes,
+                                     "flat": scalp_sig.flat_votes,
+                                     **scalp_sig.meta})
+                    if trend_sig.direction != FLAT:
+                        signals.log(coin, "AGGREGATOR_TREND", trend_sig.direction,
+                                    trend_sig.confidence,
+                                    {"regime": trend_sig.regime,
+                                     "long": trend_sig.long_votes,
+                                     "short": trend_sig.short_votes,
+                                     "flat": trend_sig.flat_votes,
+                                     **trend_sig.meta})
+
+                    # TREND first (priority), then SCALP if the coin is still free
+                    opened = False
+                    if trend_band_enabled and trend_sig.direction != FLAT:
+                        opened = open_entry(coin, trend_sig, "trend", g_allowed,
+                                            g_detail, s_allowed, s_detail)
+                    if (not opened and scalp_band_enabled
+                            and scalp_sig.direction != FLAT):
+                        open_entry(coin, scalp_sig, "scalp", g_allowed, g_detail,
+                                   s_allowed, s_detail)
 
                 if live_tickets:
                     db.set_state("live_tickets", json.dumps(
                         {"ts": int(time.time() * 1000),
-                         "coins": live_tickets}, default=str))
+                         "coins": live_tickets,
+                         "long_gates": long_gates,
+                         "short_gates": short_gates,
+                         "bands": {"scalp_enabled": scalp_band_enabled,
+                                   "trend_enabled": trend_band_enabled}},
+                        default=str))
 
             # d. heartbeat + status
             hb_path.write_text(str(int(time.time())))
@@ -774,6 +1286,7 @@ def main():
         db.set_state("status", "stopped")
         pollers.stop()
         feed.stop()
+        spot_poller.stop()
 
 
 if __name__ == "__main__":

@@ -37,6 +37,10 @@ type ActivePreset = {
 
 // preset id → accent classes for the pill (active = solid, idle = outlined)
 const PRESET_ACCENT: Record<string, { on: string; off: string }> = {
+  DUAL_BAND: {
+    on: "bg-teal-500/25 border-teal-500/70 text-teal-200",
+    off: "border-teal-500/40 text-teal-300 hover:bg-teal-500/10",
+  },
   BASELINE: {
     on: "bg-amber-500/25 border-amber-500/70 text-amber-200",
     off: "border-amber-500/40 text-amber-300 hover:bg-amber-500/10",
@@ -282,125 +286,12 @@ export default function ControlsPage() {
         </div>
       </div>
 
-      {/* ---- Section 2 — position sizing ---- */}
-      <Section title="Position Sizing">
-        <Slider cfg={cfg} ck="trading.default_usd_size" label="Position Size (USD per trade)"
-          min={10} max={500} step={5} prefix="$" onApply={setKey} onReset={clearKey} />
-        <Slider cfg={cfg} ck="risk.max_concurrent_positions" label="Max Concurrent Positions"
-          min={1} max={7} step={1} onApply={setKey} onReset={clearKey} />
+      {/* ═══ GLOBAL ═══ (applies across both bands) */}
+      <Section title="Global">
         <Slider cfg={cfg} ck="risk.max_leverage" label="Max Leverage (hard ceiling 10x)"
-          min={1} max={10} step={0.5} unit="x" onApply={setKey} onReset={clearKey} />
-      </Section>
-
-      {/* ---- Section 3 — signal gate ---- */}
-      <Section title="Signal Gate">
-        <Slider cfg={cfg} ck="risk.min_confidence" label="Minimum Confidence Threshold"
-          min={0.30} max={0.80} step={0.01} dp={2} onApply={setKey} onReset={clearKey}
-          note="0.30 aggressive → 0.80 conservative" />
-        <Slider cfg={cfg} ck="risk.min_model_agreement" label="Minimum Model Agreement"
-          min={2} max={6} step={1} onApply={setKey} onReset={clearKey}
-          note="of the active directional voters" />
-        <div className="flex items-center gap-2 flex-wrap pt-1">
-          <span className="text-xs text-slate-500">Presets:</span>
-          <Preset label="Aggressive" onClick={() => {
-            setKey("risk.min_confidence", 0.35); setKey("risk.min_model_agreement", 2);
-          }} />
-          <Preset label="Balanced" onClick={() => {
-            setKey("risk.min_confidence", 0.50); setKey("risk.min_model_agreement", 3);
-          }} />
-          <Preset label="Conservative" onClick={() => {
-            setKey("risk.min_confidence", 0.75); setKey("risk.min_model_agreement", 5);
-          }} />
-        </div>
-      </Section>
-
-      {/* ---- Section 3b — trading directions ---- */}
-      <Section title="Trading Directions">
-        <DirectionControls cfg={cfg} onApply={setKey} />
-      </Section>
-
-      {/* ---- Section 4 — entry filters ---- */}
-      <Section title="Entry Filters">
-        <div className="label text-emerald-300/80">LONG</div>
-        <Toggle cfg={cfg} ck="risk.funding_hard_block_enabled"
-          label="Funding hard-block enabled" onApply={setKey} onReset={clearKey} />
-        <Slider cfg={cfg} ck="risk.funding_hard_block_conf" label="Funding block threshold"
-          min={0} max={1} step={0.05} dp={2} onApply={setKey} onReset={clearKey}
-          note="FundingRate SHORT conf ≥ this blocks LONG" />
-        <Toggle cfg={cfg} ck="trading.long_confirmation_enabled"
-          label="Microstructure confirmation required" onApply={setKey} onReset={clearKey} />
-        <Slider cfg={cfg} ck="trading.long_confirmation_min" label="Min confirmers (OB/VWAP voting LONG)"
-          min={0} max={5} step={1} onApply={setKey} onReset={clearKey} />
-        <Toggle cfg={cfg} ck="trading.long_pump_cooldown_enabled"
-          label="Pump cooldown enabled (block LONG after sharp pump)" onApply={setKey} onReset={clearKey} />
-        <Slider cfg={cfg} ck="trading.long_pump_threshold_1" label="5m pump threshold"
-          min={0.1} max={2.0} step={0.1} pct unit="%" dp={1} onApply={setKey} onReset={clearKey}
-          note="block LONG if price up > this in last 5m" />
-        <Slider cfg={cfg} ck="trading.long_pump_threshold_2" label="10m pump threshold"
-          min={0.1} max={3.0} step={0.1} pct unit="%" dp={1} onApply={setKey} onReset={clearKey} />
-        <Slider cfg={cfg} ck="trading.long_pump_threshold_3" label="15m pump threshold"
-          min={0.1} max={4.0} step={0.1} pct unit="%" dp={1} onApply={setKey} onReset={clearKey} />
-        <div className="label text-red-300/80 pt-2">SHORT</div>
-        <Toggle cfg={cfg} ck="risk.funding_hard_block_short_enabled"
-          label="Mirror funding block for SHORTs" onApply={setKey} onReset={clearKey} />
-        <Slider cfg={cfg} ck="risk.funding_hard_block_short_conf" label="SHORT funding block threshold"
-          min={0} max={1} step={0.05} dp={2} onApply={setKey} onReset={clearKey} />
-        <Toggle cfg={cfg} ck="trading.short_confirmation_enabled"
-          label="Require microstructure for SHORTs (legacy)" onApply={setKey} onReset={clearKey} />
-        <Slider cfg={cfg} ck="trading.short_confirmation_min" label="Min SHORT confirmers"
-          min={0} max={5} step={1} onApply={setKey} onReset={clearKey} />
-        <div className="label text-red-300/80 pt-2">SHORT Structural Gate</div>
-        <Toggle cfg={cfg} ck="trading.short_structural_gate_enabled"
-          label="SHORT structural gate enabled (default ON)" onApply={setKey} onReset={clearKey} />
-        <Slider cfg={cfg} ck="trading.short_spot_lag_threshold" label="Spot lag threshold"
-          min={0} max={1.0} step={0.01} pct unit="%" dp={2} onApply={setKey} onReset={clearKey}
-          note="spot must fall ≥ this below perp" />
-        <Slider cfg={cfg} ck="trading.short_oi_rise_threshold" label="OI rise threshold"
-          min={0} max={5.0} step={0.1} pct unit="%" dp={2} onApply={setKey} onReset={clearKey}
-          note="OI must rise ≥ this with falling price (0 = testnet)" />
-        <Slider cfg={cfg} ck="trading.short_ob_ask_threshold" label="Book ask threshold"
-          min={0} max={0.9} step={0.05} dp={2} onApply={setKey} onReset={clearKey}
-          note="ask imbalance ≥ this (60/40 = 0.20)" />
-        <Toggle cfg={cfg} ck="trading.short_dump_cooldown_enabled"
-          label="Dump cooldown enabled (block SHORT after sharp drop)" onApply={setKey} onReset={clearKey} />
-        <Slider cfg={cfg} ck="trading.short_dump_threshold_1" label="5m dump threshold"
-          min={0.1} max={2.0} step={0.1} pct unit="%" dp={1} onApply={setKey} onReset={clearKey}
-          note="block SHORT if price down > this in last 5m" />
-        <Slider cfg={cfg} ck="trading.short_dump_threshold_2" label="10m dump threshold"
-          min={0.1} max={3.0} step={0.1} pct unit="%" dp={1} onApply={setKey} onReset={clearKey} />
-        <Slider cfg={cfg} ck="trading.short_dump_threshold_3" label="15m dump threshold"
-          min={0.1} max={4.0} step={0.1} pct unit="%" dp={1} onApply={setKey} onReset={clearKey} />
-      </Section>
-
-      {/* ---- Section 5 — risk / stops ---- */}
-      <Section title="Risk / Stop Loss">
-        <Slider cfg={cfg} ck="risk.atr_sl_multiplier" label="ATR Stop Loss Multiplier"
-          min={0.5} max={3.0} step={0.1} unit="x" dp={1} onApply={setKey} onReset={clearKey}
-          note="wider = more room, more loss if stopped" />
-        <Slider cfg={cfg} ck="risk.take_profit_r" label="Take Profit (R multiple)"
-          min={1.0} max={4.0} step={0.1} unit="R" dp={1} onApply={setKey} onReset={clearKey}
-          note="TP at this × initial risk" />
-        <Slider cfg={cfg} ck="risk.trail_activation_r" label="Trailing Stop Activation (R)"
-          min={0.5} max={3.0} step={0.1} unit="R" dp={1} onApply={setKey} onReset={clearKey} />
-        <Slider cfg={cfg} ck="risk.max_hold_hours_scalp" label="Max Hold Time (hours)"
-          min={0.5} max={48} step={0.5} unit="h" dp={1} onApply={setKey} onReset={clearKey} />
-      </Section>
-
-      {/* ---- Section 6 — taker fallback ---- */}
-      <Section title="Taker Fallback">
-        <Toggle cfg={cfg} ck="trading.maker_timeout_fallback_enabled"
-          label="Maker-timeout fallback enabled" onApply={setKey} onReset={clearKey} />
-        <Slider cfg={cfg} ck="trading.maker_timeout_fallback_n" label="Consecutive timeouts before fallback"
-          min={1} max={10} step={1} onApply={setKey} onReset={clearKey} />
-        <Slider cfg={cfg} ck="trading.maker_timeout_fallback_window_s" label="Fallback window (seconds)"
-          min={30} max={600} step={10} unit="s" onApply={setKey} onReset={clearKey} />
-        <Slider cfg={cfg} ck="trading.maker_timeout_exhaustion_atr_mult" label="Exhaustion threshold (ATR mult)"
-          min={0.5} max={3.0} step={0.1} unit="x" dp={1} onApply={setKey} onReset={clearKey} />
-      </Section>
-
-      {/* ---- Section 7 — coin controls ---- */}
-      <Section title="Coin Controls">
-        <div className="label mb-1">Active Trading Pairs</div>
+          min={1} max={10} step={0.5} unit="x" onApply={setKey} onReset={clearKey}
+          note="hard ceiling — applies to both bands" />
+        <div className="label mt-2 mb-1">Active Trading Pairs</div>
         <div className="flex gap-2 flex-wrap">
           {coins.map((c) => {
             const activeList: string[] = cfg.effective["trading.coins_active"] ?? coins;
@@ -419,16 +310,42 @@ export default function ControlsPage() {
             );
           })}
         </div>
-        <div className="label mt-4 mb-1">Per-coin overrides (blank = use global)</div>
+        <div className="label mt-4 mb-1">Per-coin overrides (blank = use band default)</div>
         <div className="grid gap-2">
           {coins.map((c) => (
             <PerCoin key={c} coin={c} cfg={cfg} onApply={setKey} onReset={clearKey} />
           ))}
         </div>
-      </Section>
-
-      {/* ---- Section 8 — circuit breakers ---- */}
-      <Section title="Circuit Breakers">
+        <div className="label mt-4 mb-1">Global direction master (both bands)</div>
+        <DirectionControls cfg={cfg} onApply={setKey} />
+        <div className="label mt-4 text-slate-300/80">Funding (aggregator — both bands)</div>
+        <Toggle cfg={cfg} ck="risk.funding_hard_block_enabled"
+          label="Funding hard-block enabled (blocks crowded LONGs)" onApply={setKey} onReset={clearKey} />
+        <Slider cfg={cfg} ck="risk.funding_hard_block_conf" label="Funding block threshold"
+          min={0} max={1} step={0.05} dp={2} onApply={setKey} onReset={clearKey}
+          note="FundingRate SHORT conf ≥ this blocks LONG" />
+        <Toggle cfg={cfg} ck="risk.funding_hard_block_short_enabled"
+          label="Mirror funding block for SHORTs" onApply={setKey} onReset={clearKey} />
+        <Slider cfg={cfg} ck="risk.funding_hard_block_short_conf" label="SHORT funding block threshold"
+          min={0} max={1} step={0.05} dp={2} onApply={setKey} onReset={clearKey} />
+        <Toggle cfg={cfg} ck="risk.funding_smooth_mapping_enabled"
+          label="Smooth funding mapping (ON: mild-positive funding leans SHORT; OFF: binary)"
+          onApply={setKey} onReset={clearKey} />
+        <div className="label mt-4 text-slate-300/80">Taker Fallback (both bands' entries)</div>
+        <Toggle cfg={cfg} ck="trading.maker_timeout_fallback_enabled"
+          label="Maker-timeout fallback enabled" onApply={setKey} onReset={clearKey} />
+        <Slider cfg={cfg} ck="trading.maker_timeout_fallback_n" label="Consecutive timeouts before fallback"
+          min={1} max={10} step={1} onApply={setKey} onReset={clearKey} />
+        <Slider cfg={cfg} ck="trading.maker_timeout_fallback_window_s" label="Fallback window (seconds)"
+          min={30} max={600} step={10} unit="s" onApply={setKey} onReset={clearKey} />
+        <Slider cfg={cfg} ck="trading.maker_timeout_exhaustion_atr_mult" label="Exhaustion threshold (ATR mult)"
+          min={0.5} max={3.0} step={0.1} unit="x" dp={1} onApply={setKey} onReset={clearKey} />
+        <div className="label mt-4 text-slate-300/80">Breakeven Lock (mechanism — R is per band)</div>
+        <Toggle cfg={cfg} ck="risk.breakeven_lock_enabled"
+          label="Breakeven profit lock enabled" onApply={setKey} onReset={clearKey} />
+        <Slider cfg={cfg} ck="risk.breakeven_lock_buffer_pct" label="Breakeven buffer (% above/below entry)"
+          min={0} max={0.5} step={0.01} unit="%" dp={2} onApply={setKey} onReset={clearKey} />
+        <div className="label mt-4 text-slate-300/80">Circuit Breakers (global kill switches)</div>
         <Slider cfg={cfg} ck="risk.daily_drawdown_limit" label="Daily Drawdown Limit"
           min={1} max={20} step={1} pct unit="%" onApply={setKey} onReset={clearKey}
           note="below 5% not recommended for mainnet" />
@@ -467,7 +384,119 @@ export default function ControlsPage() {
         </div>
       </Section>
 
-      {/* ---- Section 9 — open positions (manual close) ---- */}
+      {/* ═══ SCALP BAND (5m) ═══ */}
+      <BandSection title="Scalp Band" subtitle="5m · tight & fast"
+        accent="cyan" cfg={cfg} enableKey="trading.scalp_band_enabled"
+        otherEnableKey="trading.trend_band_enabled" onApply={setKey}>
+        <Slider cfg={cfg} ck="risk.scalp_position_size_usd" label="Position Size (USD)"
+          min={10} max={500} step={5} prefix="$" onApply={setKey} onReset={clearKey} />
+        <Slider cfg={cfg} ck="risk.scalp_max_concurrent_positions" label="Max Concurrent Positions"
+          min={1} max={7} step={1} onApply={setKey} onReset={clearKey} />
+        <div className="label pt-1">Signal Gate</div>
+        <Slider cfg={cfg} ck="risk.scalp_min_confidence" label="Minimum Confidence"
+          min={0.30} max={0.80} step={0.01} dp={2} onApply={setKey} onReset={clearKey} />
+        <Slider cfg={cfg} ck="risk.scalp_min_model_agreement" label="Minimum Model Agreement"
+          min={1} max={6} step={1} onApply={setKey} onReset={clearKey} />
+        <div className="label pt-1">Directions</div>
+        <BandDirection band="scalp" cfg={cfg} onApply={setKey} />
+        <div className="label pt-1">Entry Filters (structural gates — scalp only)</div>
+        <Toggle cfg={cfg} ck="risk.scalp_structural_gates_enabled"
+          label="Structural gates master (LONG/SHORT)" onApply={setKey} onReset={clearKey} />
+        <div className="label text-emerald-300/80 pt-1">LONG structural</div>
+        <Toggle cfg={cfg} ck="trading.long_structural_gate_enabled"
+          label="LONG structural gate enabled" onApply={setKey} onReset={clearKey} />
+        <Slider cfg={cfg} ck="trading.long_spot_lead_threshold" label="Spot lead threshold"
+          min={0} max={1.0} step={0.01} pct unit="%" dp={2} onApply={setKey} onReset={clearKey} />
+        <Slider cfg={cfg} ck="trading.long_oi_rise_threshold" label="OI rise threshold"
+          min={0} max={5.0} step={0.1} pct unit="%" dp={2} onApply={setKey} onReset={clearKey} />
+        <Slider cfg={cfg} ck="trading.long_ob_bid_threshold" label="Book bid threshold"
+          min={0} max={0.9} step={0.05} dp={2} onApply={setKey} onReset={clearKey}
+          note="bid imbalance ≥ this (60/40 = 0.20)" />
+        <Toggle cfg={cfg} ck="trading.long_pump_cooldown_enabled"
+          label="Pump cooldown (block LONG after sharp pump)" onApply={setKey} onReset={clearKey} />
+        <Slider cfg={cfg} ck="trading.long_pump_threshold_1" label="5m pump threshold"
+          min={0.1} max={2.0} step={0.1} pct unit="%" dp={1} onApply={setKey} onReset={clearKey} />
+        <Slider cfg={cfg} ck="trading.long_pump_threshold_2" label="10m pump threshold"
+          min={0.1} max={3.0} step={0.1} pct unit="%" dp={1} onApply={setKey} onReset={clearKey} />
+        <Slider cfg={cfg} ck="trading.long_pump_threshold_3" label="15m pump threshold"
+          min={0.1} max={4.0} step={0.1} pct unit="%" dp={1} onApply={setKey} onReset={clearKey} />
+        <div className="label text-red-300/80 pt-1">SHORT structural</div>
+        <Toggle cfg={cfg} ck="trading.short_structural_gate_enabled"
+          label="SHORT structural gate enabled" onApply={setKey} onReset={clearKey} />
+        <Slider cfg={cfg} ck="trading.short_spot_lag_threshold" label="Spot lag threshold"
+          min={0} max={1.0} step={0.01} pct unit="%" dp={2} onApply={setKey} onReset={clearKey} />
+        <Slider cfg={cfg} ck="trading.short_oi_rise_threshold" label="OI rise threshold"
+          min={0} max={5.0} step={0.1} pct unit="%" dp={2} onApply={setKey} onReset={clearKey}
+          note="0 = testnet (OI barely moves)" />
+        <Slider cfg={cfg} ck="trading.short_ob_ask_threshold" label="Book ask threshold"
+          min={0} max={0.9} step={0.05} dp={2} onApply={setKey} onReset={clearKey} />
+        <Toggle cfg={cfg} ck="trading.short_dump_cooldown_enabled"
+          label="Dump cooldown (block SHORT after sharp drop)" onApply={setKey} onReset={clearKey} />
+        <Slider cfg={cfg} ck="trading.short_dump_threshold_1" label="5m dump threshold"
+          min={0.1} max={2.0} step={0.1} pct unit="%" dp={1} onApply={setKey} onReset={clearKey} />
+        <Slider cfg={cfg} ck="trading.short_dump_threshold_2" label="10m dump threshold"
+          min={0.1} max={3.0} step={0.1} pct unit="%" dp={1} onApply={setKey} onReset={clearKey} />
+        <Slider cfg={cfg} ck="trading.short_dump_threshold_3" label="15m dump threshold"
+          min={0.1} max={4.0} step={0.1} pct unit="%" dp={1} onApply={setKey} onReset={clearKey} />
+        <div className="label pt-1">Risk / Stop Loss</div>
+        <Slider cfg={cfg} ck="risk.scalp_atr_sl_multiplier" label="ATR Stop Loss Multiplier"
+          min={0.5} max={3.0} step={0.1} unit="x" dp={1} onApply={setKey} onReset={clearKey} />
+        <Slider cfg={cfg} ck="risk.scalp_take_profit_r" label="Take Profit (R)"
+          min={1.0} max={4.0} step={0.1} unit="R" dp={1} onApply={setKey} onReset={clearKey} />
+        <Slider cfg={cfg} ck="risk.scalp_trail_activation_r" label="Trailing Stop Activation (R)"
+          min={0.5} max={3.0} step={0.1} unit="R" dp={1} onApply={setKey} onReset={clearKey} />
+        <Slider cfg={cfg} ck="risk.scalp_max_hold_hours" label="Max Hold Time (hours)"
+          min={0.1} max={12} step={0.1} unit="h" dp={1} onApply={setKey} onReset={clearKey} />
+        <Slider cfg={cfg} ck="risk.scalp_breakeven_lock_r" label="Breakeven Lock (R)"
+          min={0} max={2.0} step={0.1} unit="R" dp={1} onApply={setKey} onReset={clearKey} />
+      </BandSection>
+
+      {/* ═══ TREND BAND (1h) ═══ */}
+      <BandSection title="Trend Band" subtitle="1h · wide & patient"
+        accent="purple" cfg={cfg} enableKey="trading.trend_band_enabled"
+        otherEnableKey="trading.scalp_band_enabled" onApply={setKey}>
+        <Slider cfg={cfg} ck="risk.trend_position_size_usd" label="Position Size (USD)"
+          min={10} max={1000} step={5} prefix="$" onApply={setKey} onReset={clearKey} />
+        <Slider cfg={cfg} ck="risk.trend_max_concurrent_positions" label="Max Concurrent Positions"
+          min={1} max={7} step={1} onApply={setKey} onReset={clearKey} />
+        <div className="label pt-1">Signal Gate</div>
+        <Slider cfg={cfg} ck="risk.trend_min_confidence" label="Minimum Confidence"
+          min={0.30} max={0.80} step={0.01} dp={2} onApply={setKey} onReset={clearKey} />
+        <Slider cfg={cfg} ck="risk.trend_min_model_agreement" label="Minimum Model Agreement"
+          min={1} max={6} step={1} onApply={setKey} onReset={clearKey} />
+        <div className="label pt-1">Directions</div>
+        <BandDirection band="trend" cfg={cfg} onApply={setKey} />
+        <div className="text-xs text-slate-500">
+          No structural gates — the trend band&apos;s own 1h signal is its gate.
+        </div>
+        <div className="label pt-1">Risk / Stop Loss</div>
+        <Slider cfg={cfg} ck="risk.trend_atr_sl_multiplier" label="ATR Stop Loss Multiplier"
+          min={0.5} max={5.0} step={0.1} unit="x" dp={1} onApply={setKey} onReset={clearKey} />
+        <Slider cfg={cfg} ck="risk.trend_take_profit_r" label="Take Profit (R)"
+          min={1.0} max={8.0} step={0.1} unit="R" dp={1} onApply={setKey} onReset={clearKey} />
+        <Slider cfg={cfg} ck="risk.trend_trail_activation_r" label="Trailing Stop Activation (R)"
+          min={0.5} max={5.0} step={0.1} unit="R" dp={1} onApply={setKey} onReset={clearKey} />
+        <Slider cfg={cfg} ck="risk.trend_max_hold_hours" label="Max Hold Time (hours)"
+          min={1} max={168} step={1} unit="h" dp={0} onApply={setKey} onReset={clearKey} />
+        <Slider cfg={cfg} ck="risk.trend_breakeven_lock_r" label="Breakeven Lock (R)"
+          min={0} max={3.0} step={0.1} unit="R" dp={1} onApply={setKey} onReset={clearKey} />
+      </BandSection>
+
+      {/* ═══ REGIME BIAS (connects the bands) ═══ */}
+      <Section title="Regime Bias">
+        <Slider cfg={cfg} ck="risk.regime_counter_trend_penalty"
+          label="Counter-trend confidence penalty"
+          min={0.3} max={1.0} step={0.05} unit="x" dp={2} onApply={setKey} onReset={clearKey}
+          note="1h regime dampens scalps fading the trend (1.0 = no penalty)" />
+        <div className="text-xs text-slate-500">
+          The 1h trend regime DAMPENS (never blocks) scalps that fade it — a scalp
+          short within a 1h uptrend (or long within a downtrend) needs higher
+          conviction to fire. Opposing positions can&apos;t coexist on one coin
+          (one-way exchange nets per coin), so a coin is owned by one band at a time.
+        </div>
+      </Section>
+
+      {/* ═══ OPEN POSITIONS ═══ */}
       <Section title="Open Positions">
         {(pos?.positions ?? []).length === 0 ? (
           <div className="text-sm text-slate-500">no open positions</div>
@@ -475,7 +504,14 @@ export default function ControlsPage() {
           <div className="grid gap-2">
             {(pos?.positions ?? []).map((p: any) => (
               <div key={p.coin} className="flex items-center justify-between gap-3 border border-edge rounded-lg px-3 py-2">
-                <span className="mono text-sm">
+                <span className="mono text-sm flex items-center gap-2">
+                  {p.band && (
+                    <span className={clsx("px-1.5 py-0.5 rounded text-[10px] font-bold uppercase border",
+                      p.band === "scalp" ? "border-cyan-500/50 text-cyan-300 bg-cyan-500/10"
+                        : "border-purple-500/50 text-purple-300 bg-purple-500/10")}>
+                      {p.band}
+                    </span>
+                  )}
                   {p.coin} {p.szi > 0 ? "LONG" : "SHORT"} · entry {p.entry_px} ·{" "}
                   <span className={p.unrealized_pnl >= 0 ? "text-emerald-300" : "text-red-300"}>
                     {fmtUsd(p.unrealized_pnl)}
@@ -504,12 +540,75 @@ function Section({ title, children }: { title: string; children: React.ReactNode
   );
 }
 
-function Preset({ label, onClick }: { label: string; onClick: () => void }) {
+// Band container: colored left-border accent (cyan=scalp, purple=trend),
+// collapsible body, and an enable/disable toggle in the header. Keeps the
+// existing card/theme — only adds the band accent + collapse affordance.
+const BAND_ACCENT: Record<string, { border: string; text: string; dot: string }> = {
+  cyan: { border: "border-l-cyan-500/70", text: "text-cyan-300", dot: "bg-cyan-400" },
+  purple: { border: "border-l-purple-500/70", text: "text-purple-300", dot: "bg-purple-400" },
+};
+
+function BandSection({
+  title, subtitle, accent, cfg, enableKey, otherEnableKey, onApply, children,
+}: {
+  title: string; subtitle: string; accent: "cyan" | "purple"; cfg: Cfg;
+  enableKey: string; otherEnableKey: string;
+  onApply: (k: string, v: any) => void; children: React.ReactNode;
+}) {
+  const a = BAND_ACCENT[accent];
+  const enabled = Boolean(cfg.effective[enableKey] ?? cfg.defaults[enableKey] ?? true);
+  const otherEnabled = Boolean(
+    cfg.effective[otherEnableKey] ?? cfg.defaults[otherEnableKey] ?? true);
+  const wouldDisableBoth = enabled && !otherEnabled;
+  const [open, setOpen] = useState(true);
   return (
-    <button onClick={onClick}
-      className="px-3 py-1 rounded-lg text-xs border border-edge text-slate-300 hover:bg-edge">
-      {label}
+    <div className={clsx("card grid gap-3 border-l-4", a.border, !enabled && "opacity-60")}>
+      <div className="flex items-center justify-between gap-3">
+        <button onClick={() => setOpen((o) => !o)}
+          className="flex items-center gap-2 text-left">
+          <span className={clsx("text-xs", a.text)}>{open ? "▾" : "▸"}</span>
+          <span className={clsx("h-2 w-2 rounded-full", enabled ? a.dot : "bg-slate-600")} />
+          <span className={clsx("label", a.text)}>{title}</span>
+          <span className="text-xs text-slate-500">{subtitle}</span>
+        </button>
+        <button
+          onClick={() => { if (!wouldDisableBoth) onApply(enableKey, !enabled); }}
+          disabled={wouldDisableBoth}
+          title={wouldDisableBoth ? "at least one band must stay enabled" : ""}
+          className={clsx("px-3 py-1 rounded-lg text-xs font-semibold border whitespace-nowrap",
+            wouldDisableBoth ? "border-edge text-slate-600 cursor-not-allowed"
+              : enabled ? "border-emerald-500/40 text-emerald-300 bg-emerald-500/10 hover:bg-emerald-500/20"
+                : "border-red-500/40 text-red-300 bg-red-500/10 hover:bg-red-500/20")}>
+          {enabled ? "ENABLED" : "DISABLED"}
+        </button>
+      </div>
+      {open && <div className="grid gap-3">{children}</div>}
+    </div>
+  );
+}
+
+// Per-band LONG/SHORT toggles. Effective direction = global master AND this.
+function BandDirection({
+  band, cfg, onApply,
+}: { band: "scalp" | "trend"; cfg: Cfg; onApply: (k: string, v: any) => void }) {
+  const lk = `trading.${band}_longs_enabled`;
+  const sk = `trading.${band}_shorts_enabled`;
+  const longs = Boolean(cfg.effective[lk] ?? cfg.defaults[lk] ?? true);
+  const shorts = Boolean(cfg.effective[sk] ?? cfg.defaults[sk] ?? true);
+  const Btn = ({ on, label, k }: { on: boolean; label: string; k: string }) => (
+    <button onClick={() => onApply(k, !on)}
+      className={clsx("px-3 py-1 rounded-lg text-xs font-semibold border",
+        on ? "border-emerald-500/40 text-emerald-300 bg-emerald-500/10"
+          : "border-red-500/40 text-red-300 bg-red-500/10")}>
+      {label} {on ? "ON" : "OFF"}
     </button>
+  );
+  return (
+    <div className="flex items-center gap-2 flex-wrap">
+      <Btn on={longs} label="LONG" k={lk} />
+      <Btn on={shorts} label="SHORT" k={sk} />
+      <span className="text-xs text-slate-500">effective = global master AND band</span>
+    </div>
   );
 }
 

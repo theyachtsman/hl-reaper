@@ -1,0 +1,17 @@
+[Unit]
+Description=HL Reaper dashboard API bridge (FastAPI, 127.0.0.1:8801)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=veilcerpin
+WorkingDirectory=/opt/hl-reaper
+ExecStart=/opt/hl-reaper/venv/bin/python /opt/hl-reaper/dashboard/api.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

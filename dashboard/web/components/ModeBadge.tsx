@@ -18,8 +18,8 @@ export default function ModeBadge({ mode, large }: { mode?: string; large?: bool
       )}
       title={
         aggressive
-          ? "PAPER AGGRESSIVE: gates lowered (conf 0.35, quorum 3, 5 positions) — testnet data collection, NOT mainnet-safe"
-          : "Conservative gates (conf 0.62, quorum 5, 3 positions) — mainnet-safe defaults"
+          ? "PAPER AGGRESSIVE: gates lowered (conf 0.35, quorum 3-of-5, 5 positions) — testnet data collection, NOT mainnet-safe"
+          : "Conservative gates (conf 0.62, quorum 4-of-5, 3 positions) — mainnet-safe defaults"
       }
     >
       {aggressive ? "⚠ PAPER AGGRESSIVE" : "CONSERVATIVE"}

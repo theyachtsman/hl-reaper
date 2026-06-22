@@ -12,7 +12,7 @@
  */
 import { useEffect, useRef, useState } from "react";
 import clsx from "clsx";
-import { usePoll } from "@/lib/api";
+import { usePoll, useActiveCoins } from "@/lib/api";
 
 type CoinPulse = {
   mid: number; spread_bps: number; imbalance: number;
@@ -33,7 +33,9 @@ type TicketsResp = {
   gates?: GatesT;
 };
 
-/* the 7 votable models, in constellation order (REGIME routes weights only) */
+/* constellation slots (REGIME routes weights only, not shown). Two slots are
+ * permanently INACTIVE — kept visible so the picture is honest and so a future
+ * different-target model has a home, but clearly marked as non-voting. */
 const MODELS: [string, string][] = [
   ["TAModel", "TA"],
   ["MLForecastModel", "ML"],
@@ -43,6 +45,14 @@ const MODELS: [string, string][] = [
   ["VWAPModel", "VWAP"],
   ["LiquidationHeatmapModel", "LIQ"],
 ];
+/* permanently FLAT / zero-weight — see docs/ml_retrain_report.md (ML) and the
+ * microstructure backtest (LiqHeatmap). Not counted in the quorum denominator. */
+const INACTIVE = new Set(["MLForecastModel", "LiquidationHeatmapModel"]);
+const INACTIVE_NOTE: Record<string, string> = {
+  MLForecastModel: "ML Forecast — no model (direction classification not viable)",
+  LiquidationHeatmapModel: "Liquidation Heatmap — inactive (100% FLAT on live data)",
+};
+const ACTIVE_DIRECTIONAL = MODELS.filter(([m]) => !INACTIVE.has(m)).length; // 5
 
 const dirHex = (d?: string) =>
   d === "LONG" ? "#34d399" : d === "SHORT" ? "#f87171" : "#475569";
@@ -149,25 +159,34 @@ function Constellation({ tickets, verdict }: { tickets: TicketT[]; verdict?: Ver
         const x = cx + Math.cos(a) * R, y = cy + Math.sin(a) * R;
         const lx = cx + Math.cos(a) * (R + 12), ly = cy + Math.sin(a) * (R + 12);
         const t = by[name];
-        const active = t?.direction === "LONG" || t?.direction === "SHORT";
-        const c = active ? dirHex(t.direction) : "#334155";
+        const dead = INACTIVE.has(name);
+        const active = !dead && (t?.direction === "LONG" || t?.direction === "SHORT");
+        const c = dead ? "#283244" : active ? dirHex(t.direction) : "#334155";
         const conf = t ? Number(t.confidence) : 0;
         const why = t?.meta?.reason ?? t?.meta?.zone ?? t?.meta?.band ?? "";
         return (
-          <g key={name}>
+          <g key={name} opacity={dead ? 0.5 : 1}>
             <line x1={x} y1={y} x2={cx} y2={cy} stroke={c}
               strokeWidth={active ? 1.2 : 0.6}
-              strokeDasharray={active ? "3 5" : undefined}
+              strokeDasharray={dead ? "1 4" : active ? "3 5" : undefined}
               className={active ? "beam" : undefined}
-              opacity={active ? 0.35 + conf * 0.55 : 0.35} />
-            <circle cx={x} cy={y} r={active ? 4 : 2.8} fill={c}>
-              <title>{t
-                ? `${name}: ${t.direction} conf ${conf.toFixed(2)}${why ? ` (${String(why).replace(/_/g, " ")})` : ""}`
+              opacity={dead ? 0.25 : active ? 0.35 + conf * 0.55 : 0.35} />
+            {/* inactive slots: hollow ring + ✕, never a filled vote node */}
+            <circle cx={x} cy={y} r={dead ? 3 : active ? 4 : 2.8}
+              fill={dead ? "none" : c} stroke={dead ? c : "none"}
+              strokeWidth={dead ? 1 : 0}>
+              <title>{dead ? INACTIVE_NOTE[name]
+                : t ? `${name}: ${t.direction} conf ${conf.toFixed(2)}${why ? ` (${String(why).replace(/_/g, " ")})` : ""}`
                 : `${name}: no ticket`}</title>
             </circle>
+            {dead && (
+              <text x={x} y={y + 2.4} textAnchor="middle" fontSize="5.5"
+                fill={c}>✕</text>
+            )}
             <text x={lx} y={ly + 2.5} textAnchor="middle" fontSize="7"
-              fill={active ? "#94a3b8" : "#475569"}
-              style={{ fontFamily: "ui-monospace, monospace" }}>{abbr}</text>
+              fill={dead ? "#3a4660" : active ? "#94a3b8" : "#475569"}
+              style={{ fontFamily: "ui-monospace, monospace",
+                       textDecoration: dead ? "line-through" : "none" }}>{abbr}</text>
           </g>
         );
       })}
@@ -309,13 +328,14 @@ export default function AnalysisCore() {
   const { data } = usePoll<{ coins: Record<string, CoinPulse>;
     hist: Record<string, number[]>; n: number }>("/api/pulse", 2500);
   const { data: live } = usePoll<TicketsResp>("/api/tickets", 4000);
+  const activeCoins = useActiveCoins();
   const prev = useRef<Record<string, number>>({});
   const [feed, setFeed] = useState<{ id: number; t: string; line: string; dir: number }[]>([]);
   const feedId = useRef(0);
 
   useEffect(() => {
     if (!data?.coins) return;
-    const t = new Date().toLocaleTimeString("en-US", { hour12: false });
+    const t = new Date().toLocaleTimeString("en-US", { hour12: true });
     const fresh: typeof feed = [];
     for (const [coin, p] of Object.entries(data.coins)) {
       const last = prev.current[coin];
@@ -331,7 +351,10 @@ export default function AnalysisCore() {
     setFeed((f) => [...fresh, ...f].slice(0, 9));
   }, [data]);
 
-  const coins = Object.entries(data?.coins ?? {});
+  // only surface coins that are active in live config (Controls toggles);
+  // while config is still loading (null) show whatever the pulse provides
+  const coins = Object.entries(data?.coins ?? {}).filter(
+    ([c]) => activeCoins === null || activeCoins.includes(c));
   const gates = live?.gates;
   const gQ = gates?.min_model_agreement ?? 5;
   const gC = gates?.min_confidence ?? 0.62;
@@ -348,7 +371,7 @@ export default function AnalysisCore() {
           <span className="relative rounded-full h-1.5 w-1.5 bg-glow" />
         </span>
         <span className="text-[10px] text-slate-500">
-          live L2 books + 8-model ensemble · 2.5s cadence
+          live L2 books + {ACTIVE_DIRECTIONAL}-model ensemble · 2.5s cadence
         </span>
         <div className="md:ml-auto flex flex-wrap items-center gap-2">
           <span className="flex items-center gap-1.5 border border-edge rounded-full px-2.5 py-1 text-[10px] mono text-slate-300">
@@ -360,7 +383,7 @@ export default function AnalysisCore() {
           </span>
           <span className="border border-glow/30 rounded-full px-2.5 py-1 text-[10px] mono text-glow/90"
             title="A trade only fires when at least this many models vote the same direction AND the regime-weighted confidence clears the gate — then risk guards still get the final say.">
-            entry gate · ≥{gQ}/7 models · conf ≥{gC}
+            entry gate · ≥{gQ}/{ACTIVE_DIRECTIONAL} models · conf ≥{gC}
           </span>
         </div>
       </div>

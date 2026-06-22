@@ -33,10 +33,15 @@ SYMBOL = lambda coin: f"{coin}USDT"  # noqa: E731
 
 class SpotPoller:
     def __init__(self, coins: list[str], out_dir: Path, buf=None,
-                 poll_s: float = POLL_S):
+                 poll_s: float = POLL_S, record: bool = True):
         self.coins = coins
         self.out_dir = out_dir
-        out_dir.mkdir(parents=True, exist_ok=True)
+        self.record = record
+        # only the recorder owns the gzip files; an in-process poller that just
+        # feeds a live MarketBuffer (record=False) must not touch disk, or it
+        # would corrupt the standalone recorder's daily files.
+        if record:
+            out_dir.mkdir(parents=True, exist_ok=True)
         self.buf = buf
         self.poll_s = poll_s
         self._sym_to_coin = {SYMBOL(c): c for c in coins}
@@ -105,7 +110,7 @@ class SpotPoller:
         data = r.json()
         ts = int(time.time() * 1000)
         self.polls += 1
-        record = self._disk_ok()
+        record = self.record and self._disk_ok()
         for row in data:
             coin = self._sym_to_coin.get(row["symbol"])
             if not coin:

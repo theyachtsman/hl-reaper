@@ -82,7 +82,7 @@ class MLForecastModel(BaseModel):
                  path, entry["interval"], entry["horizon"])
         return entry
 
-    def compute(self, coin: str, buf) -> Ticket:
+    def compute(self, coin: str, buf, interval: str | None = None) -> Ticket:
         try:
             entry = self._load(coin)
             if entry is None:

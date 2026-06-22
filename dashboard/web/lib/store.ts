@@ -6,6 +6,7 @@ export type Status = {
   risk_state: string;
   risk_reason: string | null;
   trading_mode?: string;
+  directions?: { longs: boolean; shorts: boolean };
   bot_status: string | null;
   phase: string | null;
   control_request: string | null;

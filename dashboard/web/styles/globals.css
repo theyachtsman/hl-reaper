@@ -17,8 +17,15 @@ body {
 
 .card {
   /* min-w-0: grid/flex children default to min-width:auto, so a card holding
-     a wide table refuses to shrink and punches past the viewport on phones */
-  @apply bg-panel border border-edge rounded-xl p-4 min-w-0;
+     a wide table refuses to shrink and punches past the viewport on phones.
+     Shares the analysis-core look (near-black panel + faint green glow edge) so
+     the whole site reads as one design system — a lighter touch than .core-card
+     so dense tables stay legible. */
+  @apply rounded-xl p-4 min-w-0;
+  background: #0a0e14;
+  border: 1px solid rgba(29, 158, 117, 0.18);
+  box-shadow: 0 0 20px -12px rgba(29, 158, 117, 0.35),
+              inset 0 0 55px -40px rgba(29, 158, 117, 0.6);
 }
 
 @keyframes feedIn {
@@ -36,6 +43,13 @@ body {
 .feed-in { animation: feedIn 0.45s ease-out; }
 .flash-up { animation: flashUp 1.2s ease-out; }
 .flash-down { animation: flashDown 1.2s ease-out; }
+
+/* rotating status line in the analysis-core verdict pill (standing down) */
+@keyframes statusIn {
+  from { opacity: 0; transform: translateY(3px); filter: blur(1px); }
+  to   { opacity: 1; transform: translateY(0); filter: blur(0); }
+}
+.status-in { animation: statusIn 0.4s ease-out; }
 
 /* --- analysis core: decision panels ------------------------------------ */
 
@@ -89,11 +103,105 @@ body {
 }
 .armed { animation: armed 1.4s ease-in-out infinite; }
 
+/* gate disabled: animated diagonal hazard stripes over a structural-gate panel
+   when that gate is switched off in Controls (drifting + a faint breathing) */
+@keyframes gateStripes { from { background-position: 0 0; } to { background-position: 28px 0; } }
+@keyframes gateBreathe { 0%, 100% { opacity: 0.86; } 50% { opacity: 0.66; } }
+.gate-off {
+  background-image: repeating-linear-gradient(45deg,
+    rgba(12, 16, 22, 0.92) 0, rgba(12, 16, 22, 0.92) 7px,
+    rgba(30, 38, 48, 0.92) 7px, rgba(30, 38, 48, 0.92) 14px);
+  background-size: 28px 28px;
+  animation: gateStripes 1.6s linear infinite, gateBreathe 2.4s ease-in-out infinite;
+}
+
+/* RelayCore: "position armed" flash — fades + scales in over the circuit */
+.relay-flash {
+  opacity: 0; transform: scale(0.85);
+  text-shadow: 0 0 22px currentColor;
+  transition: opacity .35s ease, transform .35s ease;
+}
+.relay-flash-show { opacity: 1; transform: scale(1); }
+
 .core-ring {
   background: conic-gradient(from 0deg, transparent 0%, #22d3ee22 55%,
               #22d3ee 78%, #a5f3fc 82%, transparent 86%);
   animation: corespin 2.8s linear infinite;
 }
+
+/* --- profit deck: analysis-core look + animated polish ----------------- */
+
+/* shared "analysis core" card: near-black panel + glowing green edge, the
+   same treatment CoinCard3D uses so the deck reads as one design system */
+.core-card {
+  background: #070a0e;
+  border: 1px solid rgba(29, 158, 117, 0.28);
+  border-radius: 0.75rem;
+  box-shadow: 0 0 22px -10px rgba(29, 158, 117, 0.45),
+              inset 0 0 50px -34px rgba(29, 158, 117, 0.9);
+}
+
+/* slow pulsing indicator dot (1 → 0.4 → 1), matches the analysis-core dots */
+@keyframes deckPulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+.pulse-icon { animation: deckPulse 2s ease-in-out infinite; }
+
+/* top-edge gradient accent on the primary deck card */
+.deck-accent::before {
+  content: ""; position: absolute; top: 0; left: 0; right: 0; height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(29,158,117,0.55), transparent);
+  pointer-events: none; z-index: 2;
+}
+
+/* PnL flash-burst: a quick tinted halo when the odometer value changes.
+   keyed remount replays it on every fresh tick; colour tracks delta sign */
+.flash-burst {
+  position: absolute; inset: -12px; border-radius: 12px;
+  pointer-events: none; opacity: 0; z-index: 0;
+}
+.flash-burst.up   { animation: flashUpBurst   0.6s ease-out; }
+.flash-burst.down { animation: flashDownBurst 0.6s ease-out; }
+@keyframes flashUpBurst {
+  0%   { opacity: 0.5; background: rgba(29,158,117,0.20); transform: scale(0.96); }
+  100% { opacity: 0;   background: rgba(29,158,117,0);    transform: scale(1.08); }
+}
+@keyframes flashDownBurst {
+  0%   { opacity: 0.5; background: rgba(226,75,74,0.20); transform: scale(0.96); }
+  100% { opacity: 0;   background: rgba(226,75,74,0);    transform: scale(1.08); }
+}
+
+/* trade-stack bars cascade up from the baseline (per-bar delay set inline) */
+@keyframes barIn { from { transform: scaleY(0); } to { transform: scaleY(1); } }
+.stack-bar {
+  transform-box: fill-box;
+  animation: barIn 0.5s cubic-bezier(.34,1.56,.64,1) backwards;
+}
+
+/* flow-event card: faint atmospheric particles drifting upward */
+@keyframes floatUp {
+  0%   { opacity: 0; transform: translateY(0); }
+  10%  { opacity: 0.5; }
+  90%  { opacity: 0.3; }
+  100% { opacity: 0; transform: translateY(-60px); }
+}
+.flow-particle {
+  position: absolute; width: 2px; height: 2px; border-radius: 50%;
+  background: #1D9E75; opacity: 0; pointer-events: none;
+  animation: floatUp 6s linear infinite;
+}
+
+/* flow-event card: sequential scanning dots */
+@keyframes scanBlink { 0%, 100% { opacity: 0.2; } 50% { opacity: 1; } }
+.scan-dot { animation: scanBlink 1.2s infinite; }
+.scan-dot:nth-child(2) { animation-delay: 0.2s; }
+.scan-dot:nth-child(3) { animation-delay: 0.4s; }
+
+/* win-streak ring fill + number pop */
+.streak-fill {
+  transition: stroke-dashoffset 1s cubic-bezier(.34,1.56,.64,1);
+  filter: drop-shadow(0 0 4px rgba(29,158,117,0.7));
+}
+@keyframes streakPop { 0% { transform: scale(1.4); } 100% { transform: scale(1); } }
+.streak-pop { animation: streakPop 0.5s cubic-bezier(.34,1.56,.64,1); }
 
 .label {
   @apply text-xs uppercase tracking-wider text-slate-400;

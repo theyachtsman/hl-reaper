@@ -19,7 +19,7 @@ class LiquidationHeatmapModel(BaseModel):
         # rolling OI per coin to judge whether OI is elevated
         self._oi_hist: dict[str, deque] = {}
 
-    def compute(self, coin: str, buf) -> Ticket:
+    def compute(self, coin: str, buf, interval: str | None = None) -> Ticket:
         try:
             ctx = buf.ctx.get(coin) or {}
             funding = ctx.get("funding")

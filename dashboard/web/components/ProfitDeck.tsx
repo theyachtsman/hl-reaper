@@ -9,10 +9,15 @@
  * flags genuine order-flow events (price bursts, resting book walls). No
  * fake animation, no invented whales.
  */
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import clsx from "clsx";
 import { usePoll } from "@/lib/api";
 import { useStatusStore } from "@/lib/store";
+import ThreeCanvas, { ColorMode, Intensity } from "@/components/ThreeCanvas";
+import SignalConsole from "@/components/SignalConsole";
+
+/* analysis-core accent palette (shared with CoinCard3D / ThreeCanvas) */
+const PROFIT = "#1D9E75", LOSS = "#E24B4A", NEUTRAL = "#888880";
 
 /* ---------- 5x7 dot-matrix glyphs --------------------------------------- */
 const FONT: Record<string, string[]> = {
@@ -68,7 +73,7 @@ function RollDigit({ ch, lit }: { ch: string; lit: string }) {
 
 function Odometer({ value, className }: { value: number | null; className?: string }) {
   const lit = value == null || Math.abs(value) < 0.005 ? "#64748b"
-    : value > 0 ? "#34d399" : "#f87171";
+    : value > 0 ? "#22c98e" : "#f0625f";
   const s = value == null ? "$-.--"
     : `${value > 0 ? "+" : value < 0 ? "-" : ""}$${Math.abs(value)
         .toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
@@ -84,18 +89,27 @@ function Odometer({ value, className }: { value: number | null; className?: stri
   );
 }
 
-/* ---------- ticking UTC clock (isolated so it re-renders alone) --------- */
+/* ---------- ticking clock (isolated so it re-renders alone) -------------
+   Local browser time, matching the History page's fmtTs() so every timestamp
+   across the site reads in the same zone (was UTC, which didn't match). */
+const TZ = (() => {
+  try {
+    return new Intl.DateTimeFormat("en-US", { timeZoneName: "short" })
+      .formatToParts(new Date())
+      .find((p) => p.type === "timeZoneName")?.value ?? "LOCAL";
+  } catch { return "LOCAL"; }
+})();
 function Clock() {
   const [now, setNow] = useState("");
   useEffect(() => {
-    const f = () => setNow(new Date().toISOString().slice(11, 19));
+    const f = () => setNow(new Date().toLocaleTimeString("en-US", { hour12: true }));
     f();
     const id = setInterval(f, 1000);
     return () => clearInterval(id);
   }, []);
   return (
     <span className="mono text-sm text-slate-300 tabular-nums">
-      {now} <span className="text-[9px] text-slate-500">UTC</span>
+      {now} <span className="text-[9px] text-slate-500">{TZ}</span>
     </span>
   );
 }
@@ -115,6 +129,9 @@ function TradeStack({ closes }: { closes: number[] }) {
         return (
           <rect key={i} x={i * 3 + 0.4} width="2.2" rx="0.6"
             y={p >= 0 ? 10 - h : 10} height={h}
+            className="stack-bar"
+            style={{ animationDelay: `${i * 0.04}s`,
+                     transformOrigin: p >= 0 ? "bottom" : "top" }}
             fill={p >= 0 ? "#34d399" : "#f87171"} opacity="0.85">
             <title>{`${p >= 0 ? "+" : ""}$${p.toFixed(4)}`}</title>
           </rect>
@@ -160,7 +177,8 @@ function PositionsPanel({ positions, mids }: {
   positions: any[]; mids: Record<string, CoinPulse> | undefined;
 }) {
   if (!positions.length)
-    return <div className="h-24 flex items-center justify-center text-[10px] text-slate-600">
+    return <div className="h-24 flex items-center justify-center gap-1.5 text-[10px] text-slate-600">
+      <span className="pulse-icon inline-block w-1.5 h-1.5 rounded-full bg-emerald-500/80" />
       no open positions — gates armed, waiting for a signal…</div>;
   return (
     <div className="overflow-x-auto">
@@ -179,7 +197,7 @@ function PositionsPanel({ positions, mids }: {
             const value = mid ? Math.abs(p.szi) * mid : p.position_value;
             const long = p.szi > 0;
             return (
-              <tr key={p.coin} className="border-t border-edge/60">
+              <tr key={p.coin} className="border-t border-edge/60 feed-in">
                 <td className="py-1.5 pr-2 font-bold text-slate-200">{p.coin}</td>
                 <td className={long ? "text-emerald-400" : "text-red-400"}>
                   {long ? "LONG" : "SHORT"}
@@ -209,16 +227,39 @@ function PositionsPanel({ positions, mids }: {
 type FlowEvent = { text: string; ts: number };
 function Led({ ev }: { ev: FlowEvent | null }) {
   const liveish = ev && Date.now() - ev.ts < 30_000;
+  /* atmospheric particles: random positions/timings, fixed once on mount */
+  const particles = useMemo(
+    () => Array.from({ length: 8 }).map(() => ({
+      left: `${10 + Math.random() * 80}%`,
+      delay: `${Math.random() * 6}s`,
+      duration: `${5 + Math.random() * 3}s`,
+    })), []);
   return (
-    <div className="bg-black/70 border border-sky-400/20 rounded-lg px-3 py-2 min-w-[210px]">
-      <div className="text-[8px] uppercase tracking-[0.2em] text-sky-500/70 mb-0.5">
-        flow event
+    <div className="core-card relative overflow-hidden px-4 py-3 flex flex-col justify-center">
+      {particles.map((p, i) => (
+        <span key={i} className="flow-particle"
+          style={{ left: p.left, bottom: 0,
+                   animationDelay: p.delay, animationDuration: p.duration }} />
+      ))}
+      <div className="relative flex items-center gap-2 mb-1.5">
+        <span className="pulse-icon inline-block w-[5px] h-[5px] rounded-full"
+          style={{ background: PROFIT, boxShadow: `0 0 6px ${PROFIT}` }} />
+        <span className="label">Flow Event</span>
       </div>
       <div key={ev?.ts ?? 0}
-        className={clsx("mono text-xs tracking-widest uppercase led-in",
-          liveish ? "text-sky-300" : "text-slate-600")}
-        style={liveish ? { textShadow: "0 0 8px #38bdf8aa" } : undefined}>
-        {liveish ? ev!.text : "scanning order flow…"}
+        className={clsx("relative mono text-xs tracking-widest uppercase led-in",
+          liveish ? "" : "text-slate-500")}
+        style={liveish ? { color: PROFIT, textShadow: `0 0 8px ${PROFIT}aa` } : undefined}>
+        {liveish ? ev!.text : (
+          <span className="inline-flex items-center gap-1.5">
+            <span className="inline-flex gap-0.5" style={{ color: PROFIT }}>
+              <span className="scan-dot">·</span>
+              <span className="scan-dot">·</span>
+              <span className="scan-dot">·</span>
+            </span>
+            scanning order flow…
+          </span>
+        )}
       </div>
     </div>
   );
@@ -243,6 +284,11 @@ export default function ProfitDeck() {
 
   const [ev, setEv] = useState<FlowEvent | null>(null);
   const prevMids = useRef<Record<string, number>>({});
+
+  /* flash-burst on day-PnL change: keyed remount replays the halo even on
+     consecutive ticks; direction colours it green (up) / red (down) */
+  const [burst, setBurst] = useState<{ key: number; dir: "up" | "down" } | null>(null);
+  const prevPnl = useRef<number | null>(null);
 
   /* RPG damage numbers: one popup per freshly-closed fill */
   type Dmg = { id: number; text: string; win: boolean; x: number;
@@ -295,23 +341,52 @@ export default function ProfitDeck() {
     if (best) setEv({ text: best.text, ts: Date.now() });
   }, [pulse]);
 
+  /* day-open baseline anchored to the VIEWER'S LOCAL midnight (e.g. EST),
+     NOT the bot's UTC day_open_equity (that stays UTC — it drives the drawdown
+     guards and must not move). Baseline = account equity at the most recent
+     snapshot at/before local midnight; fall back to the earliest snapshot in
+     the 24h window (dashboard opened mid-day), then to the bot's UTC baseline
+     if no equity history is available yet. Recomputed when equity polls (30s),
+     so it rolls over within 30s of local midnight. */
+  const dayOpenLocal = useMemo(() => {
+    const eq = equity ?? [];
+    if (!eq.length) return null;
+    const lm = new Date(); lm.setHours(0, 0, 0, 0);
+    const localMidnight = lm.getTime();
+    let base: number | null = null;
+    for (const e of eq) {                       // ascending by ts
+      if (e.ts <= localMidnight) base = e.account_value;
+      else break;
+    }
+    return base ?? eq[0].account_value;         // window starts after midnight
+  }, [equity]);
+
   /* day PnL, re-marked live: swap the 5s-poll uPnL for one computed from
      the freshest 2.5s mids so the odometer moves with the market */
   let dayPnl: number | null = null;
-  if (pos && status?.day_open_equity) {
+  const dayOpen = dayOpenLocal ?? status?.day_open_equity ?? null;
+  if (pos && dayOpen) {
     const polled = pos.positions.reduce((s, p) => s + p.unrealized_pnl, 0);
     const live = pos.positions.reduce((s, p) => {
       const mid = pulse?.coins?.[p.coin]?.mid;
       return s + (mid ? p.szi * (mid - p.entry_px) : p.unrealized_pnl);
     }, 0);
-    dayPnl = pos.account_value - polled + live - status.day_open_equity;
+    dayPnl = pos.account_value - polled + live - dayOpen;
   }
+
+  /* fire a flash-burst whenever the marked day-PnL moves */
+  useEffect(() => {
+    if (dayPnl == null) return;
+    const prev = prevPnl.current;
+    if (prev != null && Math.abs(dayPnl - prev) >= 0.005) {
+      setBurst({ key: Date.now(), dir: dayPnl > prev ? "up" : "down" });
+    }
+    prevPnl.current = dayPnl;
+  }, [dayPnl]);
 
   /* fills-derived stats */
   const recent = fills?.recent ?? [];           // newest first
   const closes = recent.filter((f) => f.closed_pnl !== 0);
-  let streak = 0;
-  for (const f of closes) { if (f.closed_pnl > 0) streak++; else break; }
   const agg = Object.values(fills?.per_coin ?? {});
   const nCloses = agg.reduce((s: number, c: any) => s + c.closes, 0);
   const nWins = agg.reduce((s: number, c: any) => s + c.wins, 0);
@@ -327,39 +402,70 @@ export default function ProfitDeck() {
   const month = new Date().toLocaleString("en-US", { month: "long" }).toUpperCase();
   const openPositions = pos?.positions ?? [];
 
+  /* analysis-core 3D backdrop: a live ribbon of the account's equity path,
+     colour-keyed to the day's direction (green up / red down) so the deck
+     glows the same way CoinCard3D does. memoised on equity so the WebGL
+     geometry only rebuilds when a fresh snapshot lands, not every render. */
+  const deckColor: ColorMode = dayPnl == null || Math.abs(dayPnl) < 0.005 ? "neutral"
+    : dayPnl > 0 ? "long" : "short";
+  const deckIntensity: Intensity = openPositions.length ? "position" : "armed";
+  const deckAccent = deckColor === "long" ? PROFIT : deckColor === "short" ? LOSS : NEUTRAL;
+  const deckGlow = deckColor !== "neutral";
+
   return (
-    <div className="card relative overflow-hidden">
-      <div className="absolute -top-24 -left-24 w-72 h-72 rounded-full bg-glow/5 blur-3xl pointer-events-none" />
-
-      {/* damage numbers: realized pnl floats up and fades like game text */}
-      {dmgs.map((d) => (
-        <span key={d.id}
-          className={clsx(
-            "dmg-float absolute z-20 mono font-bold pointer-events-none select-none",
-            d.win ? "text-emerald-300" : "text-red-400")}
+    <div className="grid gap-4">
+      {/* ── row 1: profit deck (wide) | flow event + win streak stacked ── */}
+      <div className="grid lg:grid-cols-[1.7fr_1fr] gap-4">
+        {/* PROFIT DECK — live 3D core backdrop + glowing pnl-keyed edge -- */}
+        <div className="relative rounded-xl overflow-hidden deck-accent"
           style={{
-            left: `${d.x}%`, top: "34%",
-            fontSize: d.win ? "1.5rem" : "1.3rem",
-            animationDelay: `${d.delay}s`, animationFillMode: "both",
-            textShadow: d.win ? "0 0 14px #34d39999, 0 1px 0 #022c22"
-                              : "0 0 14px #f8717199, 0 1px 0 #450a0a",
+            border: `1px solid ${deckGlow ? deckAccent + "cc" : "#1e2a3a"}`,
+            boxShadow: deckGlow
+              ? `0 0 26px -8px ${deckAccent}99, inset 0 0 60px -30px ${deckAccent}`
+              : "none",
           }}>
-          {d.text}
-        </span>
-      ))}
+          {/* 3D scene — particle field only (the equity-ribbon "chart" is
+              removed); colour-keyed to the day's pnl direction */}
+          <div className="absolute inset-0">
+            <ThreeCanvas prices={[]} colorMode={deckColor} intensity={deckIntensity} />
+          </div>
+          {/* legibility scrim: clearer at the headline, darker over dense text */}
+          <div className="absolute inset-0 pointer-events-none bg-gradient-to-b
+            from-[#070a0e]/70 via-[#070a0e]/55 to-[#070a0e]/90" />
 
-      {/* masthead */}
-      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 mb-3">
-        <span className="label">Profit Deck</span>
-        <span className="text-[10px] mono text-amber-400/90 uppercase tracking-widest">
-          testnet paper · live mark
-        </span>
-        <div className="ml-auto"><Clock /></div>
-      </div>
+          <div className="relative p-4" style={{ textShadow: "0 1px 6px rgba(0,0,0,0.9)" }}>
 
-      {/* row 1: big odometer + stats | LED panel | streak ring */}
-      <div className="flex flex-wrap items-center gap-x-6 gap-y-4">
-        <div className="min-w-0">
+          {/* damage numbers: realized pnl floats up and fades like game text */}
+          {dmgs.map((d) => (
+            <span key={d.id}
+              className={clsx(
+                "dmg-float absolute z-20 mono font-bold pointer-events-none select-none",
+                d.win ? "text-emerald-300" : "text-red-400")}
+              style={{
+                left: `${d.x}%`, top: "40%",
+                fontSize: d.win ? "1.5rem" : "1.3rem",
+                animationDelay: `${d.delay}s`, animationFillMode: "both",
+                textShadow: d.win ? "0 0 14px #34d39999, 0 1px 0 #022c22"
+                                  : "0 0 14px #f8717199, 0 1px 0 #450a0a",
+              }}>
+              {d.text}
+            </span>
+          ))}
+
+          {/* masthead */}
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 mb-4">
+            <span className="flex items-center gap-2">
+              <span className="pulse-icon inline-block w-[5px] h-[5px] rounded-full"
+                style={{ background: PROFIT, boxShadow: `0 0 6px ${PROFIT}` }} />
+              <span className="label">Profit Deck</span>
+            </span>
+            <span className="text-[10px] mono text-amber-400/90 uppercase tracking-widest">
+              testnet paper · live mark
+            </span>
+            <div className="ml-auto"><Clock /></div>
+          </div>
+
+          {/* day pnl headline */}
           <div className="flex items-center gap-2 mb-1.5">
             <span className="text-[10px] uppercase tracking-[0.18em] text-slate-500">
               {month} — day pnl
@@ -368,8 +474,15 @@ export default function ProfitDeck() {
               <span className="w-1 h-1 rounded-full bg-emerald-400 animate-pulse" /> live
             </span>
           </div>
-          <Odometer value={dayPnl} className="h-10 md:h-14" />
-          <div className="flex flex-wrap items-center gap-x-3 mt-2 mono text-[10px] text-slate-400">
+          <div className="relative inline-block">
+            {burst && (
+              <span key={burst.key} className={clsx("flash-burst", burst.dir)} />
+            )}
+            <Odometer value={dayPnl} className="h-12 md:h-16" />
+          </div>
+
+          {/* stats row */}
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-1 mt-3 mono text-[11px] text-slate-400">
             <span>{nCloses} closes</span>
             <span>{nCloses ? `${Math.round((nWins / nCloses) * 100)}% win` : "— win"}</span>
             <span className={realized >= 0 ? "text-emerald-400/90" : "text-red-400/90"}>
@@ -377,32 +490,36 @@ export default function ProfitDeck() {
             </span>
             <span>acct ${pos ? pos.account_value.toFixed(2) : "—"}</span>
           </div>
-          <div className="mt-2">
-            <div className="text-[8px] uppercase tracking-[0.2em] text-slate-600 mb-0.5">
+
+          {/* trade stack */}
+          <div className="mt-4">
+            <div className="text-[8px] uppercase tracking-[0.2em] text-slate-500 mb-1">
               trade stack — pnl per close
             </div>
             <TradeStack closes={stackPnls} />
           </div>
+          </div>
         </div>
 
-        <div className="flex-1 min-w-[210px] max-w-[360px] md:ml-auto"><Led ev={ev} /></div>
-
-        <div className="relative w-20 h-20 shrink-0">
-          <div className="absolute inset-0 rounded-full core-ring" style={{ animationDuration: "5.5s" }} />
-          <div className="absolute inset-[4px] rounded-full bg-ink border border-edge flex flex-col items-center justify-center">
-            <span className="text-2xl font-bold mono text-glow tabular-nums">{streak}</span>
-            <span className="text-[7px] uppercase tracking-[0.18em] text-slate-500">win streak</span>
+        {/* FLOW EVENT + SIGNAL CONSOLE (stacked right column) ---------- */}
+        <div className="grid grid-rows-[auto_1fr] gap-4 min-h-0">
+          <Led ev={ev} />
+          {/* relative cell — the console is absolutely positioned to fill it so
+              its (growing) line list never feeds height back into the grid */}
+          <div className="relative min-h-[220px] lg:min-h-0">
+            <SignalConsole positions={openPositions} pulse={pulse}
+              fills={fills ?? undefined} />
           </div>
         </div>
       </div>
 
-      {/* row 2: 24h pnl curve | open positions */}
-      <div className="grid md:grid-cols-[1fr_1.6fr] gap-3 mt-4">
-        <div className="border border-edge/70 rounded-xl p-3 min-w-0">
-          <div className="flex items-baseline justify-between mb-1">
-            <span className="text-[9px] uppercase tracking-wider text-slate-500">24h pnl</span>
-            <span className="mono text-[10px]">
-              <span className={last24 >= 0 ? "text-emerald-400" : "text-red-400"}>
+      {/* ── row 2: 24h pnl | open positions ─────────────────────────── */}
+      <div className="grid lg:grid-cols-[1fr_1.7fr] gap-4">
+        <div className="core-card p-4 min-w-0">
+          <div className="flex items-baseline justify-between mb-2">
+            <span className="label">24h pnl</span>
+            <span className="mono text-[11px]">
+              <span style={last24 >= 0 ? { color: PROFIT } : { color: LOSS }}>
                 {last24 >= 0 ? "+" : "-"}${Math.abs(last24).toFixed(2)}
               </span>
               <span className="text-slate-600"> · peak +${peak24.toFixed(2)}</span>
@@ -411,9 +528,9 @@ export default function ProfitDeck() {
           <PnlArea pts={pnl24} />
         </div>
 
-        <div className="border border-edge/70 rounded-xl p-3 min-w-0">
-          <div className="flex flex-wrap items-center gap-2 mb-1">
-            <span className="text-[9px] uppercase tracking-wider text-slate-500">open positions</span>
+        <div className="core-card p-4 min-w-0">
+          <div className="flex flex-wrap items-center gap-2 mb-2">
+            <span className="label">open positions</span>
             <span className="px-1.5 rounded-full border border-edge text-[9px] mono text-slate-400">
               {openPositions.length}
             </span>

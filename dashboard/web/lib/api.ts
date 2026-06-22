@@ -41,6 +41,28 @@ export function usePoll<T = any>(path: string, ms = 5000) {
   return { data, err };
 }
 
+/** Full coin universe — safe fallback when /api/config can't be read so a
+ *  page never goes blank on a network error. */
+export const DEFAULT_COINS = ["BTC", "ETH", "SOL", "ARB", "AVAX", "DOGE", "WIF"];
+
+/**
+ * Active trading coins from live config (trading.coins_active), reflecting
+ * Controls-page toggles within ~30s. Returns:
+ *   - null   while the first /api/config response is in flight (loading)
+ *   - the active coin list once loaded
+ *   - DEFAULT_COINS if /api/config errors before any data arrives
+ */
+export function useActiveCoins(): string[] | null {
+  const { data, err } = usePoll<{ effective?: Record<string, any> }>(
+    "/api/config", 30000);
+  if (data) {
+    const a = data.effective?.["trading.coins_active"];
+    return Array.isArray(a) && a.length ? (a as string[]) : DEFAULT_COINS;
+  }
+  if (err) return DEFAULT_COINS; // network failure — fail open, don't blank
+  return null; // still loading
+}
+
 export const fmtUsd = (v: number | null | undefined, dp = 2) =>
   v == null ? "—" : `$${v.toLocaleString("en-US", { minimumFractionDigits: dp, maximumFractionDigits: dp })}`;
 
@@ -48,4 +70,4 @@ export const fmtPct = (v: number | null | undefined, dp = 2) =>
   v == null ? "—" : `${(v * 100).toFixed(dp)}%`;
 
 export const fmtTs = (ts: number | null | undefined) =>
-  ts ? new Date(ts).toLocaleString("en-US", { hour12: false }) : "—";
+  ts ? new Date(ts).toLocaleString("en-US", { hour12: true }) : "—";

@@ -71,7 +71,7 @@ export default function RiskPage() {
       </div>
 
       <div className="card">
-        <div className="label mb-3">Per-Coin Realized PnL (exchange fills)</div>
+        <div className="label mb-3">Per-Coin Realized PnL (round-trip trades, net of fees)</div>
         {!fills?.per_coin || !Object.keys(fills.per_coin).length ? (
           <div className="text-slate-500 text-sm py-4 text-center">no fills yet</div>
         ) : (
