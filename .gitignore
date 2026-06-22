@@ -1,35 +1,31 @@
-data/hl_reaper.db
-data/hl_reaper.db-shm
-data/hl_reaper.db-wal
-data/recorded/l2_BTC_20260612.jsonl.gz
-data/recorded/l2_DOGE_20260612.jsonl.gz
-data/recorded/l2_ETH_20260612.jsonl.gz
-data/recorded/l2_SOL_20260612.jsonl.gz
-data/hl_reaper.db-shm
-data/hl_reaper.db-wal
-data/recorded/l2_ETH_20260612.jsonl.gz
-data/hl_reaper.db-shm
-data/hl_reaper.db-shm
-data/hl_reaper.db-wal
-data/recorded/l2_ARB_20260612.jsonl.gz
-data/recorded/l2_WIF_20260612.jsonl.gz
-data/hl_reaper.db-shm
-data/hl_reaper.db-wal
-data/recorded/l2_ARB_20260612.jsonl.gz
-data/recorded/l2_BTC_20260612.jsonl.gz
-data/recorded/l2_DOGE_20260612.jsonl.gz
-data/recorded/l2_ETH_20260612.jsonl.gz
-data/recorded/l2_SOL_20260612.jsonl.gz
-data/hl_reaper.db
-data/hl_reaper.db-shm
-data/hl_reaper.db-wal
-data/recorded/l2_ARB_20260612.jsonl.gz
-data/recorded/l2_AVAX_20260612.jsonl.gz
-data/recorded/l2_BTC_20260612.jsonl.gz
-data/recorded/l2_DOGE_20260612.jsonl.gz
-data/recorded/l2_ETH_20260612.jsonl.gz
-data/recorded/l2_SOL_20260612.jsonl.gz
-data/recorded/l2_WIF_20260612.jsonl.gz
-data/recorded/trades_BTC_20260612.jsonl.gz
-data/recorded/trades_ETH_20260612.jsonl.gz
-data/recorded/trades_SOL_20260612.jsonl.gz
+# Python virtualenv
+venv/
+.venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Node / frontend dependencies & build
+node_modules/
+**/node_modules/
+dashboard/web/.next/
+.next/
+
+# Runtime databases (SQLite + WAL/SHM)
+data/*.db
+data/*.db-shm
+data/*.db-wal
+data/fills.db*
+
+# Recorded market data
+data/recorded/*.jsonl.gz
+data/recorded/*.jsonl
+
+# Logs & local env
+*.log
+.env
+.env.local
+
+# OS / editor cruft
+.DS_Store

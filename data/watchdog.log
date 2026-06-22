@@ -1,2 +1,0 @@
-22:28:50 INFO    exchange | API wallet: 0x355CdAa20Af503D500604CB35cfcA3f76d360345 (acting for account 0xBC6F4A41272a2E55B488380498E1e3aE569B08b0)
-22:28:53 INFO    watchdog | watchdog armed: heartbeat=/tmp/hl_reaper_bot_heartbeat stale_after=120s network=testnet

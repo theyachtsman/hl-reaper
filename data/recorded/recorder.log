@@ -1,9 +1,0 @@
-22:28:53 INFO    ws_feed | connecting websocket -> https://api.hyperliquid.xyz
-22:28:54 INFO    ws_feed | subscribed: 7 coins x (book + trades + 1 candle feeds)
-INFO:ws_feed:subscribed: 7 coins x (book + trades + 1 candle feeds)
-22:28:54 INFO    recorder | recording 7 coins -> /opt/hl-reaper/data/recorded (book every 2s, ctx every 60s)
-INFO:recorder:recording 7 coins -> /opt/hl-reaper/data/recorded (book every 2s, ctx every 60s)
-22:28:55 INFO    recorder_main | STATUS | 7 lines written | feed_age=0.3s
-INFO:recorder_main:STATUS | 7 lines written | feed_age=0.3s
-22:29:19 INFO    recorder_main | shutting down...
-INFO:recorder_main:shutting down...
