@@ -188,7 +188,8 @@ function verdictToAgg(coin: string, v: any, ts: number | null) {
     coin,
     direction: v.direction,
     confidence: v.confidence,
-    meta: { regime: v.regime, long: v.long_votes, short: v.short_votes, flat: v.flat_votes },
+    meta: { regime: v.regime, long: v.long_votes, short: v.short_votes, flat: v.flat_votes,
+            funding_dampen: v.funding_dampen },
     ts,
     live: true,
   };
@@ -202,6 +203,11 @@ function AggCard({ agg }: { agg: any }) {
         <span className={`text-xl font-bold ${dirColor(agg.direction)}`}>{agg.direction}</span>
         <span className="mono text-sm">conf {Number(agg.confidence).toFixed(3)}</span>
         {agg.meta?.regime && <span className="text-sky-300 text-sm">{agg.meta.regime}</span>}
+        {agg.meta?.funding_dampen && (
+          <span className="text-amber-400 text-xs" title={agg.meta.funding_dampen}>
+            ⚠ funding dampened
+          </span>
+        )}
       </div>
       <div className="flex flex-wrap gap-x-3 text-xs text-slate-400 mt-1">
         {agg.meta && <span>votes L/S/F {agg.meta.long}/{agg.meta.short}/{agg.meta.flat}</span>}

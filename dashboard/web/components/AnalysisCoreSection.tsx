@@ -10,6 +10,7 @@
 import { useEffect, useRef, useState } from "react";
 import clsx from "clsx";
 import { usePoll, useActiveCoins } from "@/lib/api";
+import { useBandStore } from "@/lib/store";
 import CoinCard3D, { Verdict } from "@/components/CoinCard3D";
 
 type Ticket = { model: string; direction: string; confidence: number; meta: any };
@@ -28,7 +29,11 @@ type TicketsResp = {
   bands?: { scalp: boolean; trend: boolean };
 };
 type Band = "scalp" | "trend";
-type Pulse = { mid: number; imbalance: number };
+type Pulse = {
+  mid: number; imbalance: number; spread_bps?: number;
+  bid_szs?: number[]; ask_szs?: number[];
+  bid_notional?: number; ask_notional?: number;
+};
 type PulseResp = { coins: Record<string, Pulse>; n: number };
 type PositionsResp = { positions?: { coin: string; szi: number }[] };
 
@@ -39,7 +44,10 @@ export default function AnalysisCoreSection() {
   const activeCoins = useActiveCoins();
 
   const coins = activeCoins ?? [];
-  const [band, setBand] = useState<Band>("scalp");
+  // shared global band context — the same toggle drives Open Positions + the
+  // chart's default timeframe on the Live page (see useBandStore).
+  const band = useBandStore((s) => s.activeBand);
+  const setBand = useBandStore((s) => s.setActiveBand);
   const gates = live?.gates?.[band];
   const gQ = gates?.min_model_agreement ?? 3;
   const gC = gates?.min_confidence ?? 0.4;
@@ -136,6 +144,7 @@ export default function AnalysisCoreSection() {
           : coins.map((coin) => (
               <CoinCard3D key={coin} coin={coin}
                 mid={pulse?.coins?.[coin]?.mid}
+                depth={pulse?.coins?.[coin]}
                 verdict={live?.verdicts?.[coin]?.[band]}
                 tickets={live?.coins?.[coin]?.[band]?.tickets ?? []}
                 position={posByCoin[coin] ?? null}

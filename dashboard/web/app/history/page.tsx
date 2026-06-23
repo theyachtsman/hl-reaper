@@ -31,6 +31,40 @@ const BAND_COLOR = (b?: string | null) =>
 const COINS = ["BTC", "ETH", "SOL", "ARB", "AVAX", "DOGE", "WIF"];
 const pnlColor = (v: number) => (v > 0 ? "text-emerald-400" : v < 0 ? "text-red-400" : "text-slate-400");
 
+// Convert a yyyy-mm-dd date-input value to an epoch-ms boundary on the viewer's
+// local calendar day. `edge="start"` → 00:00:00.000, `edge="end"` → 23:59:59.999
+// (inclusive). Empty string → null (no bound). Parsing without a "Z" suffix
+// makes JS interpret the date in local time, which is what the picker shows.
+const dayBound = (d: string, edge: "start" | "end"): number | null => {
+  if (!d) return null;
+  const t = edge === "start" ? "T00:00:00.000" : "T23:59:59.999";
+  const ms = new Date(d + t).getTime();
+  return Number.isNaN(ms) ? null : ms;
+};
+
+function DateRange({
+  start, end, onStart, onEnd,
+}: {
+  start: string; end: string;
+  onStart: (v: string) => void; onEnd: (v: string) => void;
+}) {
+  const cls = "bg-edge/50 border border-edge rounded px-2 py-1 text-slate-300 " +
+    "[color-scheme:dark]";
+  return (
+    <div className="flex items-center gap-1.5">
+      <input type="date" value={start} max={end || undefined}
+        onChange={(e) => onStart(e.target.value)} className={cls} aria-label="From date" />
+      <span className="text-slate-600 text-xs">→</span>
+      <input type="date" value={end} min={start || undefined}
+        onChange={(e) => onEnd(e.target.value)} className={cls} aria-label="To date" />
+      {(start || end) && (
+        <button onClick={() => { onStart(""); onEnd(""); }}
+          className="text-slate-500 hover:text-slate-300 text-xs px-1" title="Clear dates">✕</button>
+      )}
+    </div>
+  );
+}
+
 function Stat({ label, value, sub, color }: { label: string; value: string; sub?: string; color?: string }) {
   return (
     <div className="card p-3">
@@ -56,6 +90,8 @@ export default function HistoryPage() {
   const [direction, setDirection] = useState("");
   const [band, setBand] = useState("");
   const [result, setResult] = useState("");
+  const [start, setStart] = useState("");
+  const [end, setEnd] = useState("");
   const [sort, setSort] = useState("exit_ts");
   const [order, setOrder] = useState<"asc" | "desc">("desc");
   const [limit, setLimit] = useState(50);
@@ -69,17 +105,29 @@ export default function HistoryPage() {
     if (direction) p.set("direction", direction);
     if (band) p.set("band", band);
     if (result) p.set("result", result);
+    const s = dayBound(start, "start");
+    const e = dayBound(end, "end");
+    if (s != null) p.set("start", String(s));
+    if (e != null) p.set("end", String(e));
     p.set("sort", sort);
     p.set("order", order);
     return p.toString();
-  }, [coin, direction, band, result, sort, order]);
+  }, [coin, direction, band, result, start, end, sort, order]);
 
   useEffect(() => {
-    setLoading(true);
-    api<{ total: number; trades: Trade[] }>(`/api/history/trades?${qs}&limit=${limit}`)
-      .then((d) => { setTrades(d.trades); setTotal(d.total); })
-      .catch(() => {})
-      .finally(() => setLoading(false));
+    // fetch immediately on filter/limit change (with spinner), then poll on a
+    // 30s interval so freshly-closed round-trips appear without a manual reload.
+    // Interval refreshes are silent (no spinner flicker).
+    const load = (silent: boolean) => {
+      if (!silent) setLoading(true);
+      api<{ total: number; trades: Trade[] }>(`/api/history/trades?${qs}&limit=${limit}`)
+        .then((d) => { setTrades(d.trades); setTotal(d.total); })
+        .catch(() => {})
+        .finally(() => { if (!silent) setLoading(false); });
+    };
+    load(false);
+    const id = setInterval(() => load(true), 30000);
+    return () => clearInterval(id);
   }, [qs, limit]);
 
   const toggleSort = (col: string) => {
@@ -95,15 +143,23 @@ export default function HistoryPage() {
   const [aBand, setABand] = useState("");
   const [aSkips, setASkips] = useState(false);
   const [aLimit, setALimit] = useState(200);
+  const [aOrder, setAOrder] = useState<"asc" | "desc">("desc");
+  const [aStart, setAStart] = useState("");
+  const [aEnd, setAEnd] = useState("");
   const auditQs = useMemo(() => {
     const p = new URLSearchParams();
     if (aCoin) p.set("coin", aCoin);
     if (aAction) p.set("action", aAction);
     if (aBand) p.set("band", aBand);
     if (aSkips) p.set("include_skips", "true");
+    const s = dayBound(aStart, "start");
+    const e = dayBound(aEnd, "end");
+    if (s != null) p.set("start", String(s));
+    if (e != null) p.set("end", String(e));
+    p.set("order", aOrder);
     p.set("limit", String(aLimit));
     return p.toString();
-  }, [aCoin, aAction, aBand, aSkips, aLimit]);
+  }, [aCoin, aAction, aBand, aSkips, aLimit, aOrder, aStart, aEnd]);
   // CSV export uses the same filters but no row limit (exports everything that
   // matches, not just the page currently shown).
   const auditCsvQs = useMemo(() => {
@@ -112,8 +168,12 @@ export default function HistoryPage() {
     if (aAction) p.set("action", aAction);
     if (aBand) p.set("band", aBand);
     if (aSkips) p.set("include_skips", "true");
+    const s = dayBound(aStart, "start");
+    const e = dayBound(aEnd, "end");
+    if (s != null) p.set("start", String(s));
+    if (e != null) p.set("end", String(e));
     return p.toString();
-  }, [aCoin, aAction, aBand, aSkips]);
+  }, [aCoin, aAction, aBand, aSkips, aStart, aEnd]);
   const { data: audit } = usePoll<{ total: number; trades: AuditRow[] }>(
     `/api/trades?${auditQs}`, 15000);
 
@@ -136,7 +196,7 @@ export default function HistoryPage() {
           href={`/api/history/export.csv?${qs}`}
           className="px-3 py-1.5 rounded-lg text-sm bg-edge hover:bg-edge/70 text-white"
         >
-          ⬇ Export CSV{coin || direction || band || result ? " (filtered)" : " (all)"}
+          ⬇ Export CSV{coin || direction || band || result || start || end ? " (filtered)" : " (all)"}
         </a>
       </div>
 
@@ -268,11 +328,12 @@ export default function HistoryPage() {
             {loading ? "…" : (
               <span className="text-slate-500">
                 (showing {Math.min(limit, total)} of {total}
-                {coin || direction || result ? " filtered" : ""})
+                {coin || direction || result || band || start || end ? " filtered" : ""})
               </span>
             )}
           </div>
-          <div className="flex gap-2 text-sm flex-wrap">
+          <div className="flex gap-2 text-sm flex-wrap items-center">
+            <DateRange start={start} end={end} onStart={setStart} onEnd={setEnd} />
             <select value={coin} onChange={(e) => setCoin(e.target.value)}
               className="bg-edge/50 border border-edge rounded px-2 py-1">
               <option value="">All coins</option>
@@ -364,11 +425,12 @@ export default function HistoryPage() {
             {audit ? (
               <span className="text-slate-500">
                 (showing {audit.trades.length} of {audit.total}
-                {aCoin || aAction || aBand || aSkips ? " filtered" : ""})
+                {aCoin || aAction || aBand || aSkips || aStart || aEnd ? " filtered" : ""})
               </span>
             ) : "…"}
           </div>
           <div className="flex gap-2 text-sm flex-wrap items-center">
+            <DateRange start={aStart} end={aEnd} onStart={setAStart} onEnd={setAEnd} />
             <select value={aCoin} onChange={(e) => setACoin(e.target.value)}
               className="bg-edge/50 border border-edge rounded px-2 py-1">
               <option value="">All coins</option>
@@ -402,7 +464,7 @@ export default function HistoryPage() {
               href={`/api/trades/export.csv?${auditCsvQs}`}
               className="px-3 py-1.5 rounded-lg text-sm bg-edge hover:bg-edge/70 text-white"
             >
-              ⬇ Export CSV{aCoin || aAction || aBand || aSkips ? " (filtered)" : " (all)"}
+              ⬇ Export CSV{aCoin || aAction || aBand || aSkips || aStart || aEnd ? " (filtered)" : " (all)"}
             </a>
           </div>
         </div>
@@ -413,8 +475,11 @@ export default function HistoryPage() {
         <div className="overflow-x-auto max-h-[600px] overflow-y-auto">
           <table className="w-full text-xs whitespace-nowrap">
             <thead className="text-left text-slate-500 sticky top-0 bg-panel">
-              <tr className="text-[11px]">
-                <th className="py-1">Time</th><th>Coin</th><th>Band</th><th>Side</th><th>Action</th>
+              <tr className="text-[11px] select-none">
+                <th onClick={() => setAOrder(aOrder === "asc" ? "desc" : "asc")}
+                  className="py-1 cursor-pointer hover:text-slate-300">
+                  Time{aOrder === "asc" ? " ▲" : " ▼"}
+                </th><th>Coin</th><th>Band</th><th>Side</th><th>Action</th>
                 <th className="text-right">Size</th><th className="text-right">Price</th>
                 <th>Status</th><th>Note</th>
               </tr>

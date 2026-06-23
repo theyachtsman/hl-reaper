@@ -19,6 +19,16 @@ log = get_logger("risk")
 # position and re-evaluated (so a real failed close eventually retries).
 CLOSE_PENDING_TIMEOUT_S = 30.0
 
+# Confidence-gate float tolerance (2026-06-22). The aggregator computes
+# confidence as a weighted-score division (abs(score)/active_weight), which can
+# land one ULP below an intended at-threshold value (e.g. a true 0.30 stored as
+# 0.2999999998) and be wrongly rejected by a strict `< threshold`. Subtracting
+# this epsilon lets at-threshold values pass. It does NOT lower the effective
+# gate for genuinely-below values — 0.29 still fails a 0.30 gate. (It is NOT a
+# fix for marginal signals reading ~0.29 in 2-decimal logs; those are truly
+# below the gate and only a lower scalp_min_confidence will admit them.)
+CONF_GATE_EPS = 1e-9
+
 
 def with_retry(fn: Callable, what: str, tries: int = 3):
     """Layer 4 API wrapper: exponential backoff, returns None on final failure."""
@@ -452,9 +462,11 @@ class RiskManager:
             return False, f"state={self.state.value}"
         if direction not in ("LONG", "SHORT"):
             return False, f"no tradeable direction ({direction})"
-        if confidence < bp["min_confidence"]:
-            return False, (f"confidence {confidence:.2f} < "
-                           f"{bp['min_confidence']:.2f}")
+        if confidence < bp["min_confidence"] - CONF_GATE_EPS:
+            # 3-decimal reason so "0.30 < 0.30" no longer hides whether the value
+            # was a genuinely-below 0.298 or float noise just under 0.30.
+            return False, (f"confidence {confidence:.3f} < "
+                           f"{bp['min_confidence']:.3f}")
         if model_agreement < bp["min_model_agreement"]:
             return False, (f"model agreement {model_agreement} < "
                            f"{bp['min_model_agreement']}")
@@ -574,6 +586,31 @@ class RiskManager:
             "max_hold_s": (hold_hours or bp["max_hold_hours"]) * 3600,
         }
 
+    def set_manual_sltp(self, coin: str, sl: float, tp: float) -> tuple[bool, str]:
+        """Override an open position's SL/TP from the dashboard. Validates the
+        levels sit on the correct sides of entry, then updates the in-trade
+        tracker (and r_px, so trailing/breakeven R-math stays consistent).
+        Trailing may still tighten the SL further in the favorable direction;
+        TP is otherwise left at the chosen level. Returns (ok, message)."""
+        tr = self._pos_track.get(coin)
+        if not tr:
+            return False, f"no open tracked position for {coin}"
+        entry = tr["entry_px"]
+        if not (sl > 0 and tp > 0):
+            return False, "sl/tp must be positive"
+        if tr["is_long"]:
+            if not (tp > entry > sl):
+                return False, (f"LONG needs tp>entry>sl "
+                               f"(entry={entry:g}, got sl={sl:g} tp={tp:g})")
+        else:
+            if not (tp < entry < sl):
+                return False, (f"SHORT needs tp<entry<sl "
+                               f"(entry={entry:g}, got sl={sl:g} tp={tp:g})")
+        tr["sl"], tr["tp"], tr["r_px"] = sl, tp, abs(entry - sl)
+        log.warning("MANUAL SL/TP %s: sl=%.6f tp=%.6f (entry=%.6f)",
+                    coin, sl, tp, entry)
+        return True, "ok"
+
     def check_open_positions(self, positions: list) -> list[dict]:
         """Check all open positions against in-trade guards.
         Returns list of actions: [{"coin":str,"action":"CLOSE"|"UPDATE_SL",
@@ -683,12 +720,28 @@ class RiskManager:
                     if improved:
                         tr["sl"] = be_sl
                         tr["breakeven_locked"] = True
+                        # recalc TP to hold the original R:R measured from the
+                        # NEW (tight) SL. Otherwise SL snaps to entry+buffer
+                        # while TP stays at the entry-time target, blowing R:R
+                        # out (e.g. 1:13.7) and leaving an unreachable moonshot.
+                        # Only ever tighten TP — never push it further away.
+                        new_sl_dist = abs(tr["entry_px"] - be_sl)
+                        recalc_tp = (
+                            tr["entry_px"] + new_sl_dist * bp["take_profit_r"]
+                            if is_long else
+                            tr["entry_px"] - new_sl_dist * bp["take_profit_r"])
+                        tighter = ((recalc_tp < tr["tp"]) if is_long
+                                   else (recalc_tp > tr["tp"]))
+                        if tighter:
+                            tr["tp"] = recalc_tp
                         actions.append({"coin": coin, "band": band,
                                         "action": "BREAKEVEN",
                                         "new_sl": be_sl,
+                                        "new_tp": tr["tp"],
                                         "reason": f"breakeven lock @ "
                                                   f"{unreal_r:.2f}R "
-                                                  f"(SL -> {be_sl:.4f})"})
+                                                  f"(SL -> {be_sl:.4f}, "
+                                                  f"TP -> {tr['tp']:.4f})"})
 
                 # trailing stop: activate at >= trail_activation_r unrealized,
                 # trail at atr_trail_multiplier * ATR

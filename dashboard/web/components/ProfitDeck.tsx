@@ -11,8 +11,8 @@
  */
 import { useEffect, useMemo, useRef, useState } from "react";
 import clsx from "clsx";
-import { usePoll } from "@/lib/api";
-import { useStatusStore } from "@/lib/store";
+import { usePoll, post } from "@/lib/api";
+import { useStatusStore, useBandStore, type Band } from "@/lib/store";
 import ThreeCanvas, { ColorMode, Intensity } from "@/components/ThreeCanvas";
 import SignalConsole from "@/components/SignalConsole";
 
@@ -172,22 +172,66 @@ function PnlArea({ pts }: { pts: number[] }) {
   );
 }
 
-/* ---------- open positions, live-marked against the 2.5s pulse ---------- */
-function PositionsPanel({ positions, mids }: {
-  positions: any[]; mids: Record<string, CoinPulse> | undefined;
+/* per-position band tag (cyan = scalp, purple = trend) — shown on every row so
+   it's always clear which band owns a position at a glance. */
+function BandTag({ band }: { band?: string | null }) {
+  if (!band) return <span className="text-slate-600 text-[8px]">—</span>;
+  return (
+    <span className={clsx(
+      "px-1 rounded text-[8px] uppercase tracking-wider font-semibold",
+      band === "scalp" ? "bg-cyan-500/20 text-cyan-300"
+                       : "bg-purple-500/20 text-purple-300")}>
+      {band}
+    </span>
+  );
+}
+
+/* ---------- open positions, live-marked against the 2.5s pulse ----------
+   `band` is the active Live-page context: the panel shows only positions owned
+   by that band, but every row still carries its band tag. */
+function PositionsPanel({ positions, mids, band }: {
+  positions: any[]; mids: Record<string, CoinPulse> | undefined; band: Band;
 }) {
+  // manual close: a row's "close" arms a one-click confirm, which queues a
+  // close_coin command to the bot (it executes the market close within one
+  // loop and logs the round-trip to history as a manual stop — see api.py
+  // _exit_result). `sent` shows "closing…" until the position clears the book.
+  const [pending, setPending] = useState<string | null>(null);
+  const [sent, setSent] = useState<Set<string>>(new Set());
+  const [err, setErr] = useState<string | null>(null);
+
+  // once a closed position drops out of the feed, forget it so the same coin
+  // reopening later shows a fresh "close" button (not a stale "closing…").
+  useEffect(() => {
+    const live = new Set(positions.map((p) => p.coin));
+    setSent((prev) => {
+      const next = new Set([...prev].filter((c) => live.has(c)));
+      return next.size === prev.size ? prev : next;
+    });
+  }, [positions]);
+
+  const doClose = (coin: string) => {
+    setErr(null);
+    setSent((s) => new Set(s).add(coin));
+    setPending(null);
+    post("/api/bot/command", { command: `close_coin/${coin}` }).catch((e) => {
+      setErr(`${coin}: ${e}`);
+      setSent((s) => { const n = new Set(s); n.delete(coin); return n; });
+    });
+  };
+
   if (!positions.length)
     return <div className="h-24 flex items-center justify-center gap-1.5 text-[10px] text-slate-600">
       <span className="pulse-icon inline-block w-1.5 h-1.5 rounded-full bg-emerald-500/80" />
-      no open positions — gates armed, waiting for a signal…</div>;
+      no open {band} positions — gates armed, waiting for a signal…</div>;
   return (
     <div className="overflow-x-auto">
-      <table className="w-full mono text-[11px] min-w-[500px]">
+      <table className="w-full mono text-[11px] min-w-[620px]">
         <thead className="text-left text-slate-500 uppercase text-[8px] tracking-[0.15em]">
           <tr>
-            <th className="py-1 pr-2">coin</th><th>side</th><th>size</th>
+            <th className="py-1 pr-2">coin</th><th>band</th><th>side</th><th>size</th>
             <th>entry</th><th>mark</th><th>value</th><th>upnl</th>
-            <th>lev</th><th>liq</th>
+            <th>lev</th><th>liq</th><th className="text-right pr-1">action</th>
           </tr>
         </thead>
         <tbody>
@@ -196,9 +240,11 @@ function PositionsPanel({ positions, mids }: {
             const upnl = mid ? p.szi * (mid - p.entry_px) : p.unrealized_pnl;
             const value = mid ? Math.abs(p.szi) * mid : p.position_value;
             const long = p.szi > 0;
+            const inProfit = upnl >= 0;
             return (
               <tr key={p.coin} className="border-t border-edge/60 feed-in">
                 <td className="py-1.5 pr-2 font-bold text-slate-200">{p.coin}</td>
+                <td><BandTag band={p.band} /></td>
                 <td className={long ? "text-emerald-400" : "text-red-400"}>
                   {long ? "LONG" : "SHORT"}
                 </td>
@@ -209,16 +255,42 @@ function PositionsPanel({ positions, mids }: {
                   {value != null ? `$${value.toLocaleString("en-US",
                     { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : "—"}
                 </td>
-                <td className={upnl >= 0 ? "text-emerald-400" : "text-red-400"}>
-                  {upnl >= 0 ? "+" : "-"}${Math.abs(upnl).toFixed(2)}
+                <td className={inProfit ? "text-emerald-400" : "text-red-400"}>
+                  {inProfit ? "+" : "-"}${Math.abs(upnl).toFixed(2)}
                 </td>
                 <td>{p.leverage ?? "—"}x</td>
                 <td className="text-slate-500">{p.liq_px ?? "—"}</td>
+                <td className="text-right pr-1 whitespace-nowrap">
+                  {sent.has(p.coin) ? (
+                    <span className="text-[9px] uppercase tracking-wider text-sky-400">closing…</span>
+                  ) : pending === p.coin ? (
+                    <span className="inline-flex items-center gap-1">
+                      <button onClick={() => doClose(p.coin)}
+                        title={inProfit ? "market close — lock in this profit"
+                                        : "market close — take this loss now"}
+                        className={clsx(
+                          "px-1.5 py-0.5 rounded text-[9px] font-semibold uppercase tracking-wider",
+                          inProfit ? "bg-emerald-500/25 text-emerald-200 hover:bg-emerald-500/40"
+                                   : "bg-red-500/25 text-red-200 hover:bg-red-500/40")}>
+                        {inProfit ? "lock profit" : "take loss"}
+                      </button>
+                      <button onClick={() => setPending(null)}
+                        className="px-1 py-0.5 rounded text-[9px] text-slate-500 hover:text-slate-300"
+                        title="cancel">✕</button>
+                    </span>
+                  ) : (
+                    <button onClick={() => { setErr(null); setPending(p.coin); }}
+                      className="px-1.5 py-0.5 rounded text-[9px] font-semibold uppercase tracking-wider border border-edge text-slate-400 hover:text-slate-100 hover:border-slate-500">
+                      close
+                    </button>
+                  )}
+                </td>
               </tr>
             );
           })}
         </tbody>
       </table>
+      {err && <div className="text-[10px] text-red-400 mt-1.5 mono">close failed — {err}</div>}
     </div>
   );
 }
@@ -401,6 +473,11 @@ export default function ProfitDeck() {
 
   const month = new Date().toLocaleString("en-US", { month: "long" }).toUpperCase();
   const openPositions = pos?.positions ?? [];
+  // account-wide pnl/deck calcs above stay over ALL positions; the Open
+  // Positions panel below shows only the active band's positions.
+  const activeBand = useBandStore((s) => s.activeBand);
+  const setActiveBand = useBandStore((s) => s.setActiveBand);
+  const bandPositions = openPositions.filter((p) => p.band === activeBand);
 
   /* analysis-core 3D backdrop: a live ribbon of the account's equity path,
      colour-keyed to the day's direction (green up / red down) so the deck
@@ -531,14 +608,33 @@ export default function ProfitDeck() {
         <div className="core-card p-4 min-w-0">
           <div className="flex flex-wrap items-center gap-2 mb-2">
             <span className="label">open positions</span>
+            {/* band selector — shares the global Live-page band context with the
+                Analysis Core toggle, so switching here swaps both in sync */}
+            <div className="flex items-center gap-1 rounded-full border border-edge p-0.5">
+              {(["scalp", "trend"] as Band[]).map((b) => (
+                <button key={b} onClick={() => setActiveBand(b)}
+                  className={clsx(
+                    "px-2 py-0.5 rounded-full text-[9px] font-semibold uppercase tracking-wider transition",
+                    activeBand === b
+                      ? b === "scalp"
+                        ? "bg-cyan-500/25 text-cyan-200"
+                        : "bg-purple-500/25 text-purple-200"
+                      : "text-slate-500 hover:text-slate-300")}>
+                  {b}
+                </button>
+              ))}
+            </div>
             <span className="px-1.5 rounded-full border border-edge text-[9px] mono text-slate-400">
-              {openPositions.length}
+              {bandPositions.length}
+              {openPositions.length > bandPositions.length
+                && <span className="text-slate-600"> / {openPositions.length}</span>}
             </span>
             <span className="ml-auto text-[8px] uppercase tracking-wider text-slate-600">
               upnl marked vs 2.5s live mids
             </span>
           </div>
-          <PositionsPanel positions={openPositions} mids={pulse?.coins} />
+          <PositionsPanel positions={bandPositions} mids={pulse?.coins}
+            band={activeBand} />
         </div>
       </div>
     </div>

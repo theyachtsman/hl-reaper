@@ -163,24 +163,38 @@ r3.check_open_positions([position("BTC", 100.0, -1.0, 0.2)])
 check("SHORT SL never rises back toward entry (still 99.95)",
       abs(r3._pos_track["BTC"]["sl"] - 99.95) < 1e-6)
 
-print("\n--- interaction with trailing stop ---")
-# breakeven at 0.5R, then continue to 1.5R (default trail_activation_r) and
-# confirm the trailing stop activates ON TOP of the breakeven-locked SL,
-# moving it further into profit.
+print("\n--- breakeven recalculates TP to hold original R:R ---")
+# When breakeven lock fires the SL snaps to entry+buffer; TP must be recalced
+# to keep the original R:R measured from the NEW (tight) SL, otherwise SL moves
+# but TP stays at the entry-time moonshot (R:R blows out to e.g. 1:13.7).
+# entry=100, sl=99 (r_px=1), tp=102 (2R), buffer=0.05% -> be_sl=100.05,
+# new_sl_dist=0.05, take_profit_r=2.0 -> recalc_tp = 100 + 0.05*2 = 100.10.
 r4 = make_risk()
 r4.register_entry("BTC", 100.0, 99.0, 102.0, True)
 r4.buf.set_mid("BTC", 100.5)
-r4.check_open_positions([position("BTC", 100.0, 1.0, 0.5)])
-sl_after_be = r4._pos_track["BTC"]["sl"]
-check("breakeven set first (100.05)", abs(sl_after_be - 100.05) < 1e-6)
-r4.buf.set_mid("BTC", 101.5)           # 1.5R -> trailing activates
+acts = r4.check_open_positions([position("BTC", 100.0, 1.0, 0.5)])
+be = next((a for a in acts if a["action"] == "BREAKEVEN"), None)
+check("breakeven SL snapped to entry+buffer (100.05)",
+      abs(r4._pos_track["BTC"]["sl"] - 100.05) < 1e-6)
+check("TP recalculated to hold 2R from new SL (100.10)",
+      abs(r4._pos_track["BTC"]["tp"] - 100.10) < 1e-6,
+      f"tp={r4._pos_track['BTC']['tp']}")
+check("BREAKEVEN action carries new_tp",
+      be is not None and abs(be.get("new_tp", 0) - 100.10) < 1e-6, str(be))
+check("BREAKEVEN reason reports both new SL and new TP",
+      be is not None and "TP ->" in be["reason"] and "SL ->" in be["reason"],
+      str(be))
+
+# after breakeven the tightened TP is reached on the next favorable tick — the
+# trade exits cleanly at TP rather than chopping out to a trailing stop / expiry.
+r4.buf.set_mid("BTC", 101.5)
 acts = r4.check_open_positions([position("BTC", 100.0, 1.0, 1.5)])
-check("trailing UPDATE_SL fires at trail_activation_r",
-      any(a["action"] == "UPDATE_SL" for a in acts))
-check("trailing tightened SL further into profit (> breakeven SL)",
-      r4._pos_track["BTC"]["sl"] > sl_after_be,
-      f"sl={r4._pos_track['BTC']['sl']}")
-check("trailing flag set", r4._pos_track["BTC"]["trailing"] is True)
+tp_close = next((a for a in acts if a["action"] == "CLOSE"
+                 and "take profit" in a["reason"]), None)
+check("post-breakeven price hits the tightened TP and CLOSEs at take profit",
+      tp_close is not None, str(acts))
+check("trailing does not pre-empt the tightened TP",
+      not any(a["action"] == "UPDATE_SL" for a in acts), str(acts))
 
 print("\n--- disabled switch ---")
 r5 = make_risk({"breakeven_lock_enabled": False})

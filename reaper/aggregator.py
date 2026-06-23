@@ -82,6 +82,17 @@ FLAT_CONF_EPS = 0.05
 # Agreeing BOOK votes and RANGING/UNKNOWN regimes are untouched.
 BOOK_REGIME_DAMPEN = 0.40
 
+# Funding regime dampening (2026-06-23): FundingRateModel fades the crowd — in a
+# RANGING/HIGH_VOL squeeze that's its edge, but in a SUSTAINED 1h trend a
+# persistently negative (or positive) funding rate makes it vote counter-trend
+# for hours (e.g. LONG all the way down a $2k BTC drop), systematically
+# cancelling the SHORT conviction of BOOK/VWAP/TA. So a counter-1h-trend FUNDING
+# vote has its WEIGHT cut to this factor (numerator AND denominator), shrinking
+# its drag without removing it. Trend-aligned FUNDING and RANGING/HIGH_VOL/
+# UNKNOWN regimes keep full weight. Mirrors BOOK_REGIME_DAMPEN's intent but acts
+# on the weight (per spec) rather than the confidence.
+FUNDING_COUNTER_TREND_DAMP = 0.40
+
 # Permanently non-voting models (ML: direction classification not viable;
 # LiqHeatmap: inert on normal tape). Both carry 0 weight, so excluding them from
 # the vote tally is DISPLAY-ONLY — no effect on score, confidence, or
@@ -147,7 +158,8 @@ class SignalAggregator:
                  funding_hard_block_enabled: bool = True,
                  funding_hard_block_conf: float = FUNDING_HARD_BLOCK_CONF,
                  funding_hard_block_short_enabled: bool = False,
-                 funding_hard_block_short_conf: float = FUNDING_HARD_BLOCK_CONF):
+                 funding_hard_block_short_conf: float = FUNDING_HARD_BLOCK_CONF,
+                 funding_counter_trend_damp: float = FUNDING_COUNTER_TREND_DAMP):
         self.base_weights = dict(base_weights or BASE_WEIGHTS)
         self.funding_hard_block_enabled = funding_hard_block_enabled
         self.funding_hard_block_conf = funding_hard_block_conf
@@ -156,6 +168,25 @@ class SignalAggregator:
         # deeply negative funding) blocks SHORT entries outright.
         self.funding_hard_block_short_enabled = funding_hard_block_short_enabled
         self.funding_hard_block_short_conf = funding_hard_block_short_conf
+        # weight multiplier for a counter-1h-trend FUNDING vote (see
+        # FUNDING_COUNTER_TREND_DAMP). 1.0 = no dampening, 0.0 = ignore funding
+        # entirely when counter-trend. Hot-reloadable.
+        self.funding_counter_trend_damp = funding_counter_trend_damp
+
+    def funding_weight_factor(self, model: str, direction: str,
+                              regime: str | None) -> float:
+        """Weight multiplier for `model` given the confirmed 1h `regime`.
+
+        Only FundingRateModel voting AGAINST a TRENDING regime is dampened
+        (LONG in TRENDING_DOWN, SHORT in TRENDING_UP) -> funding_counter_trend_damp.
+        Every other model, trend-aligned funding, and RANGING/HIGH_VOL/UNKNOWN/
+        None regimes return 1.0 (full weight)."""
+        if model != "FundingRateModel" or regime not in (
+                "TRENDING_UP", "TRENDING_DOWN"):
+            return 1.0
+        counter = ((regime == "TRENDING_DOWN" and direction == LONG)
+                   or (regime == "TRENDING_UP" and direction == SHORT))
+        return self.funding_counter_trend_damp if counter else 1.0
 
     @staticmethod
     def _normalize_fixed(weights: dict) -> dict:
@@ -256,6 +287,19 @@ class SignalAggregator:
                     f"x{BOOK_REGIME_DAMPEN:.2f} vs 1h {book_regime}")
 
             w = weights.get(t.model, 0.0)
+            # funding regime dampening: a counter-1h-trend FUNDING vote has its
+            # WEIGHT cut (numerator AND denominator) so a persistent crowd-fade
+            # vote can't cancel trend-aligned conviction in a sustained trend.
+            ff = self.funding_weight_factor(t.model, t.direction, book_regime)
+            if ff != 1.0:
+                w_eff = w * ff
+                meta["funding_dampen"] = (
+                    f"FUNDING {t.direction} weight {w:.3f}->{w_eff:.3f} "
+                    f"x{ff:.2f} vs 1h {book_regime}")
+                log.info("AGGREGATOR: %s FUNDING dampened (%s + %s vote) "
+                         "weight %.3f -> %.3f", coin, book_regime, t.direction,
+                         w, w_eff)
+                w = w_eff
             active_weight += w
             if t.direction == LONG:
                 long_votes += 1

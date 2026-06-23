@@ -1,6 +1,84 @@
+
+> hl-reaper-dashboard@1.0.0 start
+> next start -p 8888 -H 0.0.0.0
+
   ▲ Next.js 14.2.29
   - Local:        http://localhost:8888
   - Network:      http://0.0.0.0:8888
 
  ✓ Starting...
- ✓ Ready in 324ms
+ ✓ Ready in 438ms
+Failed to proxy http://127.0.0.1:8801/api/pulse Error: connect ECONNREFUSED 127.0.0.1:8801
+    at TCPConnectWrap.afterConnect [as oncomplete] (node:net:1611:16) {
+  errno: -111,
+  code: 'ECONNREFUSED',
+  syscall: 'connect',
+  address: '127.0.0.1',
+  port: 8801
+}
+Error: connect ECONNREFUSED 127.0.0.1:8801
+    at TCPConnectWrap.afterConnect [as oncomplete] (node:net:1611:16) {
+  errno: -111,
+  code: 'ECONNREFUSED',
+  syscall: 'connect',
+  address: '127.0.0.1',
+  port: 8801
+}
+Failed to proxy http://127.0.0.1:8801/api/pulse Error: connect ECONNREFUSED 127.0.0.1:8801
+    at TCPConnectWrap.afterConnect [as oncomplete] (node:net:1611:16) {
+  errno: -111,
+  code: 'ECONNREFUSED',
+  syscall: 'connect',
+  address: '127.0.0.1',
+  port: 8801
+}
+Error: connect ECONNREFUSED 127.0.0.1:8801
+    at TCPConnectWrap.afterConnect [as oncomplete] (node:net:1611:16) {
+  errno: -111,
+  code: 'ECONNREFUSED',
+  syscall: 'connect',
+  address: '127.0.0.1',
+  port: 8801
+}
+Failed to proxy http://127.0.0.1:8801/api/tickets Error: connect ECONNREFUSED 127.0.0.1:8801
+    at TCPConnectWrap.afterConnect [as oncomplete] (node:net:1611:16) {
+  errno: -111,
+  code: 'ECONNREFUSED',
+  syscall: 'connect',
+  address: '127.0.0.1',
+  port: 8801
+}
+Error: connect ECONNREFUSED 127.0.0.1:8801
+    at TCPConnectWrap.afterConnect [as oncomplete] (node:net:1611:16) {
+  errno: -111,
+  code: 'ECONNREFUSED',
+  syscall: 'connect',
+  address: '127.0.0.1',
+  port: 8801
+}
+Failed to proxy http://127.0.0.1:8801/api/tickets Error: connect ECONNREFUSED 127.0.0.1:8801
+    at TCPConnectWrap.afterConnect [as oncomplete] (node:net:1611:16) {
+  errno: -111,
+  code: 'ECONNREFUSED',
+  syscall: 'connect',
+  address: '127.0.0.1',
+  port: 8801
+}
+Error: connect ECONNREFUSED 127.0.0.1:8801
+    at TCPConnectWrap.afterConnect [as oncomplete] (node:net:1611:16) {
+  errno: -111,
+  code: 'ECONNREFUSED',
+  syscall: 'connect',
+  address: '127.0.0.1',
+  port: 8801
+}
+
+> hl-reaper-dashboard@1.0.0 start
+> next start -p 8888 -H 0.0.0.0
+
+  ▲ Next.js 14.2.29
+  - Local:        http://localhost:8888
+  - Network:      http://0.0.0.0:8888
+
+ ✓ Starting...
+ ✓ Ready in 276ms

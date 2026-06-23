@@ -146,6 +146,15 @@ models:
   ob_top_levels: 10
   ob_min_imbalance: 0.30
 
+# ---- aggregator: regime-aware weight dampening ----
+aggregator:
+  # FundingRateModel fades the crowd — great in RANGING/HIGH_VOL squeezes, but a
+  # systematic drag in a sustained 1h trend (it votes counter-trend for hours).
+  # When FUNDING votes against the confirmed 1h trend (LONG in TRENDING_DOWN /
+  # SHORT in TRENDING_UP) its aggregator WEIGHT is multiplied by this factor.
+  # 0.0 = ignore funding entirely when counter-trend, 1.0 = no dampening.
+  funding_counter_trend_damp: 0.40
+
 # ---- Phase 4/5: trading loop ----
 trading:
   # The legacy paper_aggressive/conservative "mode" toggle is gone. The risk
@@ -188,6 +197,15 @@ trading:
   maker_timeout_fallback_n: 3             # consecutive maker timeouts before check
   maker_timeout_fallback_window_s: 180    # window to count the streak within
   maker_timeout_exhaustion_atr_mult: 1.5  # price already moved this*ATR our way = skip
+  # armed-signal TTL (2026-06-22): a signal "arms" when it first clears every
+  # entry gate (can_open) on a coin+band. The maker may then keep retrying
+  # across cycles while it sits unfilled. These ceilings bound how long an
+  # armed setup may keep retrying before it is dropped as stale — beyond the
+  # TTL the original votes/conf no longer reflect current microstructure, so
+  # the entry is abandoned (logged [ARMED_TTL]) rather than filled into a
+  # changed market. Scalp is short-lived; trend tolerates more lag.
+  scalp_armed_ttl_seconds: 75
+  trend_armed_ttl_seconds: 75
   # LONG structural gate (2026-06-17): supersedes the old OB/VWAP confirmation
   # (Change B). A LONG must clear ALL THREE structural signals — spot LEADING
   # perp (real demand, not leverage), OI RISING (fresh longs entering), and the

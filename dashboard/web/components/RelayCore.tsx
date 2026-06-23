@@ -312,15 +312,19 @@ export default function RelayCore({
         if (open && active && !off) gate.group.rotation.z += d * 0.4;
         else if (off) gate.group.rotation.z = 0;
       };
-      const dir = st.direction;
+      const dir = st.coreDir;
       applyGate(r.gateShort, st.shortProg, st.shortOff, RED, dir === "SHORT", r.curShort);
       applyGate(r.gateLong, st.longProg, st.longOff, GREEN, dir === "LONG", r.curLong);
 
-      // beam to the ACTIVE gate only
-      const longActive = dir === "LONG" && !st.longOff;
-      const shortActive = dir === "SHORT" && !st.shortOff;
-      updBeam(r.beamLong, t, longActive ? st.longProg : 0, 0.5 + st.longProg * 0.9);
-      updBeam(r.beamShort, t, shortActive ? st.shortProg : 0, 0.5 + st.shortProg * 0.9);
+      // arc flows from the core to whichever side consensus leans, as it builds —
+      // visible regardless of the gate toggle (dimmer when that gate is off, like
+      // the ring) so you can watch the circuit form even with gates disabled.
+      const beamFor = (side: "LONG" | "SHORT", prog: number, off: boolean) =>
+        dir === side
+          ? Math.min(1, 0.32 + 0.68 * Math.max(prog, st.coreFill)) * (off ? 0.6 : 1)
+          : 0;
+      updBeam(r.beamLong, t, beamFor("LONG", st.longProg, st.longOff), 0.5 + st.longProg * 0.9);
+      updBeam(r.beamShort, t, beamFor("SHORT", st.shortProg, st.shortOff), 0.5 + st.shortProg * 0.9);
 
       // shock
       if (r.shockActive) {

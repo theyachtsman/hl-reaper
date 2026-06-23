@@ -36,7 +36,8 @@ from reaper.models.orderbook_imbalance import OrderbookImbalanceModel
 from reaper.models.regime_detector import RegimeDetectorModel
 from reaper.models.ta_model import TAModel
 from reaper.models.vwap_model import VWAPModel
-from reaper.risk.manager import CLOSE_PENDING_TIMEOUT_S, RiskManager, with_retry
+from reaper.risk.manager import (CLOSE_PENDING_TIMEOUT_S, CONF_GATE_EPS,
+                                  RiskManager, with_retry)
 from reaper.risk.state import BotState
 
 log = get_logger("bot")
@@ -475,6 +476,55 @@ class MakerTimeoutTracker:
         self._streaks.pop(coin, None)
 
 
+class ArmedSignalTracker:
+    """Per-coin arm-time tracker for the armed-signal TTL (2026-06-22).
+
+    A signal "arms" the moment it first clears every entry gate (can_open) on a
+    coin+band. The maker order may then sit unfilled and retry across several
+    10s cycles before it fills via taker fallback or is dropped. This tracker
+    anchors the arm time so the loop can bound that retry window: once an armed
+    setup ages past its band TTL the original votes/conf no longer reflect
+    current microstructure, so the entry is abandoned instead of filled stale.
+
+    Distinct from MakerTimeoutTracker — that one COUNTS consecutive maker
+    non-fills to drive the taker fallback; this one TIMES how long a setup has
+    been armed. They coexist: the TTL drop sits upstream of the fallback. The
+    arm time resets on a direction flip, a band change, or explicitly via
+    reset() (called on any fill, drop, or TTL expiry)."""
+
+    def __init__(self):
+        self._armed: dict[str, dict] = {}
+
+    def age(self, coin: str, band: str, direction: str,
+            now: float | None = None) -> float | None:
+        """Seconds since the signal armed, or None if this exact coin+band+
+        direction is not currently armed (a flip or fresh setup is not yet
+        armed, so it has no age to test against the TTL)."""
+        now = time.time() if now is None else now
+        s = self._armed.get(coin)
+        if s is None or s["band"] != band or s["direction"] != direction:
+            return None
+        return now - s["armed_at"]
+
+    def arm(self, coin: str, band: str, direction: str,
+            now: float | None = None) -> None:
+        """Stamp the arm time on the FIRST armed attempt; a no-op while the same
+        setup stays armed so the TTL always measures from the original arm, not
+        the latest retry."""
+        now = time.time() if now is None else now
+        s = self._armed.get(coin)
+        if s is None or s["band"] != band or s["direction"] != direction:
+            self._armed[coin] = {"band": band, "direction": direction,
+                                 "armed_at": now}
+
+    def is_armed(self, coin: str, band: str) -> bool:
+        s = self._armed.get(coin)
+        return s is not None and s["band"] == band
+
+    def reset(self, coin: str):
+        self._armed.pop(coin, None)
+
+
 def run_taker_fallback(coin, is_long, usd_size, *, models, aggregator, buf, xc,
                        db, min_confidence, min_model_agreement,
                        exhaustion_atr_mult, start_mid, interval=None,
@@ -499,8 +549,8 @@ def run_taker_fallback(coin, is_long, usd_size, *, models, aggregator, buf, xc,
     degraded = None
     if sig.direction != direction:
         degraded = f"direction {sig.direction} != {direction}"
-    elif sig.confidence < min_confidence:
-        degraded = f"conf {sig.confidence:.2f} < {min_confidence:.2f}"
+    elif sig.confidence < min_confidence - CONF_GATE_EPS:
+        degraded = f"conf {sig.confidence:.3f} < {min_confidence:.3f}"
     elif agreement < min_model_agreement:
         degraded = f"agreement {agreement} < {min_model_agreement}"
     if degraded:
@@ -562,7 +612,8 @@ def run_taker_fallback(coin, is_long, usd_size, *, models, aggregator, buf, xc,
                  price=fill_px, band=band,
                  status="taker_fallback" if fill_px else "taker_failed",
                  note=(f"maker:taker_fallback conf={sig.confidence:.2f} "
-                       f"votes={agreement} fmap={fmap} {st_note}"))
+                       f"votes={agreement} active={sig.long_votes + sig.short_votes} "
+                       f"fmap={fmap} {st_note}"))
     return {"status": "taker_fallback" if fill_px else "taker_failed",
             "fill_px": fill_px, "sig": sig, "agreement": agreement}
 
@@ -616,6 +667,10 @@ def main():
     fallback_window_s = float(t_raw.get("maker_timeout_fallback_window_s", 180))
     fallback_exhaustion_mult = float(
         t_raw.get("maker_timeout_exhaustion_atr_mult", 1.5))
+    # armed-signal TTL ceilings (2026-06-22) — drop a setup that has stayed
+    # armed (clearing the gate but not filling) longer than this; per-band.
+    scalp_armed_ttl = float(t_raw.get("scalp_armed_ttl_seconds", 20))
+    trend_armed_ttl = float(t_raw.get("trend_armed_ttl_seconds", 45))
     # LONG structural gate (2026-06-17): supersedes the old Change B OB/VWAP
     # confirmation. A LONG must clear ALL of {spot leading, OI rising, book
     # bid-heavy}, else skip. SHORTs (the working side) are never gated.
@@ -660,6 +715,13 @@ def main():
     # spot-leading check. Best-effort: a spot outage just fails LONGs safe.
     spot_poller = SpotPoller(cfg.coins, PROJECT_ROOT / "data" / "recorded",
                              buf=buf, poll_s=5.0, record=False)
+    # prime candle buffers over REST so TA / MeanReversion / VWAP work
+    # immediately after a (re)start instead of waiting hours for the 5m/1h
+    # deques to fill live (HL's candle WS sends no history).
+    try:
+        feed.backfill(per_interval=cfg.candle_buffer_size)
+    except Exception as e:
+        log.warning("candle backfill skipped: %s", e)
     feed.start()
     pollers.start()
     spot_poller.start()
@@ -691,7 +753,12 @@ def main():
         funding_hard_block_short_enabled=bool(
             r_raw.get("funding_hard_block_short_enabled", False)),
         funding_hard_block_short_conf=float(
-            r_raw.get("funding_hard_block_short_conf", 0.75)))
+            r_raw.get("funding_hard_block_short_conf", 0.75)),
+        funding_counter_trend_damp=float(
+            (cfg._raw.get("aggregator", {}) or {})
+            .get("funding_counter_trend_damp", 0.40)))
+    log.info("funding counter-trend dampening: x%.2f weight on counter-1h-trend "
+             "FUNDING votes", aggregator.funding_counter_trend_damp)
     if aggregator.funding_hard_block_enabled:
         log.info("funding HARD-block ENABLED — FundingRate SHORT conf >= %.2f "
                  "blocks all LONG entries", aggregator.funding_hard_block_conf)
@@ -715,6 +782,9 @@ def main():
                  short_struct["oi_rise_threshold"],
                  short_struct["ob_ask_threshold"])
     maker_streaks = MakerTimeoutTracker(fallback_n, fallback_window_s)
+    armed_signals = ArmedSignalTracker()
+    log.info("armed-signal TTL ENABLED — drop stale setups: scalp %.0fs, "
+             "trend %.0fs", scalp_armed_ttl, trend_armed_ttl)
     if entry_style == "maker" and fallback_enabled:
         log.info("maker timeout->taker fallback ENABLED — fire after %d "
                  "consecutive timeouts within %.0fs, skip if move > %.1fxATR",
@@ -823,8 +893,44 @@ def main():
         ok, reason = risk.can_open(coin, sig.direction, sig.confidence,
                                    agreement, coin_lev, band=band)
         if not ok:
-            log.debug("skip %s %s [%s]: %s", coin, sig.direction, band, reason)
+            # Fix 3 (2026-06-22): re-validate before each retry. The loop re-
+            # aggregates every cycle, so a coin that was already armed and is
+            # now failing can_open on conf/agreement is a setup that DEGRADED
+            # while its maker sat unfilled — abort it loudly (and clear the
+            # streak/arm) instead of silently letting the next cycle re-arm.
+            if (armed_signals.is_armed(coin, band)
+                    and ("confidence" in reason or "agreement" in reason)):
+                log.info("[RETRY_ABORT] %s %s signal degraded on retry — %s, "
+                         "dropping", coin, band, reason)
+                db.log_trade(coin, sig.direction, "OPEN", band=band,
+                             status="retry_abort",
+                             note=f"maker:retry_abort ({reason})")
+                armed_signals.reset(coin)
+                maker_streaks.reset(coin)
+            else:
+                log.debug("skip %s %s [%s]: %s", coin, sig.direction, band,
+                          reason)
             return False
+
+        # Fix 2 (2026-06-22): armed-signal TTL. can_open just passed, so the
+        # signal is armed. If it armed more than the band's TTL ago it has been
+        # retrying too long to still trust the original setup — drop it (do NOT
+        # submit another order) before this attempt goes out. age() is None on
+        # the first armed attempt, so the very first submission is never
+        # blocked; arm() then stamps the time used by later cycles.
+        armed_ttl = scalp_armed_ttl if band == "scalp" else trend_armed_ttl
+        armed_age = armed_signals.age(coin, band, sig.direction)
+        if armed_age is not None and armed_age > armed_ttl:
+            log.info("[ARMED_TTL] %s %s %s dropped — armed %.1fs ago, stale "
+                     "signal", coin, band, sig.direction, armed_age)
+            db.log_trade(coin, sig.direction, "OPEN", band=band,
+                         status="armed_ttl_drop",
+                         note=f"maker:armed_ttl_drop (armed {armed_age:.1f}s "
+                              f"ago > {armed_ttl:.0f}s)")
+            armed_signals.reset(coin)
+            maker_streaks.reset(coin)
+            return False
+        armed_signals.arm(coin, band, sig.direction)
 
         lev = risk.clamp_leverage(coin_lev)
         atr = atr_from_candles(buf.latest_candles(coin, "1m", 60))
@@ -836,10 +942,13 @@ def main():
         weights = SCALP_WEIGHTS if band == "scalp" else TREND_WEIGHTS
         interval = scalp_interval if band == "scalp" else trend_interval
         fmap = "smooth" if funding_smooth else "binary"
+        # active = total non-FLAT directional voters (long+short); confidence is
+        # normalized over these, so it exposes how thin the consensus was.
+        active = sig.long_votes + sig.short_votes
 
-        log.warning("ENTRY %s %s [%s] conf=%.2f votes=%d regime=%s "
+        log.warning("ENTRY %s %s [%s] conf=%.2f votes=%d active=%d regime=%s "
                     "sl=%.4f tp=%.4f", sig.direction, coin, band,
-                    sig.confidence, agreement, sig.regime, sl, tp)
+                    sig.confidence, agreement, active, sig.regime, sl, tp)
 
         if entry_style == "maker":
             mres = xc.try_limit_entry(coin, is_long, coin_usd,
@@ -864,6 +973,7 @@ def main():
                             start_mid=streak["start_mid"], interval=interval,
                             weights=weights, regime_routing=False, band=band)
                         maker_streaks.reset(coin)
+                        armed_signals.reset(coin)
                         if fb["status"] == "taker_fallback" and fb["fill_px"]:
                             fill_px = fb["fill_px"]
                             sl, tp = risk.calc_sl_tp(
@@ -886,6 +996,7 @@ def main():
                                  status=mres["status"], note=note)
                 return False
             maker_streaks.reset(coin)
+            armed_signals.reset(coin)
         else:
             res = with_retry(lambda: xc.market_open(coin, is_long, coin_usd),
                              f"market_open({coin})")
@@ -896,18 +1007,19 @@ def main():
             fill_px, note = parse_fill(res)
 
         if fill_px:
+            armed_signals.reset(coin)  # position opened — clear the arm clock
             sl, tp = risk.calc_sl_tp(coin, fill_px, is_long, atr, band=band)
             risk.register_entry(coin, fill_px, sl, tp, is_long, band=band)
             alerts.send(
                 f"OPEN {sig.direction} {coin} [{band}] @ {fill_px}\n"
-                f"conf={sig.confidence:.2f} votes={agreement} "
+                f"conf={sig.confidence:.2f} votes={agreement} active={active} "
                 f"regime={sig.regime}\nsl={sl:.4f} tp={tp:.4f}")
         db.log_trade(coin, sig.direction, "OPEN",
                      size=coin_usd / (fill_px or entry_ref),
                      price=fill_px, leverage=lev, band=band,
                      status="filled" if fill_px else "failed",
                      note=f"conf={sig.confidence:.2f} votes={agreement} "
-                          f"fmap={fmap} {note}")
+                          f"active={active} fmap={fmap} {note}")
         return bool(fill_px)
 
     def handle_command(command: str) -> str:
@@ -939,6 +1051,28 @@ def main():
             else:
                 risk._set_state(BotState(target), "dashboard set_state")
             return f"state -> {target}"
+        if cmd.startswith("set_sltp/"):
+            # manual SL/TP override from the dashboard chart sliders:
+            # set_sltp/<coin>/<sl>/<tp>. Applies to the in-trade tracker so the
+            # bot manages the position to the new levels (trailing may still
+            # tighten the SL further in the favorable direction).
+            parts = cmd.split("/")
+            if len(parts) != 4:
+                raise ValueError(f"bad set_sltp command {cmd!r}")
+            coin = parts[1]
+            if coin not in cfg.coins:
+                raise ValueError(f"unknown coin {coin}")
+            try:
+                new_sl, new_tp = float(parts[2]), float(parts[3])
+            except ValueError:
+                raise ValueError(f"bad sl/tp in {cmd!r}")
+            ok_set, msg = risk.set_manual_sltp(coin, new_sl, new_tp)
+            if not ok_set:
+                raise ValueError(msg)
+            # not logged to the trades table on purpose: the marker/history
+            # reconstruction treats any non-OPEN/BE_LOCK row as a CLOSE, which
+            # would break OPEN/CLOSE pairing. The bot log + COMMAND log cover it.
+            return f"set {coin} sl={new_sl:g} tp={new_tp:g}"
         raise ValueError(f"unknown command {cmd!r}")
 
     # Phase 8.6: cascade bounce — event-driven track, separate from ensemble
@@ -1001,6 +1135,8 @@ def main():
                 t_raw.get("maker_timeout_exhaustion_atr_mult", 1.5))
             maker_streaks.n = fallback_n
             maker_streaks.window_s = fallback_window_s
+            scalp_armed_ttl = float(t_raw.get("scalp_armed_ttl_seconds", 20))
+            trend_armed_ttl = float(t_raw.get("trend_armed_ttl_seconds", 45))
             long_struct = long_structural_params(
                 t_raw, cfg._raw.get("models", {}) or {})
             short_struct = short_structural_params(
@@ -1025,6 +1161,9 @@ def main():
                 r_raw.get("funding_hard_block_short_enabled", False))
             aggregator.funding_hard_block_short_conf = float(
                 r_raw.get("funding_hard_block_short_conf", 0.75))
+            aggregator.funding_counter_trend_damp = float(
+                (cfg._raw.get("aggregator", {}) or {})
+                .get("funding_counter_trend_damp", 0.40))
             # funding mapping A/B switch — hot-reloaded onto the model and
             # stamped on each OPEN trade note (fmap=) for clean attribution.
             funding_smooth = bool(
@@ -1258,7 +1397,17 @@ def main():
                                      "flat": trend_sig.flat_votes,
                                      **trend_sig.meta})
 
-                    # TREND first (priority), then SCALP if the coin is still free
+                    # TREND first (priority), then SCALP if the coin is still free.
+                    # Fix 1 (2026-06-22): order submission is SAME-ITERATION — the
+                    # signal is aggregated immediately above and open_entry()
+                    # submits the maker order synchronously here, in this cycle.
+                    # There is no armed queue deferred to the next loop, so the
+                    # arm->submit latency floor is just the per-coin model compute
+                    # time (sub-second), not a 10s cycle. (Coins later in the list
+                    # do wait on earlier coins' maker timeouts, but each coin's
+                    # signal is re-aggregated right before its own submit, so it is
+                    # never stale at submission — and the armed-signal TTL above
+                    # bounds the across-cycle case.)
                     opened = False
                     if trend_band_enabled and trend_sig.direction != FLAT:
                         opened = open_entry(coin, trend_sig, "trend", g_allowed,
@@ -1277,6 +1426,16 @@ def main():
                          "bands": {"scalp_enabled": scalp_band_enabled,
                                    "trend_enabled": trend_band_enabled}},
                         default=str))
+
+            # publish the in-trade tracker (entry/sl/tp/band per open coin) to
+            # bot_state so the dashboard chart can draw the live TP/SL/entry
+            # overlay. The tracker is the source of truth for sl/tp (it moves on
+            # trailing-stop / breakeven-lock), and it's already kept in sync with
+            # the real positions (closed coins are dropped from it each cycle).
+            db.set_state("pos_track", json.dumps({
+                c: {"entry": t["entry_px"], "sl": t["sl"], "tp": t["tp"],
+                    "is_long": t["is_long"], "band": t.get("band")}
+                for c, t in risk._pos_track.items()}, default=str))
 
             # d. heartbeat + status
             hb_path.write_text(str(int(time.time())))

@@ -268,7 +268,7 @@ def _fills_sync_loop():
             first = False
         except Exception as e:
             log.warning("fills sync loop error: %s", e)
-        time.sleep(60)
+        time.sleep(20)
 
 
 threading.Thread(target=_fills_sync_loop, daemon=True).start()
@@ -434,7 +434,9 @@ SKIP_STATUSES = (
 @app.get("/api/trades")
 def trades(limit: int = 200, coin: str | None = None,
            action: str | None = None, status: str | None = None,
-           band: str | None = None, include_skips: bool = False):
+           band: str | None = None, include_skips: bool = False,
+           order: str = "desc", start: int | None = None,
+           end: int | None = None):
     """Trade audit log: real OPEN/CLOSE/TEST actions. Skip statuses are
     excluded by default. Returns {total, trades} so the UI can show how many
     rows matched the active filters vs how many are displayed."""
@@ -458,9 +460,16 @@ def trades(limit: int = 200, coin: str | None = None,
     if band:
         clauses.append("band = ?")
         params.append(band)
+    if start is not None:
+        clauses.append("ts >= ?")
+        params.append(start)
+    if end is not None:
+        clauses.append("ts <= ?")
+        params.append(end)
     where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    direction = "ASC" if str(order).lower() == "asc" else "DESC"
     total = rows(f"SELECT COUNT(*) AS n FROM trades{where}", *params)[0]["n"]
-    out = rows(f"SELECT * FROM trades{where} ORDER BY ts DESC LIMIT ?",
+    out = rows(f"SELECT * FROM trades{where} ORDER BY ts {direction} LIMIT ?",
                *params, limit)
     return {"total": total, "trades": out}
 
@@ -609,6 +618,7 @@ def tickets():
             "regime": packed.get("regime"), "veto": veto,
             "block_reason": block_reason,
             "regime_bias": meta.get("regime_bias"),
+            "funding_dampen": meta.get("funding_dampen"),
             "long_gate": long_gate or None, "short_gate": short_gate or None,
             "would_fire": would_fire, "enabled": bands_enabled[band],
         }
@@ -721,6 +731,11 @@ def _exit_result(note: str) -> str:
         return "max hold"
     if "roundtrip" in n:
         return "roundtrip"
+    # manual close from the dashboard (Live/Controls "close" button -> bot
+    # close_coin command, reason note "dashboard close_coin command"). Surface
+    # it as an explicit exit reason so history shows it was manually stopped.
+    if "close_coin" in n or "manual" in n:
+        return "manual stop"
     head = (note or "").split("@")[0].strip()
     return head or "close"
 
@@ -807,12 +822,24 @@ def chart(coin: str, interval: str = "5m", limit: int = 200):
             })
 
     # open position (if any) from the account-state poller.
+    # live in-trade tracker (entry/sl/tp/band) published by the bot each loop —
+    # sl/tp move on trailing-stop / breakeven-lock, so this is the source of
+    # truth for the chart's TP/SL overlay (the bot owns it in-memory; the bridge
+    # can only see it via bot_state).
+    ptrack: dict = {}
+    try:
+        raw_pt = get_state("pos_track")
+        if raw_pt:
+            ptrack = json.loads(raw_pt)
+    except Exception:
+        ptrack = {}
     open_position = None
     for p in (cache.user or {}).get("assetPositions", []):
         q = p.get("position", {})
         if q.get("coin") != coin or float(q.get("szi") or 0) == 0:
             continue
         szi = float(q.get("szi") or 0)
+        pt = ptrack.get(coin) or {}
         # entry time: the most recent unmatched filled OPEN, if we have one
         entry_time = open_stack[-1]["time"] if open_stack else None
         open_position = {
@@ -821,6 +848,13 @@ def chart(coin: str, interval: str = "5m", limit: int = 200):
             "entry_time": entry_time,
             "unrealized_pnl": float(q.get("unrealizedPnl") or 0),
             "conf": open_stack[-1].get("conf") if open_stack else None,
+            "band": (open_stack[-1].get("band") if open_stack
+                     else pt.get("band")),
+            # TP/SL overlay inputs; sl/tp may be None if the tracker hasn't
+            # published yet (e.g. just after a bot restart) — the UI guards that.
+            "sl": pt.get("sl"),
+            "tp": pt.get("tp"),
+            "size": abs(szi),
         }
         break
 
@@ -1016,7 +1050,9 @@ def history_export(coin: str | None = None, direction: str | None = None,
 
 @app.get("/api/trades/export.csv")
 def trades_export(coin: str | None = None, action: str | None = None,
-                  status: str | None = None, include_skips: bool = False):
+                  status: str | None = None, include_skips: bool = False,
+                  band: str | None = None, start: int | None = None,
+                  end: int | None = None):
     """CSV of the raw trade audit log (OPEN/CLOSE/TEST actions), honoring the
     same filters as the audit table. Separate from the round-trip trades CSV —
     this is the per-action bot log, not reconstructed PnL. No row limit: exports
@@ -1039,6 +1075,15 @@ def trades_export(coin: str | None = None, action: str | None = None,
     if status:
         clauses.append("status = ?")
         params.append(status)
+    if band:
+        clauses.append("band = ?")
+        params.append(band)
+    if start is not None:
+        clauses.append("ts >= ?")
+        params.append(start)
+    if end is not None:
+        clauses.append("ts <= ?")
+        params.append(end)
     where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
     out = rows(f"SELECT * FROM trades{where} ORDER BY ts DESC", *params)
     buf = _io.StringIO()
@@ -1219,6 +1264,10 @@ CONFIG_SCHEMA: dict[str, dict] = {
     # zones (fallback), true = smoothed continuous mapping. Stamped on OPEN
     # trade notes as fmap=binary|smooth for attribution.
     "risk.funding_smooth_mapping_enabled": {"type": "bool"},
+    # FundingRate counter-1h-trend weight dampening (2026-06-23). Cuts FUNDING's
+    # aggregator weight when it votes against a sustained trend. 0.40 default.
+    "aggregator.funding_counter_trend_damp": {"type": "float", "min": 0.0,
+                                              "max": 1.0},
     "trading.short_confirmation_enabled": {"type": "bool"},
     "trading.short_confirmation_min": {"type": "int", "min": 0, "max": 5},
     # SHORT structural gate (2026-06-19) — mirror of the LONG gate
@@ -1273,7 +1322,7 @@ CONFIG_SCHEMA: dict[str, dict] = {
     "trading.trend_longs_enabled": {"type": "bool"},
     "trading.trend_shorts_enabled": {"type": "bool"},
     # SCALP band geometry + gate
-    "risk.scalp_min_confidence": {"type": "float", "min": 0.30, "max": 0.80},
+    "risk.scalp_min_confidence": {"type": "float", "min": 0.25, "max": 0.80},
     "risk.scalp_min_model_agreement": {"type": "int", "min": 1, "max": 6},
     "risk.scalp_atr_sl_multiplier": {"type": "float", "min": 0.5, "max": 3.0},
     "risk.scalp_take_profit_r": {"type": "float", "min": 1.0, "max": 4.0},
@@ -1612,6 +1661,17 @@ def bot_command(body: CommandBody,
     ok = (cmd in ("pause", "resume", "close_all")
           or (cmd.startswith("close_coin/") and cmd.split("/", 1)[1] in COINS)
           or cmd.startswith("set_state/"))
+    # manual SL/TP override from the chart sliders: set_sltp/<coin>/<sl>/<tp>.
+    # Light validation here (shape + known coin + parseable floats); the bot
+    # enforces the side constraints (tp/sl on the correct sides of entry).
+    if not ok and cmd.startswith("set_sltp/"):
+        parts = cmd.split("/")
+        if len(parts) == 4 and parts[1] in COINS:
+            try:
+                float(parts[2]); float(parts[3])
+                ok = True
+            except ValueError:
+                ok = False
     if not ok:
         raise HTTPException(400, f"unknown or unsafe command: {cmd!r}")
     with db() as c:

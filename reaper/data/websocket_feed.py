@@ -13,6 +13,13 @@ from reaper.logger import get_logger
 
 log = get_logger("ws_feed")
 
+# Candle interval string -> milliseconds (for REST backfill window math).
+_INTERVAL_MS = {
+    "1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900_000,
+    "30m": 1_800_000, "1h": 3_600_000, "2h": 7_200_000, "4h": 14_400_000,
+    "8h": 28_800_000, "12h": 43_200_000, "1d": 86_400_000,
+}
+
 
 class WebSocketFeed:
     def __init__(self, api_url: str, buffer: MarketBuffer,
@@ -26,6 +33,40 @@ class WebSocketFeed:
         self._reconnects = 0
 
     # ---------- lifecycle ----------
+    def backfill(self, per_interval: int = 500) -> int:
+        """Prime the candle buffers with recent history over REST.
+
+        Hyperliquid's candle WS subscription streams only live candles — it
+        sends no historical snapshot — so after a (re)start each deque fills
+        one candle per period: a 5m series needs ~2.5h to reach the 30 candles
+        TAModel requires, and a 1h series needs ~30h. Backfilling on startup
+        makes every model work immediately instead. Best-effort: a failed
+        coin/interval just falls back to filling live. Returns total candles
+        loaded. Call before start() so the buffer is warm before the loop runs.
+        """
+        rest = Info(self.api_url, skip_ws=True)
+        now_ms = int(time.time() * 1000)
+        total = 0
+        for iv in self.intervals:
+            span = _INTERVAL_MS.get(iv)
+            if span is None:
+                log.warning("backfill: unknown interval %s — skipped", iv)
+                continue
+            start = now_ms - per_interval * span
+            for coin in self.buf.coins:
+                try:
+                    candles = rest.candles_snapshot(coin, iv, start, now_ms)
+                except Exception as e:
+                    log.warning("backfill %s/%s failed: %s", coin, iv, e)
+                    continue
+                for c in candles or []:
+                    self.buf.on_candle(coin, iv, c)
+                total += len(candles or [])
+        log.info("candle backfill: %d candles over %d coins x %d intervals "
+                 "(<=%d each)", total, len(self.buf.coins),
+                 len(self.intervals), per_interval)
+        return total
+
     def start(self):
         self._connect()
         threading.Thread(target=self._monitor, daemon=True,
