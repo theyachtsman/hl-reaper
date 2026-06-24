@@ -731,9 +731,22 @@ def main():
     funding_model = FundingRateModel(
         db, smooth_mapping=bool(r_raw.get("funding_smooth_mapping_enabled",
                                           False)))
+    # TAModel regime-aware RSI thresholds (config models.ta.*; hot-reloaded each
+    # loop below). Kept as a named instance so the loop can update its trending
+    # thresholds in place, like funding_model.smooth_mapping.
+    ta_cfg = (m_raw.get("ta", {}) or {})
+    ta_trending = (ta_cfg.get("trending", {}) or {})
+    ta_ranging = (ta_cfg.get("ranging", {}) or {})
+    ta_model = TAModel(
+        trending_rsi_short=float(ta_trending.get("rsi_short", 48.0)),
+        trending_rsi_long=float(ta_trending.get("rsi_long", 38.0)),
+        trending_rsi_neutral_low=float(ta_trending.get("rsi_neutral_low", 48.0)),
+        trending_rsi_neutral_high=float(ta_trending.get("rsi_neutral_high", 55.0)),
+        ranging_rsi_short=float(ta_ranging.get("rsi_short", 68.0)),
+        ranging_rsi_long=float(ta_ranging.get("rsi_long", 32.0)))
     models = [
         RegimeDetectorModel(),   # first: publishes regime for the others
-        TAModel(),
+        ta_model,
         MeanReversionModel(),
         funding_model,
         OrderbookImbalanceModel(
@@ -1172,6 +1185,25 @@ def main():
                 log.warning("funding mapping -> %s",
                             "SMOOTH" if funding_smooth else "BINARY")
             funding_model.smooth_mapping = funding_smooth
+
+            # TA regime-aware trending RSI thresholds — hot-reload in place from
+            # the (override-merged) config each loop (like the funding mapping).
+            ta_t = ((cfg._raw.get("models", {}) or {}).get("ta", {}) or {}) \
+                .get("trending", {}) or {}
+            new_trending = {
+                "rsi_short": float(ta_t.get("rsi_short",
+                                            ta_model.trending["rsi_short"])),
+                "rsi_long": float(ta_t.get("rsi_long",
+                                           ta_model.trending["rsi_long"])),
+                "rsi_neutral_low": float(ta_t.get(
+                    "rsi_neutral_low", ta_model.trending["rsi_neutral_low"])),
+                "rsi_neutral_high": float(ta_t.get(
+                    "rsi_neutral_high", ta_model.trending["rsi_neutral_high"])),
+            }
+            if new_trending != ta_model.trending:
+                log.warning("LIVE CONFIG: TA trending thresholds %s -> %s",
+                            ta_model.trending, new_trending)
+                ta_model.trending = new_trending
 
             # --- drain one-shot control commands (controls page) -----------
             for cmd_id, command in db.get_pending_commands():

@@ -145,6 +145,23 @@ models:
   ml_min_confidence: 0.55
   ob_top_levels: 10
   ob_min_imbalance: 0.30
+  # TAModel regime-aware RSI thresholds (2026-06-24). In a clear trend the
+  # blend's mean-reversion components cancel its trend components and TA abstains
+  # (FLAT) right when the regime is TRENDING — starving the aggregator of voters.
+  # In TRENDING_UP/DOWN, TA switches to these relaxed RSI thresholds so it agrees
+  # with the trend at MODERATE RSI and only fades at a true extreme. RANGING /
+  # HIGH_VOL keep the original blend (ranging.* below is accepted for
+  # completeness but the RANGING path is deliberately unchanged). Hot-reloadable
+  # via live_config (keys models.ta.trending.*), re-read by run_bot each loop.
+  ta:
+    ranging:
+      rsi_short: 68            # (reference only — RANGING uses the original blend)
+      rsi_long: 32
+    trending:
+      rsi_short: 48            # downtrend: SHORT (trend-aligned) once RSI >= this
+      rsi_long: 38             # downtrend: LONG only at this extreme oversold
+      rsi_neutral_low: 48      # confidence anchor: firing edge -> conf ~0.40
+      rsi_neutral_high: 55     # +0.20 conf per (high-low) of extra RSI travel
 
 # ---- aggregator: regime-aware weight dampening ----
 aggregator:
