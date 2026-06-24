@@ -496,6 +496,35 @@ export default function ControlsPage() {
         </div>
       </Section>
 
+      {/* ═══ TA TRENDING MODE (regime-aware RSI thresholds) ═══ */}
+      <Section title="TA Trending Mode">
+        <div className="text-xs text-slate-500">
+          In a clear 1h trend the TA model&apos;s mean-reversion components cancel
+          its trend components and it abstains (FLAT) just when the regime is
+          trending — starving the aggregator of voters. In TRENDING_UP/DOWN it
+          switches to these relaxed RSI thresholds so it agrees with the trend at
+          moderate RSI and only fades at a true extreme. RANGING / HIGH_VOL keep
+          the original behavior. Thresholds are stated in downtrend terms;
+          uptrend mirrors them around RSI&nbsp;50. Applies to both bands.
+        </div>
+        <Slider cfg={cfg} ck="models.ta.trending.rsi_short"
+          label="Trend-aligned RSI threshold (SHORT in downtrend)"
+          min={40} max={70} step={1} dp={0} onApply={setKey} onReset={clearKey}
+          note="downtrend: SHORT once RSI ≥ this (uptrend LONG mirrors at 100−this)" />
+        <Slider cfg={cfg} ck="models.ta.trending.rsi_long"
+          label="Extreme-oversold RSI threshold (counter-trend LONG)"
+          min={20} max={50} step={1} dp={0} onApply={setKey} onReset={clearKey}
+          note="downtrend: LONG only at RSI ≤ this (mean-reversion bounce)" />
+        <Slider cfg={cfg} ck="models.ta.trending.rsi_neutral_low"
+          label="Confidence anchor — neutral low"
+          min={40} max={60} step={1} dp={0} onApply={setKey} onReset={clearKey}
+          note="firing edge → conf ~0.40" />
+        <Slider cfg={cfg} ck="models.ta.trending.rsi_neutral_high"
+          label="Confidence anchor — neutral high"
+          min={45} max={70} step={1} dp={0} onApply={setKey} onReset={clearKey}
+          note="+0.20 conf per (high − low) of extra RSI travel, capped 0.95" />
+      </Section>
+
       {/* ═══ OPEN POSITIONS ═══ */}
       <Section title="Open Positions">
         {(pos?.positions ?? []).length === 0 ? (

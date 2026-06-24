@@ -15,6 +15,7 @@ const NAV = [
   { href: "/risk", label: "Risk" },
   { href: "/history", label: "History" },
   { href: "/controls", label: "Controls" },
+  { href: "/docs", label: "Docs" },
 ];
 
 export default function Header() {
@@ -48,7 +49,7 @@ export default function Header() {
               href={n.href}
               className={clsx(
                 "px-3 py-1.5 rounded-lg text-sm border transition-colors",
-                path === n.href
+                (n.href === "/docs" ? path.startsWith("/docs") : path === n.href)
                   ? "border-[#1D9E75]/45 bg-[#1D9E75]/15 text-[#22c98e]"
                   : "border-transparent text-slate-400 hover:text-white hover:bg-[#1D9E75]/8"
               )}

@@ -190,6 +190,14 @@ export default function RelayCore({
     const coreSolidMat = new THREE.MeshBasicMaterial({ color: DIM, transparent: true, opacity: 0.85 });
     const coreSolid = new THREE.Mesh(new THREE.IcosahedronGeometry(0.5, 0), coreSolidMat); core.add(coreSolid);
     const coreGlow = mkGlow(DIM, 4.4); core.add(coreGlow);
+    // invisible hit-sphere, sized to the visible orb (not the wide glow halo),
+    // so only a pointer landing ON the orb starts a spin — the rest of the
+    // canvas (gates, nodes, empty space) is no longer draggable. It's a child of
+    // `core`, so it tracks the orb's scale (confidence pulse) automatically.
+    const coreHit = new THREE.Mesh(
+      new THREE.SphereGeometry(1.0, 16, 16),
+      new THREE.MeshBasicMaterial({ transparent: true, opacity: 0, depthWrite: false }));
+    core.add(coreHit);
 
     // nodes
     const nodeRadius = 1.9;
@@ -279,8 +287,21 @@ export default function RelayCore({
     // surface follow the finger (swipe right → spins right, swipe up → up).
     const dragAxis = new THREE.Vector3();
     const dragQuat = new THREE.Quaternion();
+    // raycast a pointer event into the scene and return true iff it lands on the
+    // orb hit-sphere — gates the spin so the orb alone is interactive.
+    const ndc = new THREE.Vector2();
+    const raycaster = new THREE.Raycaster();
+    const overOrb = (e: PointerEvent) => {
+      const rect = canvas.getBoundingClientRect();
+      if (!rect.width || !rect.height) return false;
+      ndc.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+      ndc.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+      raycaster.setFromCamera(ndc, camera);
+      return raycaster.intersectObject(coreHit, false).length > 0;
+    };
     const onPointerDown = (e: PointerEvent) => {
       const sp = sceneRef.current?.spin; if (!sp) return;
+      if (!overOrb(e)) return;       // pointer missed the orb — ignore entirely
       sp.dragging = true;
       sp.lastX = e.clientX; sp.lastY = e.clientY;
       sp.moved = 0;
@@ -290,7 +311,12 @@ export default function RelayCore({
       canvas.style.cursor = "grabbing";
     };
     const onPointerMove = (e: PointerEvent) => {
-      const sp = sceneRef.current?.spin; if (!sp || !sp.dragging) return;
+      const sp = sceneRef.current?.spin; if (!sp) return;
+      if (!sp.dragging) {
+        // hover feedback: grab cursor only while actually over the orb
+        canvas.style.cursor = overOrb(e) ? "grab" : "default";
+        return;
+      }
       const dx = e.clientX - sp.lastX, dy = e.clientY - sp.lastY;
       sp.lastX = e.clientX; sp.lastY = e.clientY;
       sp.moved += Math.abs(dx) + Math.abs(dy);
@@ -326,7 +352,7 @@ export default function RelayCore({
         } else sp.omega.set(0, 0, 0);
       } else sp.omega.set(0, 0, 0);
     };
-    canvas.style.cursor = "grab";
+    canvas.style.cursor = "default";
     canvas.addEventListener("pointerdown", onPointerDown);
     canvas.addEventListener("pointermove", onPointerMove);
     canvas.addEventListener("pointerup", onPointerUp);

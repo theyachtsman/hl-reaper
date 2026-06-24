@@ -241,14 +241,25 @@ export default function SignalsPage() {
     if (coin && coins.length && !coins.includes(coin)) setCoin("");
   }, [coin, coins]);
 
-  // latest aggregated signal per coin for the selected band (signals table
-  // holds AGGREGATOR_SCALP / AGGREGATOR_TREND rows since the dual-band split)
-  const aggModel = `AGGREGATOR_${band.toUpperCase()}`;
+  const bandsEnabled = live?.bands ?? { scalp: true, trend: true };
+  const enabledBands = (["scalp", "trend"] as Band[]).filter((b) => bandsEnabled[b]);
+  // follow the active band(s) from Controls: a band disabled there is hidden on
+  // this page, and the view falls back to whichever band is still live. Render
+  // off `effectiveBand` so there's no flash of the disabled band before the
+  // state syncs. (If somehow BOTH are off, keep the current selection.)
+  const effectiveBand: Band =
+    bandsEnabled[band] || enabledBands.length === 0 ? band : enabledBands[0];
+  useEffect(() => {
+    if (live?.bands && effectiveBand !== band) setBand(effectiveBand);
+  }, [live?.bands, effectiveBand, band]);
+
+  // latest aggregated signal per coin for the active band (signals table holds
+  // AGGREGATOR_SCALP / AGGREGATOR_TREND rows since the dual-band split)
+  const aggModel = `AGGREGATOR_${effectiveBand.toUpperCase()}`;
   const aggByCoin: Record<string, any> = {};
   for (const s of signals ?? []) {
     if (s.model === aggModel && !aggByCoin[s.coin]) aggByCoin[s.coin] = s;
   }
-  const bandsEnabled = live?.bands ?? { scalp: true, trend: true };
   const showCoins = coin ? [coin] : coins;
 
   if (activeCoins === null) {
@@ -278,23 +289,39 @@ export default function SignalsPage() {
             {c || "ALL"}
           </button>
         ))}
-        <div className="flex items-center gap-1 rounded-full border border-edge p-0.5 md:ml-auto">
-          {(["scalp", "trend"] as Band[]).map((b) => (
-            <button key={b} onClick={() => setBand(b)}
-              className={clsx(
-                "px-2.5 py-0.5 rounded-full text-[11px] font-semibold uppercase transition",
-                band === b
-                  ? b === "scalp" ? "bg-cyan-500/25 text-cyan-200" : "bg-purple-500/25 text-purple-200"
-                  : "text-slate-500 hover:text-slate-300",
-                !bandsEnabled[b] && "opacity-50")}
-              title={bandsEnabled[b] ? "" : `${b} band disabled`}>
-              {b}{!bandsEnabled[b] && " ⏻"}
-            </button>
-          ))}
-        </div>
+        {/* band selector follows Controls: only enabled bands appear. Both on
+            → a toggle; exactly one on → a static label (nothing to choose);
+            none on → a notice (the bot opens no entries in that state). */}
+        {enabledBands.length >= 2 ? (
+          <div className="flex items-center gap-1 rounded-full border border-edge p-0.5 md:ml-auto">
+            {enabledBands.map((b) => (
+              <button key={b} onClick={() => setBand(b)}
+                className={clsx(
+                  "px-2.5 py-0.5 rounded-full text-[11px] font-semibold uppercase transition",
+                  effectiveBand === b
+                    ? b === "scalp" ? "bg-cyan-500/25 text-cyan-200" : "bg-purple-500/25 text-purple-200"
+                    : "text-slate-500 hover:text-slate-300")}>
+                {b}
+              </button>
+            ))}
+          </div>
+        ) : enabledBands.length === 1 ? (
+          <span className={clsx(
+            "md:ml-auto px-2.5 py-0.5 rounded-full text-[11px] font-semibold uppercase border",
+            enabledBands[0] === "scalp"
+              ? "bg-cyan-500/20 text-cyan-200 border-cyan-500/40"
+              : "bg-purple-500/20 text-purple-200 border-purple-500/40")}
+            title={`only the ${enabledBands[0]} band is enabled in Controls`}>
+            {enabledBands[0]} band
+          </span>
+        ) : (
+          <span className="md:ml-auto text-[11px] mono uppercase text-amber-400/80">
+            ⏻ all bands disabled
+          </span>
+        )}
         {live?.ts && (
           <span className="text-xs text-slate-500">
-            {band} tickets live · {fmtTs(live.ts)}
+            {effectiveBand} tickets live · {fmtTs(live.ts)}
           </span>
         )}
       </div>
@@ -304,7 +331,7 @@ export default function SignalsPage() {
           AGGREGATOR row only when the bot isn't publishing tickets. */}
       <div className={clsx("grid gap-3", !coin && "md:grid-cols-3")}>
         {showCoins.map((c) => {
-          const v = live?.verdicts?.[c]?.[band];
+          const v = live?.verdicts?.[c]?.[effectiveBand];
           const agg = v ? verdictToAgg(c, v, live?.ts ?? null) : aggByCoin[c];
           return agg ? (
             <AggCard key={c} agg={agg} />
@@ -320,16 +347,16 @@ export default function SignalsPage() {
       {showCoins.map((c) => {
         // hide the parked non-voters (ML / LiqHeatmap) entirely — they're not
         // part of the active ensemble and shouldn't show as model cards/chips
-        const tickets: any[] = (live?.coins?.[c]?.[band]?.tickets ?? [])
+        const tickets: any[] = (live?.coins?.[c]?.[effectiveBand]?.tickets ?? [])
           .filter((t: any) => !INACTIVE_MODELS.has(t.model));
-        const gate = live?.verdicts?.[c]?.[band]?.long_gate;
-        const shortGate = live?.verdicts?.[c]?.[band]?.short_gate;
+        const gate = live?.verdicts?.[c]?.[effectiveBand]?.long_gate;
+        const shortGate = live?.verdicts?.[c]?.[effectiveBand]?.short_gate;
         return (
           <div key={c} className="card">
             <div className="label mb-2">
               {c} — live model tickets
               <span className={clsx("ml-2 text-[10px] uppercase",
-                band === "scalp" ? "text-cyan-300" : "text-purple-300")}>{band}</span>
+                effectiveBand === "scalp" ? "text-cyan-300" : "text-purple-300")}>{effectiveBand}</span>
             </div>
             {!tickets.length ? (
               <div className="text-slate-500 text-sm py-2">

@@ -1345,6 +1345,18 @@ CONFIG_SCHEMA: dict[str, dict] = {
     # Regime bias connector: 1h regime dampens counter-trend scalp confidence
     "risk.regime_counter_trend_penalty": {"type": "float", "min": 0.3,
                                           "max": 1.0},
+    # ---- TAModel regime-aware trending RSI thresholds (2026-06-24) ----------
+    # In TRENDING_UP/DOWN, TA uses these relaxed RSI thresholds so it agrees with
+    # the trend at moderate RSI instead of abstaining (FLAT). RANGING/HIGH_VOL
+    # keep the original blend. Re-read by run_bot each loop (hot-reload), same
+    # pattern as aggregator.funding_counter_trend_damp. Thresholds are stated in
+    # TRENDING_DOWN space; TRENDING_UP mirrors them around RSI 50.
+    "models.ta.trending.rsi_short": {"type": "float", "min": 40, "max": 70},
+    "models.ta.trending.rsi_long": {"type": "float", "min": 20, "max": 50},
+    "models.ta.trending.rsi_neutral_low": {"type": "float", "min": 40,
+                                           "max": 60},
+    "models.ta.trending.rsi_neutral_high": {"type": "float", "min": 45,
+                                            "max": 70},
 }
 
 # ---------------------------------------------------------------------------
