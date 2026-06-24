@@ -52,6 +52,20 @@ export default function AnalysisCoreSection() {
   const gQ = gates?.min_model_agreement ?? 3;
   const gC = gates?.min_confidence ?? 0.4;
   const bandsEnabled = live?.bands ?? { scalp: true, trend: true };
+  const setEnabledBands = useBandStore((s) => s.setEnabledBands);
+
+  // Publish enabled bands to the shared store, and if the active band gets
+  // disabled in Controls, fall back to the still-enabled band so the whole Live
+  // page (cores, Open Positions, chart timeframe — all driven by useBandStore)
+  // reflects the real single-band trading mode.
+  useEffect(() => {
+    setEnabledBands(bandsEnabled);
+    if (!bandsEnabled[band]) {
+      const other: Band = band === "scalp" ? "trend" : "scalp";
+      if (bandsEnabled[other]) setBand(other);
+    }
+  }, [bandsEnabled.scalp, bandsEnabled.trend, band, setBand, setEnabledBands]);
+
   // per-band structural-gate enabled flags (trend band has no structural gates)
   const gcfg = live?.gates?.scalp;
   const gatesEnabled = band === "scalp"
@@ -100,10 +114,14 @@ export default function AnalysisCoreSection() {
         <span className="label">Analysis Core</span>
         <span className="text-[10px] mono uppercase tracking-wider text-slate-500">
           {band === "scalp" ? "5m scalp" : "1h trend"} · 5-model ensemble
+          {bandsEnabled.scalp !== bandsEnabled.trend && (
+            <span className="text-amber-400/80"> · single-band mode</span>
+          )}
         </span>
-        {/* band selector — switches which band's verdict every core shows */}
+        {/* band selector — only bands enabled in Controls are shown, so a
+            disabled band disappears and a single enabled band reads as the mode. */}
         <div className="flex items-center gap-1 rounded-full border border-edge p-0.5">
-          {(["scalp", "trend"] as Band[]).map((b) => (
+          {(["scalp", "trend"] as Band[]).filter((b) => bandsEnabled[b]).map((b) => (
             <button key={b} onClick={() => setBand(b)}
               className={clsx(
                 "px-2.5 py-0.5 rounded-full text-[10px] font-semibold uppercase transition",
@@ -111,10 +129,8 @@ export default function AnalysisCoreSection() {
                   ? b === "scalp"
                     ? "bg-cyan-500/25 text-cyan-200"
                     : "bg-purple-500/25 text-purple-200"
-                  : "text-slate-500 hover:text-slate-300",
-                !bandsEnabled[b] && "opacity-50")}
-              title={bandsEnabled[b] ? "" : `${b} band disabled`}>
-              {b}{!bandsEnabled[b] && " ⏻"}
+                  : "text-slate-500 hover:text-slate-300")}>
+              {b}
             </button>
           ))}
         </div>

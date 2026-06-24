@@ -1435,6 +1435,11 @@ PRESETS: dict[str, dict] = {
             "trading.trend_longs_enabled": True,
             "trading.trend_shorts_enabled": True,
             **_TREND_WIDE,
+            # tuned trend-band defaults (captured from live config 2026-06-23):
+            # bigger size, looser confidence bar, no counter-trend penalty.
+            "risk.trend_position_size_usd": 175,
+            "risk.trend_min_confidence": 0.49,
+            "risk.regime_counter_trend_penalty": 1.0,
             "risk.funding_hard_block_enabled": True,
         },
     },

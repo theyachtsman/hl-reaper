@@ -111,8 +111,8 @@ function pct(x: any, dp = 3) {
  * plus the momentum cooldown (no recent pump, 2026-06-18) must ALL pass for a
  * LONG to fire. Published by the bot each loop. */
 function LongGate({ gate }: { gate: any }) {
-  if (!gate) return null;
-  const enabled = gate.enabled !== false;
+  // hide the gate entirely when it's disabled in Controls
+  if (!gate || gate.enabled === false) return null;
   const Row = ({ ok, label, detail }: { ok: boolean; label: string; detail: string }) => (
     <div className="flex items-center gap-2 text-xs mono">
       <span className={ok ? "text-emerald-400" : "text-red-400"}>{ok ? "✓" : "✗"}</span>
@@ -123,7 +123,7 @@ function LongGate({ gate }: { gate: any }) {
   return (
     <div className="mt-3 border-t border-edge/40 pt-2">
       <div className="label mb-1">
-        LONG structural gate {!enabled && <span className="text-slate-600">· disabled</span>}
+        LONG structural gate
       </div>
       <Row ok={!!gate.spot_leading} label="Spot leading"
         detail={`${pct(gate.spot_ret)} vs perp ${pct(gate.perp_ret)}`} />
@@ -148,8 +148,8 @@ function LongGate({ gate }: { gate: any }) {
  * loop. Reads live microstructure, overriding a regime detector that lags into
  * TRENDING_UP. */
 function ShortGate({ gate }: { gate: any }) {
-  if (!gate) return null;
-  const enabled = gate.enabled !== false;
+  // hide the gate entirely when it's disabled in Controls
+  if (!gate || gate.enabled === false) return null;
   const Row = ({ ok, label, detail }: { ok: boolean; label: string; detail: string }) => (
     <div className="flex items-center gap-2 text-xs mono">
       <span className={ok ? "text-emerald-400" : "text-red-400"}>{ok ? "✓" : "✗"}</span>
@@ -160,7 +160,7 @@ function ShortGate({ gate }: { gate: any }) {
   return (
     <div className="mt-3 border-t border-edge/40 pt-2">
       <div className="label mb-1">
-        SHORT structural gate {!enabled && <span className="text-slate-600">· disabled</span>}
+        SHORT structural gate
       </div>
       <Row ok={!!gate.spot_lagging} label="Spot lagging"
         detail={`${pct(gate.spot_ret)} vs perp ${pct(gate.perp_ret)}`} />

@@ -29,6 +29,19 @@ const GREEN = 0x1d9e75, RED = 0xe24b4a, GOLD = 0xffd166;
 const DIM = 0x3a4250, FLAT = 0x556070, DEAD = 0x2a3344;
 const dirHex = (d?: string) => d === "LONG" ? GREEN : d === "SHORT" ? RED : FLAT;
 
+// --- fidget-spin tuning ----------------------------------------------------
+// The core orb spins like a fidget spinner: a trackball drag rotates it about
+// whatever axis your swipe implies (grab from anywhere), and on release it
+// keeps that angular velocity and coasts down with friction. The model nodes
+// keep their own independent orbit and are NOT affected.
+const AUTO_SPEED = 0.12;   // idle drift (rad/sec) once it's spun all the way down
+const DRAG_RAD_PER_PX = 0.011; // screen px → rotation radians while dragging
+const THROW_BOOST = 2.2;   // multiplier on release velocity → faster fling spin
+const FRICTION = 0.985;    // momentum retained per (1/60)s — high = long fidget coast
+const MAX_OMEGA = 70;      // cap on throw speed (rad/sec) so a hard flick stays sane
+const IDLE_FLOOR = 0.18;   // |omega| below this → momentum done, fall back to drift
+const TAP_PX = 6;          // total movement under this counts as a tap, not a drag
+
 // the 5 active voting models (ML + LiqHeatmap are parked non-voters — not shown)
 const SLOTS: { model: string; abbr: string; dead?: boolean }[] = [
   { model: "TAModel", abbr: "TA" },
@@ -241,6 +254,14 @@ export default function RelayCore({
       nodes, gateShort, gateLong, beamShort, beamLong, shock, shockActive: false,
       curC: new THREE.Color(DIM), curShort: new THREE.Color(DIM),
       curLong: new THREE.Color(DIM), raf: 0,
+      // fidget-spin state, driven by the pointer handlers, read by animate()
+      spin: {
+        dragging: false,
+        lastX: 0, lastY: 0,      // previous pointer position
+        moved: 0,                // total px travelled this gesture (tap vs drag)
+        samples: [] as { t: number; x: number; y: number }[], // recent positions for fling velocity
+        omega: new THREE.Vector3(), // angular velocity: axis * rad/sec (world space)
+      },
     };
 
     const resize = () => {
@@ -250,6 +271,66 @@ export default function RelayCore({
     };
     resize();
     const ro = new ResizeObserver(resize); ro.observe(wrap);
+
+    // ---- drag / swipe to spin the orb (pointer = mouse + touch) ----
+    // Trackball model: a swipe rotates the orb about the axis perpendicular to
+    // the drag, so you can grab any point on the sphere and spin it any
+    // direction. Axis is (-dy, -dx, 0): screen-Y is down, so this makes the
+    // surface follow the finger (swipe right → spins right, swipe up → up).
+    const dragAxis = new THREE.Vector3();
+    const dragQuat = new THREE.Quaternion();
+    const onPointerDown = (e: PointerEvent) => {
+      const sp = sceneRef.current?.spin; if (!sp) return;
+      sp.dragging = true;
+      sp.lastX = e.clientX; sp.lastY = e.clientY;
+      sp.moved = 0;
+      sp.samples = [{ t: performance.now(), x: e.clientX, y: e.clientY }];
+      sp.omega.set(0, 0, 0);               // grabbing the orb freezes any coast
+      try { canvas.setPointerCapture(e.pointerId); } catch {}
+      canvas.style.cursor = "grabbing";
+    };
+    const onPointerMove = (e: PointerEvent) => {
+      const sp = sceneRef.current?.spin; if (!sp || !sp.dragging) return;
+      const dx = e.clientX - sp.lastX, dy = e.clientY - sp.lastY;
+      sp.lastX = e.clientX; sp.lastY = e.clientY;
+      sp.moved += Math.abs(dx) + Math.abs(dy);
+      const dist = Math.hypot(dx, dy);
+      if (dist >= 1e-4) {
+        dragAxis.set(-dy, -dx, 0).normalize();
+        dragQuat.setFromAxisAngle(dragAxis, dist * DRAG_RAD_PER_PX);
+        sceneRef.current.core.quaternion.premultiply(dragQuat); // rotate live, world space
+      }
+      // keep a short history of recent positions for the release fling velocity
+      const now = performance.now();
+      sp.samples.push({ t: now, x: e.clientX, y: e.clientY });
+      while (sp.samples.length > 2 && now - sp.samples[0].t > 120) sp.samples.shift();
+    };
+    const onPointerUp = (e: PointerEvent) => {
+      const sp = sceneRef.current?.spin; if (!sp || !sp.dragging) return;
+      sp.dragging = false;
+      canvas.style.cursor = "grab";
+      try { canvas.releasePointerCapture(e.pointerId); } catch {}
+      if (sp.moved < TAP_PX) { sp.omega.set(0, 0, 0); return; } // tap = stop, no fling
+      // fling velocity = average over the last ~110ms (immune to the finger
+      // naturally slowing in the final frame before lift).
+      const now = performance.now(), s = sp.samples;
+      let i = 0; while (i < s.length - 1 && now - s[i].t > 110) i++;
+      const a = s[i], b = s[s.length - 1];
+      const dt = (b.t - a.t) / 1000;
+      if (dt > 0) {
+        const vx = (b.x - a.x) / dt, vy = (b.y - a.y) / dt; // px/sec
+        const speedPx = Math.hypot(vx, vy);
+        if (speedPx > 5) {
+          dragAxis.set(-vy, -vx, 0).normalize();
+          sp.omega.copy(dragAxis).multiplyScalar(Math.min(MAX_OMEGA, speedPx * DRAG_RAD_PER_PX * THROW_BOOST));
+        } else sp.omega.set(0, 0, 0);
+      } else sp.omega.set(0, 0, 0);
+    };
+    canvas.style.cursor = "grab";
+    canvas.addEventListener("pointerdown", onPointerDown);
+    canvas.addEventListener("pointermove", onPointerMove);
+    canvas.addEventListener("pointerup", onPointerUp);
+    canvas.addEventListener("pointercancel", onPointerUp);
 
     const updBeam = (beam: any, t: number, intensity: number, speed: number) => {
       beam.mat.opacity = intensity;
@@ -261,14 +342,38 @@ export default function RelayCore({
       beam.points.geometry.attributes.position.needsUpdate = true;
     };
 
+    const spinQuat = new THREE.Quaternion();
+    const spinAxis = new THREE.Vector3();
+    const Y_AXIS = new THREE.Vector3(0, 1, 0);
     const clock = new THREE.Clock();
     const animate = () => {
       const r = sceneRef.current; if (!r) return;
-      const t = clock.getElapsedTime(), d = clock.getDelta();
+      // NOTE: getElapsedTime() internally calls getDelta(), so calling getDelta()
+      // after it returns ~0. Take the delta first, then read the accumulated time.
+      const d = clock.getDelta(), t = clock.elapsedTime;
       const st = target.current;
       const dc = dirHex(st.coreDir);
 
-      // nodes orbit + colour
+      // fidget spin: while dragging, onPointerMove rotates the orb live. On
+      // release it keeps the swipe's angular velocity and coasts down with
+      // friction; once spun all the way down it settles into a slow idle drift.
+      // (Only the core orb spins — the model nodes keep their own orbit below.)
+      const sp = r.spin;
+      if (!sp.dragging) {
+        const speed = sp.omega.length();
+        if (speed > IDLE_FLOOR) {
+          spinAxis.copy(sp.omega).normalize();
+          spinQuat.setFromAxisAngle(spinAxis, speed * d);
+          r.core.quaternion.premultiply(spinQuat);
+          sp.omega.multiplyScalar(Math.pow(FRICTION, d * 60)); // frame-rate-independent decay
+        } else {
+          sp.omega.set(0, 0, 0);
+          spinQuat.setFromAxisAngle(Y_AXIS, AUTO_SPEED * d);   // gentle resting drift
+          r.core.quaternion.premultiply(spinQuat);
+        }
+      }
+
+      // nodes orbit + colour (independent of the orb spin)
       const rot = t * 0.12;
       r.nodes.forEach((n: any, i: number) => {
         const a = n.angle + rot;
@@ -290,7 +395,7 @@ export default function RelayCore({
       (r.coreGlow.material as THREE.SpriteMaterial).color.copy(r.curC);
       r.core.scale.setScalar(1 + (armed ? 0 : st.coreFill * 0.14)
         + Math.sin(t * (armed ? 4 : 2)) * 0.04);
-      r.core.rotation.y += d * 0.15; r.core.rotation.x += d * 0.03;
+      // orb orientation is driven by the fidget-spin quaternion above
 
       // gates
       const applyGate = (gate: GateRefs, prog: number, off: boolean, baseHex: number,
@@ -340,6 +445,10 @@ export default function RelayCore({
 
     return () => {
       ro.disconnect();
+      canvas.removeEventListener("pointerdown", onPointerDown);
+      canvas.removeEventListener("pointermove", onPointerMove);
+      canvas.removeEventListener("pointerup", onPointerUp);
+      canvas.removeEventListener("pointercancel", onPointerUp);
       cancelAnimationFrame(sceneRef.current.raf);
       scene.traverse((o: any) => {
         if (o.geometry) o.geometry.dispose();
@@ -397,7 +506,8 @@ export default function RelayCore({
 
   return (
     <div ref={wrapRef} className="relative h-[300px] bg-[#070a0e] border-t border-edge overflow-hidden">
-      <canvas ref={canvasRef} className="block w-full h-full" />
+      <canvas ref={canvasRef} className="block w-full h-full"
+        style={{ touchAction: "none" }} />
       {/* tally + prominent confidence — the "so what" of the consensus core */}
       <div className="absolute top-2 left-0 right-0 text-center pointer-events-none">
         <div className="text-[10px] mono uppercase tracking-[0.14em]"
@@ -419,15 +529,19 @@ export default function RelayCore({
       {/* armed flash */}
       <div ref={flashRef} className="relay-flash absolute left-0 right-0 top-[38%] text-center
         text-[15px] font-bold mono uppercase tracking-wide pointer-events-none" />
-      {/* gate chips */}
+      {/* gate chips — hidden entirely when that gate is disabled */}
+      {!shortOff && (
       <div className="absolute bottom-2.5 left-2.5 pointer-events-none">
         <Chip side="short" gate={shortGate} off={shortOff}
           sig={shortSig} labels={["spot lag", "OI↑fall", "ask-heavy", "no dump"]} />
       </div>
+      )}
+      {!longOff && (
       <div className="absolute bottom-2.5 right-2.5 pointer-events-none">
         <Chip side="long" gate={longGate} off={longOff}
           sig={longSig} labels={["spot lead", "OI↑", "bid-heavy", "no pump"]} />
       </div>
+      )}
     </div>
   );
 }

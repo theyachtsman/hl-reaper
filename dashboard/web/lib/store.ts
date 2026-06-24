@@ -37,8 +37,15 @@ export type Band = "scalp" | "trend";
 type BandStore = {
   activeBand: Band;
   setActiveBand: (b: Band) => void;
+  // which bands are enabled in Controls (published by AnalysisCoreSection from
+  // /api/tickets) so every band selector on the Live page can grey out / refuse
+  // a disabled band and reflect single-band trading mode.
+  enabledBands: Record<Band, boolean>;
+  setEnabledBands: (e: Record<Band, boolean>) => void;
 };
 export const useBandStore = create<BandStore>((set) => ({
   activeBand: "scalp",
   setActiveBand: (activeBand) => set({ activeBand }),
+  enabledBands: { scalp: true, trend: true },
+  setEnabledBands: (enabledBands) => set({ enabledBands }),
 }));

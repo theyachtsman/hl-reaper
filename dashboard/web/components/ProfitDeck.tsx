@@ -477,6 +477,7 @@ export default function ProfitDeck() {
   // Positions panel below shows only the active band's positions.
   const activeBand = useBandStore((s) => s.activeBand);
   const setActiveBand = useBandStore((s) => s.setActiveBand);
+  const enabledBands = useBandStore((s) => s.enabledBands);
   const bandPositions = openPositions.filter((p) => p.band === activeBand);
 
   /* analysis-core 3D backdrop: a live ribbon of the account's equity path,
@@ -611,7 +612,7 @@ export default function ProfitDeck() {
             {/* band selector — shares the global Live-page band context with the
                 Analysis Core toggle, so switching here swaps both in sync */}
             <div className="flex items-center gap-1 rounded-full border border-edge p-0.5">
-              {(["scalp", "trend"] as Band[]).map((b) => (
+              {(["scalp", "trend"] as Band[]).filter((b) => enabledBands[b]).map((b) => (
                 <button key={b} onClick={() => setActiveBand(b)}
                   className={clsx(
                     "px-2 py-0.5 rounded-full text-[9px] font-semibold uppercase tracking-wider transition",
