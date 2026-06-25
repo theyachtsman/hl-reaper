@@ -6,13 +6,41 @@ Every entry passes through RiskManager.can_open(); every open position is
 managed by RiskManager.check_open_positions() each cycle."""
 import fcntl
 import json
+import os
 import signal
 import sqlite3
 import sys
+import threading
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+# Internal liveness watchdog. The main loop bumps _loop_alive at the end of
+# every cycle; a daemon thread force-exits the process if that timestamp goes
+# stale. systemd (Restart=always) then relaunches a fresh, warm bot. On
+# 2026-06-25 the loop wedged on a timeout-less socket and sat dead for ~4.4h
+# with an open, underwater position — a hung loop must self-heal, not linger.
+_loop_alive = [0.0]  # mutable so the main loop can bump it without `global`
+
+
+def _liveness_watchdog(stale_after_s: float):
+    log = get_logger("liveness")
+    log.info("internal liveness watchdog armed: force-exit if loop stalls "
+             ">%.0fs", stale_after_s)
+    while True:
+        time.sleep(5.0)
+        last = _loop_alive[0]
+        if last and (time.time() - last) > stale_after_s:
+            log.error("MAIN LOOP STALLED %.0fs — force-exiting for systemd "
+                      "restart", time.time() - last)
+            try:
+                alerts.send(f"🔁 bot loop stalled "
+                            f"{time.time() - last:.0f}s — self-restarting")
+            except Exception:
+                pass
+            time.sleep(1.0)  # give the alert thread a moment
+            os._exit(1)
 
 from reaper import alerts
 from reaper.aggregator import (REGIME_NAMES, SCALP_WEIGHTS, TREND_WEIGHTS,
@@ -32,6 +60,7 @@ from reaper.models.funding_rate import FundingRateModel
 from reaper.models.liquidation_heatmap import LiquidationHeatmapModel
 from reaper.models.mean_reversion import MeanReversionModel
 from reaper.models.ml_forecast import MLForecastModel
+from reaper.models.momentum_model import MomentumModel
 from reaper.models.orderbook_imbalance import OrderbookImbalanceModel
 from reaper.models.regime_detector import RegimeDetectorModel
 from reaper.models.ta_model import TAModel
@@ -744,6 +773,15 @@ def main():
         trending_rsi_neutral_high=float(ta_trending.get("rsi_neutral_high", 55.0)),
         ranging_rsi_short=float(ta_ranging.get("rsi_short", 68.0)),
         ranging_rsi_long=float(ta_ranging.get("rsi_long", 32.0)))
+    # MomentumModel price-velocity thresholds (config models.momentum.*; hot-
+    # reloaded each loop below). Named instance so the loop can update its
+    # thresholds in place, like ta_model / funding_model.
+    mom_cfg = (m_raw.get("momentum", {}) or {})
+    momentum_model = MomentumModel(
+        short_threshold=float(mom_cfg.get("short_threshold", -0.003)),
+        long_threshold=float(mom_cfg.get("long_threshold", 0.003)),
+        full_conf_move=float(mom_cfg.get("full_conf_move", 0.010)),
+        min_candles=int(mom_cfg.get("min_candles", 15)))
     models = [
         RegimeDetectorModel(),   # first: publishes regime for the others
         ta_model,
@@ -753,6 +791,7 @@ def main():
             top_levels=int(m_raw.get("ob_top_levels", 10)),
             min_imbalance=float(m_raw.get("ob_min_imbalance", 0.30))),
         VWAPModel(),
+        momentum_model,
         LiquidationHeatmapModel(),
         MLForecastModel(model_dir=ml_dir,
                         min_confidence=float(m_raw.get("ml_min_confidence",
@@ -769,7 +808,9 @@ def main():
             r_raw.get("funding_hard_block_short_conf", 0.75)),
         funding_counter_trend_damp=float(
             (cfg._raw.get("aggregator", {}) or {})
-            .get("funding_counter_trend_damp", 0.40)))
+            .get("funding_counter_trend_damp", 0.40)),
+        momentum_ranging_damp=float(
+            (m_raw.get("momentum", {}) or {}).get("ranging_weight_damp", 0.70)))
     log.info("funding counter-trend dampening: x%.2f weight on counter-1h-trend "
              "FUNDING votes", aggregator.funding_counter_trend_damp)
     if aggregator.funding_hard_block_enabled:
@@ -1112,6 +1153,13 @@ def main():
     hb_path = Path(cfg.heartbeat_path)
     last_status = 0.0
     prev_state = None
+    # Arm the internal liveness watchdog: if a cycle wedges (hung socket,
+    # deadlock) and stops bumping _loop_alive, self-restart via systemd well
+    # before the external dead-man's switch has to flatten the account.
+    _loop_alive[0] = time.time()
+    liveness_stale_after = max(90.0, 3.0 * cfg.heartbeat_interval)
+    threading.Thread(target=_liveness_watchdog, args=(liveness_stale_after,),
+                     daemon=True).start()
     alerts.send(f"paper trading loop started — network={cfg.network} "
                 f"coins={coins_active} size=${usd_size:.0f} "
                 f"entry={entry_style}")
@@ -1204,6 +1252,24 @@ def main():
                 log.warning("LIVE CONFIG: TA trending thresholds %s -> %s",
                             ta_model.trending, new_trending)
                 ta_model.trending = new_trending
+
+            # Momentum thresholds + ranging weight damp — hot-reload in place
+            # from the (override-merged) config each loop (like TA / funding).
+            mom_c = (cfg._raw.get("models", {}) or {}).get("momentum", {}) or {}
+            momentum_model.short_threshold = float(
+                mom_c.get("short_threshold", momentum_model.short_threshold))
+            momentum_model.long_threshold = float(
+                mom_c.get("long_threshold", momentum_model.long_threshold))
+            momentum_model.full_conf_move = float(
+                mom_c.get("full_conf_move", momentum_model.full_conf_move))
+            momentum_model.min_candles = int(
+                mom_c.get("min_candles", momentum_model.min_candles))
+            new_mom_damp = float(
+                mom_c.get("ranging_weight_damp", aggregator.momentum_ranging_damp))
+            if new_mom_damp != aggregator.momentum_ranging_damp:
+                log.warning("LIVE CONFIG: momentum ranging damp x%.2f -> x%.2f",
+                            aggregator.momentum_ranging_damp, new_mom_damp)
+                aggregator.momentum_ranging_damp = new_mom_damp
 
             # --- drain one-shot control commands (controls page) -----------
             for cmd_id, command in db.get_pending_commands():
@@ -1471,6 +1537,7 @@ def main():
 
             # d. heartbeat + status
             hb_path.write_text(str(int(time.time())))
+            _loop_alive[0] = time.time()  # feed the internal liveness watchdog
             if time.time() - last_status >= 60:
                 last_status = time.time()
                 log.info("STATUS | state=%s | %s | feed_age=%.1fs",

@@ -14,6 +14,13 @@ from reaper.logger import get_logger
 
 log = get_logger("exchange")
 
+# The hyperliquid SDK defaults its requests timeout to None (block forever).
+# A single stalled socket then wedges the whole process — this is what froze
+# the trading loop AND the watchdog's flatten() on 2026-06-25, leaving an
+# underwater position open with no stop-loss enforcement for ~4.4h. Bound
+# every REST call so a hung connection raises instead of hanging.
+REST_TIMEOUT_S = 20.0
+
 
 class ExchangeClient:
     def __init__(self, cfg):
@@ -24,6 +31,11 @@ class ExchangeClient:
         self.exchange = Exchange(
             wallet, cfg.api_url, account_address=cfg.account_address)
         self.info = Info(cfg.api_url, skip_ws=True)
+        # SDK Exchange/Info both subclass API, whose post() passes self.timeout
+        # straight to requests. The constructors don't expose it, so set it
+        # here — bounds order placement, cancels, market_close, user_state, etc.
+        self.exchange.timeout = REST_TIMEOUT_S
+        self.info.timeout = REST_TIMEOUT_S
         self.account_address = cfg.account_address
         # asset metadata: szDecimals per coin
         meta = self.info.meta()

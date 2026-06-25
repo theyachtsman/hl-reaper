@@ -5,11 +5,19 @@ Watches the bot heartbeat file; if it goes stale, cancels all orders and
 closes all positions through its own ExchangeClient, then waits for the
 heartbeat to recover before re-arming. The bot can die mid-position —
 this process makes sure dead bot != open exposure."""
+import socket
 import sys
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+# Belt-and-suspenders: even with the ExchangeClient REST timeout, force a hard
+# floor on every blocking socket op in this process so flatten() can NEVER hang
+# forever. This process makes no websocket connections (skip_ws=True), so a
+# global default timeout is safe here. On 2026-06-25 a timeout-less SDK socket
+# wedged flatten() mid-trip and the dead-man's switch went silent for ~4.4h.
+socket.setdefaulttimeout(30.0)
 
 from reaper import alerts
 from reaper.config import Config
