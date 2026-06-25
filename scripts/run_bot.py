@@ -636,15 +636,84 @@ def run_taker_fallback(coin, is_long, usd_size, *, models, aggregator, buf, xc,
     fmap = "smooth" if next(
         (m.smooth_mapping for m in models if m.name == "FundingRateModel"),
         False) else "binary"
-    db.log_trade(coin, direction, "OPEN",
-                 size=usd_size / (fill_px or cur_mid or 1),
-                 price=fill_px, band=band,
-                 status="taker_fallback" if fill_px else "taker_failed",
-                 note=(f"maker:taker_fallback conf={sig.confidence:.2f} "
-                       f"votes={agreement} active={sig.long_votes + sig.short_votes} "
-                       f"fmap={fmap} {st_note}"))
+    tid = db.log_trade(coin, direction, "OPEN",
+                       size=usd_size / (fill_px or cur_mid or 1),
+                       price=fill_px, band=band,
+                       status="taker_fallback" if fill_px else "taker_failed",
+                       note=(f"maker:taker_fallback conf={sig.confidence:.2f} "
+                             f"votes={agreement} active={sig.long_votes + sig.short_votes} "
+                             f"fmap={fmap} {st_note}"))
     return {"status": "taker_fallback" if fill_px else "taker_failed",
-            "fill_px": fill_px, "sig": sig, "agreement": agreement}
+            "fill_px": fill_px, "sig": sig, "agreement": agreement,
+            "trade_id": tid if fill_px else None}
+
+
+# model name -> signal_history vote_* column. MomentumModel got vote_momentum
+# (it's the 6th active voter, post-dates the original spec); ML/LiqHeatmap are
+# parked non-voters but still produce tickets, so their real FLAT vote is logged.
+_VOTE_COLS = {
+    "TAModel": "vote_ta",
+    "MeanReversionModel": "vote_meanrev",
+    "VWAPModel": "vote_vwap",
+    "FundingRateModel": "vote_funding",
+    "OrderbookImbalanceModel": "vote_ob",
+    "MomentumModel": "vote_momentum",
+    "RegimeDetectorModel": "vote_regime",
+    "LiquidationHeatmapModel": "vote_liqmap",
+    "MLForecastModel": "vote_ml",
+}
+
+
+def _signal_gate_eval(sig, threshold: float, required: int,
+                      conf_pre_bias: float | None = None):
+    """(cleared, reason) for the conf+agreement gate, in the spec's priority
+    order. Pure read — never mutates sig. `conf_pre_bias` is the scalp band's
+    confidence before apply_regime_bias dampened it (None for the trend band)."""
+    if str(sig.meta.get("block_reason", "")).startswith("funding_hard_block"):
+        return False, "funding_hard_block"
+    if sig.direction == LONG:
+        agreement = sig.long_votes
+    elif sig.direction == SHORT:
+        agreement = sig.short_votes
+    else:
+        agreement = max(sig.long_votes, sig.short_votes)
+    # regime dampening is reported only when it is what pushed an otherwise
+    # passing confidence below the gate — a more specific reason than plain conf.
+    if (conf_pre_bias is not None and conf_pre_bias >= threshold
+            and sig.confidence < threshold
+            and "counter_trend" in str(sig.meta.get("regime_bias", ""))):
+        return False, f"regime_bias_dampened to {sig.confidence:.3f}"
+    if sig.confidence < threshold:
+        return False, f"conf {sig.confidence:.3f} < {threshold:.3f}"
+    if agreement < required:
+        return False, f"agreement {agreement} < {required}"
+    return True, None
+
+
+def _signal_history_fields(coin: str, band: str, sig, tickets: list,
+                           threshold: float, required: int,
+                           conf_pre_bias: float | None, trade_id) -> dict:
+    """Build a signal_history row dict from an aggregator evaluation."""
+    import datetime as _dt
+    cleared, reason = _signal_gate_eval(sig, threshold, required, conf_pre_bias)
+    votes = {t.model: f"{t.direction}:{t.confidence:.2f}" for t in tickets}
+    # bool is a subclass of int — guard so a truthy non-id return never lands in
+    # the trade_id column as 0/1.
+    tid = trade_id if isinstance(trade_id, int) and not isinstance(
+        trade_id, bool) else None
+    row = {
+        "ts_utc": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+        "coin": coin, "band": band, "regime": sig.regime,
+        "final_direction": sig.direction,
+        "final_conf": round(sig.confidence, 4),
+        "active_voters": sig.long_votes + sig.short_votes,
+        "cleared_gate": 1 if cleared else 0,
+        "gate_block_reason": reason,
+        "trade_id": tid,
+    }
+    for model, col in _VOTE_COLS.items():
+        row[col] = votes.get(model, "INACTIVE:0.00")
+    return row
 
 
 def _pack_band(tickets: list, sig) -> dict:
@@ -889,8 +958,9 @@ def main():
     def open_entry(coin: str, sig, band: str, g_allowed: bool, g_detail: dict,
                    s_allowed: bool, s_detail: dict) -> bool:
         """Attempt ONE band entry for coin given its aggregated signal. Returns
-        True iff a position was opened (so the caller skips the other band on
-        this coin — one-way exchange owns one position per coin). Mirrors the
+        the opened trade's id (truthy) iff a position was opened, else False (so
+        the caller skips the other band on this coin — one-way exchange owns one
+        position per coin, and the id links signal_history to the trade). Mirrors the
         legacy single-band entry flow, scoped to the band's gate/geometry/size.
         Structural gates apply to the SCALP band only."""
         bp = risk.band_params(band)
@@ -1041,7 +1111,7 @@ def main():
                                 f"votes={fb['agreement']} "
                                 f"(maker timed out {streak['count']}x)\n"
                                 f"sl={sl:.4f} tp={tp:.4f}")
-                            return True
+                            return fb.get("trade_id") or True
                 if not triggered:
                     log.info("maker entry %s on %s [%s] — skipped "
                              "(timeout streak=%d/%d)", mres["status"], coin,
@@ -1068,13 +1138,13 @@ def main():
                 f"OPEN {sig.direction} {coin} [{band}] @ {fill_px}\n"
                 f"conf={sig.confidence:.2f} votes={agreement} active={active} "
                 f"regime={sig.regime}\nsl={sl:.4f} tp={tp:.4f}")
-        db.log_trade(coin, sig.direction, "OPEN",
-                     size=coin_usd / (fill_px or entry_ref),
-                     price=fill_px, leverage=lev, band=band,
-                     status="filled" if fill_px else "failed",
-                     note=f"conf={sig.confidence:.2f} votes={agreement} "
-                          f"active={active} fmap={fmap} {note}")
-        return bool(fill_px)
+        tid = db.log_trade(coin, sig.direction, "OPEN",
+                           size=coin_usd / (fill_px or entry_ref),
+                           price=fill_px, leverage=lev, band=band,
+                           status="filled" if fill_px else "failed",
+                           note=f"conf={sig.confidence:.2f} votes={agreement} "
+                                f"active={active} fmap={fmap} {note}")
+        return tid if fill_px else False
 
     def handle_command(command: str) -> str:
         """Execute one queued dashboard control command; return a status note."""
@@ -1461,6 +1531,9 @@ def main():
                         regime_routing=False, book_regime=trend_regime)
                     # regime bias: 1h (trend) regime DAMPENS counter-trend scalp
                     # confidence (never blocks). Trend signal is never modified.
+                    # Capture the pre-bias scalp conf so signal_history can tell
+                    # apart "dampened below gate" from a plain low-conf miss.
+                    scalp_conf_pre_bias = scalp_sig.confidence
                     apply_regime_bias(scalp_sig, trend_sig.regime, penalty)
 
                     # structural gates — SCALP band only; computed every loop for
@@ -1506,14 +1579,34 @@ def main():
                     # signal is re-aggregated right before its own submit, so it is
                     # never stale at submission — and the armed-signal TTL above
                     # bounds the across-cycle case.)
-                    opened = False
+                    trend_tid = scalp_tid = None
                     if trend_band_enabled and trend_sig.direction != FLAT:
-                        opened = open_entry(coin, trend_sig, "trend", g_allowed,
-                                            g_detail, s_allowed, s_detail)
-                    if (not opened and scalp_band_enabled
+                        trend_tid = open_entry(coin, trend_sig, "trend",
+                                               g_allowed, g_detail, s_allowed,
+                                               s_detail)
+                    if (not trend_tid and scalp_band_enabled
                             and scalp_sig.direction != FLAT):
-                        open_entry(coin, scalp_sig, "scalp", g_allowed, g_detail,
-                                   s_allowed, s_detail)
+                        scalp_tid = open_entry(coin, scalp_sig, "scalp",
+                                               g_allowed, g_detail, s_allowed,
+                                               s_detail)
+
+                    # signal_history: one row per band per cycle for this active
+                    # coin, traded or not. Additive diagnostics only — a failure
+                    # here must never break the loop.
+                    try:
+                        sp = risk.band_params("scalp")
+                        tpb = risk.band_params("trend")
+                        db.log_signal_history(_signal_history_fields(
+                            coin, "trend", trend_sig, trend_tickets,
+                            tpb["min_confidence"], tpb["min_model_agreement"],
+                            None, trend_tid))
+                        db.log_signal_history(_signal_history_fields(
+                            coin, "scalp", scalp_sig, scalp_tickets,
+                            sp["min_confidence"], sp["min_model_agreement"],
+                            scalp_conf_pre_bias, scalp_tid))
+                    except Exception as e:
+                        log.warning("signal_history logging failed for %s: %s",
+                                    coin, e)
 
                 if live_tickets:
                     db.set_state("live_tickets", json.dumps(

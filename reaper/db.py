@@ -54,6 +54,39 @@ CREATE TABLE IF NOT EXISTS bot_commands (
     executed_ts INTEGER,
     status TEXT DEFAULT 'pending'
 );
+-- signal_history: one row per aggregator evaluation per active coin+band per
+-- loop cycle, traded or not. Captures the per-model votes, the aggregated
+-- verdict, the gate decision (+ why it was blocked), and a link to the trade
+-- that opened from it (if any). Purely diagnostic — lets us see the 90% of
+-- cycles that never trade. The CREATE IF NOT EXISTS here also serves as the
+-- migration for existing installs (first run and upgrade are identical).
+CREATE TABLE IF NOT EXISTS signal_history (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts_utc      TEXT NOT NULL,          -- ISO8601 timestamp (UTC)
+    coin        TEXT NOT NULL,
+    band        TEXT NOT NULL,          -- scalp | trend
+    regime      TEXT,                   -- TRENDING_UP/DOWN, RANGING, HIGH_VOL, UNKNOWN
+    -- per-model votes as "DIRECTION:0.00" (e.g. "SHORT:0.72"); "INACTIVE:0.00"
+    -- if the model isn't present in the band's ticket set this cycle.
+    vote_ta         TEXT,
+    vote_meanrev    TEXT,
+    vote_vwap       TEXT,
+    vote_funding    TEXT,
+    vote_ob         TEXT,
+    vote_momentum   TEXT,               -- 6th active voter (added 2026-06-24)
+    vote_regime     TEXT,
+    vote_liqmap     TEXT,
+    vote_ml         TEXT,
+    final_direction TEXT,               -- LONG | SHORT | FLAT
+    final_conf      REAL,               -- 0.0–1.0
+    active_voters   INTEGER,            -- non-FLAT directional voters
+    cleared_gate    INTEGER NOT NULL,   -- 1 if conf>=threshold AND agreement met
+    gate_block_reason TEXT,             -- NULL if cleared, else the first reason
+    trade_id        INTEGER,            -- FK to trades(id), NULL if no trade opened
+    ts_inserted TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_signal_history_ts   ON signal_history(ts_utc);
+CREATE INDEX IF NOT EXISTS idx_signal_history_coin ON signal_history(coin, band, ts_utc);
 """
 
 
@@ -95,14 +128,36 @@ class DB:
                     "AND IFNULL(note,'')=IFNULL(?,'') AND ts > ? LIMIT 1",
                     (coin, note, now_ms - 60_000)).fetchone()
                 if dup:
-                    return
-            c.execute(
+                    return None
+            cur = c.execute(
                 "INSERT INTO trades (ts,coin,side,action,size,price,leverage,"
                 "order_id,status,note,band) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (now_ms, coin, side, action, size, price,
                  leverage, str(order_id) if order_id else None, status, note,
                  band),
             )
+            return cur.lastrowid
+
+    # signal_history columns in a fixed order — shared by the insert and the
+    # dashboard CSV export so the two never drift.
+    SIGNAL_HISTORY_COLS = (
+        "ts_utc", "coin", "band", "regime",
+        "vote_ta", "vote_meanrev", "vote_vwap", "vote_funding", "vote_ob",
+        "vote_momentum", "vote_regime", "vote_liqmap", "vote_ml",
+        "final_direction", "final_conf", "active_voters",
+        "cleared_gate", "gate_block_reason", "trade_id",
+    )
+
+    def log_signal_history(self, row: dict):
+        """Insert one aggregator-evaluation row. `row` keys are a subset of
+        SIGNAL_HISTORY_COLS; missing keys insert NULL. Caller wraps this in
+        try/except — logging must never crash the trading loop."""
+        cols = self.SIGNAL_HISTORY_COLS
+        with self._conn() as c:
+            c.execute(
+                f"INSERT INTO signal_history ({','.join(cols)}) "
+                f"VALUES ({','.join('?' * len(cols))})",
+                tuple(row.get(k) for k in cols))
 
     def insert_funding(self, coin: str, rows: list[dict]):
         with self._conn() as c:

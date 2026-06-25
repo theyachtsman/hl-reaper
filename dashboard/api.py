@@ -104,6 +104,22 @@ def _ensure_control_tables():
         c.execute("""CREATE TABLE IF NOT EXISTS preset_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT, preset_name TEXT NOT NULL,
             applied_ts INTEGER NOT NULL, applied_by TEXT DEFAULT 'dashboard')""")
+        # signal_history — the bot owns this table (reaper/db.py), but the bridge
+        # may start first on a brand-new DB; ensure it so the export endpoints
+        # never 500 before the bot's first run. Schema must match db.py.
+        c.execute("""CREATE TABLE IF NOT EXISTS signal_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, ts_utc TEXT NOT NULL,
+            coin TEXT NOT NULL, band TEXT NOT NULL, regime TEXT,
+            vote_ta TEXT, vote_meanrev TEXT, vote_vwap TEXT, vote_funding TEXT,
+            vote_ob TEXT, vote_momentum TEXT, vote_regime TEXT, vote_liqmap TEXT,
+            vote_ml TEXT, final_direction TEXT, final_conf REAL,
+            active_voters INTEGER, cleared_gate INTEGER NOT NULL,
+            gate_block_reason TEXT, trade_id INTEGER,
+            ts_inserted TEXT DEFAULT (datetime('now')))""")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_signal_history_ts "
+                  "ON signal_history(ts_utc)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_signal_history_coin "
+                  "ON signal_history(coin, band, ts_utc)")
 
 
 _ensure_control_tables()
@@ -1097,6 +1113,91 @@ def trades_export(coin: str | None = None, action: str | None = None,
                     t.get("size"), t.get("price"), t.get("leverage"),
                     t.get("status"), t.get("note")])
     fname = f"hl_reaper_audit_{int(time.time())}.csv"
+    return Response(buf.getvalue(), media_type="text/csv",
+                    headers={"Content-Disposition":
+                             f'attachment; filename="{fname}"'})
+
+
+# ---------------------------------------------------------------------------
+# signal_history — every aggregator evaluation, traded or not (diagnostic). The
+# CSV is the deliverable; the JSON/count endpoints feed the History page filters.
+# ---------------------------------------------------------------------------
+SIGNAL_HISTORY_CSV_COLS = (
+    "ts_utc", "coin", "band", "regime",
+    "vote_ta", "vote_meanrev", "vote_vwap", "vote_funding", "vote_ob",
+    "vote_momentum", "vote_regime", "vote_liqmap", "vote_ml",
+    "final_direction", "final_conf", "active_voters", "cleared_gate",
+    "gate_block_reason", "trade_id",
+)
+
+
+def _signal_history_where(coin, band, from_ts, to_ts, cleared_only):
+    """Build (where_sql, params) shared by the list/count/export endpoints.
+    ts_utc is stored as ISO8601 UTC, so lexicographic >=/<= on the ISO strings
+    is chronological."""
+    clauses, params = [], []
+    if coin:
+        clauses.append("coin = ?")
+        params.append(coin)
+    if band:
+        clauses.append("band = ?")
+        params.append(band)
+    if from_ts:
+        clauses.append("ts_utc >= ?")
+        params.append(from_ts)
+    if to_ts:
+        clauses.append("ts_utc <= ?")
+        params.append(to_ts)
+    if cleared_only:
+        clauses.append("cleared_gate = 1")
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    return where, params
+
+
+@app.get("/api/signal-history")
+def signal_history(coin: str | None = None, band: str | None = None,
+                   from_ts: str | None = None, to_ts: str | None = None,
+                   cleared_only: bool = False, limit: int = 500):
+    """Filtered signal_history rows, newest first. limit clamped to 5000."""
+    limit = max(1, min(int(limit), 5000))
+    where, params = _signal_history_where(coin, band, from_ts, to_ts,
+                                          cleared_only)
+    out = rows(f"SELECT * FROM signal_history{where} "
+               f"ORDER BY ts_utc DESC LIMIT ?", *params, limit)
+    return {"count": len(out), "rows": _json_safe(out)}
+
+
+@app.get("/api/signal-history/count")
+def signal_history_count(coin: str | None = None, band: str | None = None,
+                         from_ts: str | None = None, to_ts: str | None = None,
+                         cleared_only: bool = False):
+    """Row count for the current filters — drives the 'N signals in range'
+    preview without shipping the rows."""
+    where, params = _signal_history_where(coin, band, from_ts, to_ts,
+                                          cleared_only)
+    r = rows(f"SELECT COUNT(*) AS n FROM signal_history{where}", *params)
+    return {"count": r[0]["n"] if r else 0}
+
+
+@app.get("/api/signal-history/export.csv")
+def signal_history_export(coin: str | None = None, band: str | None = None,
+                          from_ts: str | None = None, to_ts: str | None = None,
+                          cleared_only: bool = False):
+    """CSV of signal_history honoring the same filters. No row limit — the
+    whole point is to analyze the blocked signals externally. Hand to Claude."""
+    import csv as _csv
+    import io as _io
+    where, params = _signal_history_where(coin, band, from_ts, to_ts,
+                                          cleared_only)
+    out = rows(f"SELECT * FROM signal_history{where} ORDER BY ts_utc DESC",
+               *params)
+    buf = _io.StringIO()
+    w = _csv.writer(buf)
+    w.writerow(SIGNAL_HISTORY_CSV_COLS)
+    for r in out:
+        w.writerow([r.get(c) for c in SIGNAL_HISTORY_CSV_COLS])
+    tag = lambda s: (s or "").replace(":", "").replace(" ", "")[:19] or "all"  # noqa: E731
+    fname = f"hl_reaper_signals_{tag(from_ts)}_{tag(to_ts)}.csv"
     return Response(buf.getvalue(), media_type="text/csv",
                     headers={"Content-Disposition":
                              f'attachment; filename="{fname}"'})

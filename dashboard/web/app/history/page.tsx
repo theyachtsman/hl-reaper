@@ -177,6 +177,28 @@ export default function HistoryPage() {
   const { data: audit } = usePoll<{ total: number; trades: AuditRow[] }>(
     `/api/trades?${auditQs}`, 15000);
 
+  // signal history export — every aggregator evaluation (traded or not). No
+  // in-page table: the CSV is the deliverable, analyzed externally. Default
+  // shows blocked signals too (cleared-only off) — that's the whole point.
+  const [shCoin, setShCoin] = useState("");
+  const [shBand, setShBand] = useState("");
+  const [shCleared, setShCleared] = useState(false);
+  const [shStart, setShStart] = useState("");
+  const [shEnd, setShEnd] = useState("");
+  // ts_utc in signal_history is ISO8601 UTC; turn the date inputs into ISO day
+  // bounds (UTC) the API can compare lexicographically.
+  const shQs = useMemo(() => {
+    const p = new URLSearchParams();
+    if (shCoin) p.set("coin", shCoin);
+    if (shBand) p.set("band", shBand);
+    if (shCleared) p.set("cleared_only", "true");
+    if (shStart) p.set("from_ts", shStart + "T00:00:00");
+    if (shEnd) p.set("to_ts", shEnd + "T23:59:59.999");
+    return p.toString();
+  }, [shCoin, shBand, shCleared, shStart, shEnd]);
+  const { data: shCount } = usePoll<{ count: number }>(
+    `/api/signal-history/count?${shQs}`, 30000);
+
   const s = summary;
   const span = s?.first_ts && s?.last_ts
     ? `${new Date(s.first_ts).toLocaleDateString()} – ${new Date(s.last_ts).toLocaleDateString()}`
@@ -504,6 +526,50 @@ export default function HistoryPage() {
             </tbody>
           </table>
         </div>
+      </div>
+
+      {/* signal history export — every aggregator evaluation, traded or not.
+          Export-only (CSV is analyzed externally); no in-page table. */}
+      <div className="card p-3">
+        <div className="flex items-center justify-between flex-wrap gap-2 mb-1">
+          <div className="label">
+            Signal History{" "}
+            <span className="text-slate-500">
+              ({shCount ? `~${shCount.count.toLocaleString()}` : "…"} signals in range)
+            </span>
+          </div>
+          <div className="flex gap-2 text-sm flex-wrap items-center">
+            <DateRange start={shStart} end={shEnd} onStart={setShStart} onEnd={setShEnd} />
+            <select value={shCoin} onChange={(e) => setShCoin(e.target.value)}
+              className="bg-edge/50 border border-edge rounded px-2 py-1">
+              <option value="">All coins</option>
+              {COINS.map((c) => <option key={c} value={c}>{c}</option>)}
+            </select>
+            <select value={shBand} onChange={(e) => setShBand(e.target.value)}
+              className="bg-edge/50 border border-edge rounded px-2 py-1">
+              <option value="">All bands</option>
+              <option value="scalp">Scalp</option>
+              <option value="trend">Trend</option>
+            </select>
+            <label className="flex items-center gap-1.5 text-xs text-slate-400 cursor-pointer select-none">
+              <input type="checkbox" checked={shCleared}
+                onChange={(e) => setShCleared(e.target.checked)} />
+              cleared gate only
+            </label>
+            <a
+              href={`/api/signal-history/export.csv?${shQs}`}
+              className="px-3 py-1.5 rounded-lg text-sm bg-edge hover:bg-edge/70 text-white"
+            >
+              ⬇ Export CSV{shCoin || shBand || shCleared || shStart || shEnd ? " (filtered)" : " (all)"}
+            </a>
+          </div>
+        </div>
+        <p className="text-[11px] text-slate-500">
+          Every aggregator evaluation for each active coin+band, every loop cycle —
+          including the ~90% that never trade. Per-model votes (DIRECTION:CONF), the
+          aggregated verdict, why it was gate-blocked, and the linked trade_id when one
+          opened. Leave “cleared gate only” off to see the blocked signals — that’s the point.
+        </p>
       </div>
     </div>
   );
