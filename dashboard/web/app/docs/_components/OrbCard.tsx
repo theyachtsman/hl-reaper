@@ -24,7 +24,7 @@ function Badge({ n }: { n: number }) {
   );
 }
 
-// stylised wireframe orb with the five model nodes orbiting it
+// stylised wireframe orb with the six model nodes orbiting it
 function Orb() {
   const cx = 150;
   const cy = 95;
@@ -37,6 +37,7 @@ function Orb() {
     { label: "VP", x: 176, y: 66, color: "#7c8696" },
     { label: "TA", x: 206, y: 92, color: GREEN },
     { label: "MR", x: 150, y: 140, color: "#7c8696" },
+    { label: "MO", x: 110, y: 118, color: "#7c8696" },
   ];
   return (
     <svg viewBox="0 0 300 190" className="w-full">
@@ -195,7 +196,7 @@ export default function OrbCard() {
           <Badge n={5} />
           <span className="w-9 text-slate-300 pl-6">cons</span>
           <span className="flex items-center gap-1">
-            {[GREEN, "#3a4250", "#3a4250", "#3a4250", "#3a4250"].map((c, i) => (
+            {[GREEN, "#3a4250", "#3a4250", "#3a4250", "#3a4250", "#3a4250"].map((c, i) => (
               <span
                 key={i}
                 className="inline-block w-[7px] h-[7px] rounded-full"
@@ -208,7 +209,7 @@ export default function OrbCard() {
             ))}
           </span>
           <span className="ml-auto tabular-nums" style={{ color: GREEN }}>
-            1L · 0S · 4F <span className="text-slate-400">· 1/5</span>
+            1L · 0S · 5F <span className="text-slate-400">· 1/6</span>
           </span>
         </div>
         <div className="relative flex items-center gap-2 text-[10px] mono">
@@ -226,7 +227,7 @@ export default function OrbCard() {
         <div className="relative text-center">
           <Badge n={7} />
           <div className="text-[10px] mono uppercase tracking-[0.14em]" style={{ color: GREEN }}>
-            consensus 1/5 LONG
+            consensus 1/6 LONG
           </div>
           <div className="mt-0.5 flex items-baseline justify-center gap-1.5 leading-none">
             <span className="text-[22px] font-bold mono tabular-nums" style={{ color: GREEN, textShadow: `0 0 12px ${GREEN}66` }}>

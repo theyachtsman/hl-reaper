@@ -43,6 +43,7 @@ const MODELS: [string, string][] = [
   ["FundingRateModel", "FUND"],
   ["OrderbookImbalanceModel", "BOOK"],
   ["VWAPModel", "VWAP"],
+  ["MomentumModel", "MOM"],
   ["LiquidationHeatmapModel", "LIQ"],
 ];
 /* permanently FLAT / zero-weight — see docs/ml_retrain_report.md (ML) and the

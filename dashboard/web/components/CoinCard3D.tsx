@@ -84,18 +84,11 @@ const ACCENT: Record<ColorMode, string> = {
   long: "#1D9E75", short: "#E24B4A", neutral: "#888880",
 };
 const PASS = "#1D9E75", FAIL = "#E24B4A";
-const ACTIVE_MODELS = 5; // TA / MR / FR / OB / VP — the directional ensemble
+const ACTIVE_MODELS = 6; // TA / MR / FR / OB / VP / MO — the directional ensemble
 const TREND_DEADBAND = 0.0025; // |Δ| below this over the window reads as flat
 
 const pct = (v?: number, dp = 3) =>
   v == null ? "—" : `${v >= 0 ? "+" : ""}${(v * 100).toFixed(dp)}%`;
-
-const MODEL_BADGES: [string, string][] = [
-  ["TAModel", "TA"], ["MeanReversionModel", "MR"], ["FundingRateModel", "FR"],
-  ["OrderbookImbalanceModel", "OB"], ["VWAPModel", "VP"],
-];
-const voteColor = (d?: string) =>
-  d === "LONG" ? PASS : d === "SHORT" ? FAIL : "#5b5b55";
 
 export default function CoinCard3D({ coin, mid, verdict, tickets, position, gates, gatesEnabled, depth }: {
   coin: string; mid?: number; verdict?: Verdict;
@@ -231,40 +224,8 @@ export default function CoinCard3D({ coin, mid, verdict, tickets, position, gate
         </div>
       </div>
 
-      {/* consensus-core agreement + confidence — sits BELOW the 3D scene block */}
-      <div className="px-3 py-2 border-t border-edge/60 bg-black/30 grid gap-1.5">
-        <div className="flex items-center gap-2 text-[10px] mono leading-none">
-          <span className="w-9 text-slate-200/90">cons</span>
-          <span className="flex items-center gap-1">
-            {MODEL_BADGES.map(([model]) => {
-              const t = tickets.find((x) => x.model === model);
-              const c = voteColor(t?.direction);
-              const lit = t?.direction === "LONG" || t?.direction === "SHORT";
-              return (
-                <span key={model} className="inline-block w-[7px] h-[7px] rounded-full"
-                  title={t ? `${model}: ${t.direction}` : model}
-                  style={lit ? { background: c, boxShadow: `0 0 5px ${c}` }
-                             : { background: "#ffffff14", border: "1px solid #ffffff22" }} />
-              );
-            })}
-          </span>
-          <span className="ml-auto tabular-nums"
-            style={{ color: dir === "LONG" ? PASS : dir === "SHORT" ? FAIL : "#cbd5e1" }}>
-            {verdict?.long_votes ?? 0}L · {verdict?.short_votes ?? 0}S · {verdict?.flat_votes ?? 0}F
-            <span className="text-slate-400"> · {verdict?.agreement ?? 0}/{ACTIVE_MODELS}</span>
-          </span>
-        </div>
-        <div className="flex items-center gap-2 text-[10px] mono">
-          <span className="w-9 text-slate-300/80">conf</span>
-          <div className="relative h-[3px] flex-1 rounded-full bg-white/15">
-            <div className="absolute inset-y-0 left-0 rounded-full"
-              style={{ width: `${Math.min(100, conf * 100)}%`, background: accent }} />
-          </div>
-          <span className="text-slate-100 tabular-nums">{conf.toFixed(2)}</span>
-        </div>
-      </div>
-
-      {/* consensus → gate relay — replaces the spoke wheel + gate info panel */}
+      {/* consensus core — confidence-led read-out + model-vote agreement live
+          inside RelayCore's overlay now, so the old duplicate strip is gone. */}
       <RelayCore
         direction={dir}
         confidence={conf}

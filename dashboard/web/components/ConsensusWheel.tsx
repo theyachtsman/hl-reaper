@@ -18,7 +18,7 @@ type Ticket = { model: string; direction: string; confidence: number; meta: any 
 const PASS = 0x1d9e75, FAIL = 0xe24b4a, FLAT = 0x556070, DEAD = 0x2a3344;
 const dirHex = (d?: string) => d === "LONG" ? PASS : d === "SHORT" ? FAIL : FLAT;
 
-// 7 ensemble slots; the 2 marked dead are permanently non-voting (kept for an
+// 8 ensemble slots; the 2 marked dead are permanently non-voting (kept for an
 // honest picture, matching the model badges / old constellation).
 const SLOTS: { model: string; abbr: string; dead?: boolean }[] = [
   { model: "TAModel", abbr: "TA" },
@@ -27,6 +27,7 @@ const SLOTS: { model: string; abbr: string; dead?: boolean }[] = [
   { model: "FundingRateModel", abbr: "FR" },
   { model: "OrderbookImbalanceModel", abbr: "OB" },
   { model: "VWAPModel", abbr: "VP" },
+  { model: "MomentumModel", abbr: "MO" },
   { model: "LiquidationHeatmapModel", abbr: "LIQ", dead: true },
 ];
 const N = SLOTS.length;

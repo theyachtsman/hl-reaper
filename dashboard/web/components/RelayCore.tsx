@@ -1,15 +1,14 @@
 "use client";
 /**
- * RelayCore — the "Consensus → Gate Relay" for one coin's Analysis Core card.
+ * RelayCore — the consensus core for one coin's Analysis Core card.
  *
- * Replaces the old ConsensusWheel + structural-gate info panel with a single
- * live 3D circuit: model nodes orbit a central core, the core fills toward the
- * coin's bias colour as confidence builds, and two gates (SHORT left / LONG
- * right) light up as their real structural signals close — a beam flows from the
- * core into the ACTIVE gate, and a shockwave fires when the circuit closes
- * (would_fire / in position). Unlike the standalone demo this is fully reactive:
- * everything is driven by the live /api/tickets verdict + gate detail, and a
- * gate switched off in Controls renders DISABLED (hazard-striped, no beam).
+ * A single live 3D scene: the model nodes orbit a central core, and the core
+ * fills toward the coin's bias colour as confidence builds (gold pulse when
+ * armed / in position). The overlay leads with the live weighted confidence and
+ * its gate, with the model-vote agreement shown beneath as a compact supplement.
+ * Everything is driven by the live /api/tickets verdict. The structural gate
+ * detail still lives in the two corner chips (which read DISABLED when a gate is
+ * switched off in Controls).
  *
  * One WebGL context (a straight swap for ConsensusWheel — no extra context).
  */
@@ -42,13 +41,14 @@ const MAX_OMEGA = 70;      // cap on throw speed (rad/sec) so a hard flick stays
 const IDLE_FLOOR = 0.18;   // |omega| below this → momentum done, fall back to drift
 const TAP_PX = 6;          // total movement under this counts as a tap, not a drag
 
-// the 5 active voting models (ML + LiqHeatmap are parked non-voters — not shown)
+// the 6 active voting models (ML + LiqHeatmap are parked non-voters — not shown)
 const SLOTS: { model: string; abbr: string; dead?: boolean }[] = [
   { model: "TAModel", abbr: "TA" },
   { model: "MeanReversionModel", abbr: "MR" },
   { model: "FundingRateModel", abbr: "FR" },
   { model: "OrderbookImbalanceModel", abbr: "OB" },
   { model: "VWAPModel", abbr: "VP" },
+  { model: "MomentumModel", abbr: "MO" },
 ];
 
 function glowTexture(): THREE.CanvasTexture {
@@ -81,14 +81,8 @@ function labelSprite(text: string, hex: number): THREE.Sprite {
   return sp;
 }
 
-type GateRefs = {
-  group: THREE.Group; ring: THREE.Mesh; ringMat: THREE.MeshBasicMaterial;
-  disc: THREE.Mesh; discMat: THREE.MeshBasicMaterial;
-  glow: THREE.Sprite; titleMat: THREE.SpriteMaterial;
-};
-
 export default function RelayCore({
-  direction, confidence, agreement, activeModels = 5, tickets,
+  direction, confidence, agreement, activeModels = 6, tickets,
   longGate, shortGate, gatesEnabled, position, wouldFire, confGate = 0.4,
 }: {
   direction: string; confidence: number; agreement: number; activeModels?: number;
@@ -127,31 +121,23 @@ export default function RelayCore({
   const coreFill = coreDir === "FLAT" ? 0
     : Math.min(1, 0.15 + 0.85 * Math.max(confProg, leanV / Math.max(1, activeModels)));
 
+  // overlay colour + gate-clear state for the confidence-led read-out
+  const headColor = direction === "LONG" ? "#2de8b0"
+    : direction === "SHORT" ? "#f0625f" : "#cbd5e1";
+  const confCleared = confidence >= confGate;
+
   const targetVal = {
     direction, confidence, agreement, coreDir, coreFill,
     voteHex: SLOTS.map((s) => dirHex(voteByModel.get(s.model))),
-    // fill from the real structural signals even when a gate is OFF (the bridge
-    // always sends the detail) — a disabled gate still shows consensus building.
-    longProg: longSig.filter(Boolean).length / 4,
-    shortProg: shortSig.filter(Boolean).length / 4,
-    longOff, shortOff, armedDir,
+    armedDir,
   };
   const target = useRef(targetVal);
   target.current = targetVal;
 
-  // ---- shock trigger on entering armed ----
+  // ---- armed flash on entering armed ----
   const prevArmed = useRef<string | null>(null);
   useEffect(() => {
     if (armedDir && armedDir !== prevArmed.current) {
-      const s = sceneRef.current;
-      if (s) {
-        const gate = armedDir === "LONG" ? s.gateLong : s.gateShort;
-        s.shock.position.copy(gate.group.position);
-        s.shock.scale.set(1, 1, 1);
-        s.shock.material.color.setHex(dirHex(armedDir));
-        s.shock.material.opacity = 0.9;
-        s.shockActive = true;
-      }
       if (flashRef.current) {
         flashRef.current.textContent = `● armed · ${armedDir}`;
         flashRef.current.style.color = armedDir === "LONG" ? "#2de8b0" : "#f0625f";
@@ -172,8 +158,11 @@ export default function RelayCore({
 
     const scene = new THREE.Scene();
     const camera = new THREE.PerspectiveCamera(46, 1, 0.1, 100);
-    camera.position.set(0, 1.05, 7.0);
-    camera.lookAt(0, 0, 0);
+    // pan the view up (camera + target raised by the same amount = pure vertical
+    // pan, no tilt) so the sphere sits lower in the box, clear of the top
+    // confidence overlay rather than centred behind it.
+    camera.position.set(0, 1.75, 7.0);
+    camera.lookAt(0, 0.7, 0);
 
     const GLOW = glowTexture();
     const mkGlow = (hex: number, sc: number) => {
@@ -216,52 +205,10 @@ export default function RelayCore({
                baseY: Math.sin(i * 1.7) * 0.3, dead: !!s.dead };
     });
 
-    // gates
-    const mkGate = (x: number, titleHex: number, title: string): GateRefs => {
-      const group = new THREE.Group(); group.position.set(x, 0, 0);
-      const ringMat = new THREE.MeshBasicMaterial({ color: DIM, transparent: true, opacity: 0.55 });
-      const ring = new THREE.Mesh(new THREE.TorusGeometry(0.8, 0.04, 14, 40), ringMat); group.add(ring);
-      const discMat = new THREE.MeshBasicMaterial({ color: titleHex, transparent: true, opacity: 0 });
-      const disc = new THREE.Mesh(new THREE.CircleGeometry(0.72, 40), discMat);
-      disc.scale.set(0.01, 0.01, 1); group.add(disc);
-      const glow = mkGlow(titleHex, 0.1); group.add(glow);
-      const t = labelSprite(title, 0x9fb0c3); t.position.set(0, 1.18, 0); t.scale.multiplyScalar(0.7);
-      group.add(t);
-      scene.add(group);
-      return { group, ring, ringMat, disc, discMat, glow, titleMat: t.material as THREE.SpriteMaterial };
-    };
-    const gateShort = mkGate(-2.7, RED, "SHORT");
-    const gateLong = mkGate(2.7, GREEN, "LONG");
-
-    // beam (core -> gate)
-    const mkBeam = (tx: number, hex: number) => {
-      const curve = new THREE.CatmullRomCurve3([
-        new THREE.Vector3(0, 0, 0),
-        new THREE.Vector3(tx * 0.5, 0.7, 0),
-        new THREE.Vector3(tx * 0.9, 0, 0)]);
-      const N = 34;
-      const positions = new Float32Array(N * 3);
-      const geo = new THREE.BufferGeometry();
-      geo.setAttribute("position", new THREE.BufferAttribute(positions, 3));
-      const mat = new THREE.PointsMaterial({ color: hex, size: 0.085, transparent: true,
-        opacity: 0, blending: THREE.AdditiveBlending, depthWrite: false, sizeAttenuation: true });
-      const points = new THREE.Points(geo, mat); scene.add(points);
-      const offsets = Array.from({ length: N }, () => Math.random());
-      return { curve, points, mat, positions, offsets, N };
-    };
-    const beamShort = mkBeam(-2.7, RED);
-    const beamLong = mkBeam(2.7, GREEN);
-
-    // shock ring
-    const shockMat = new THREE.MeshBasicMaterial({ color: GREEN, transparent: true, opacity: 0, side: THREE.DoubleSide });
-    const shock = new THREE.Mesh(new THREE.RingGeometry(0.5, 0.62, 40), shockMat);
-    scene.add(shock);
-
     sceneRef.current = {
       renderer, scene, camera, core, coreWireMat, coreSolidMat, coreGlow,
-      nodes, gateShort, gateLong, beamShort, beamLong, shock, shockActive: false,
-      curC: new THREE.Color(DIM), curShort: new THREE.Color(DIM),
-      curLong: new THREE.Color(DIM), raf: 0,
+      nodes,
+      curC: new THREE.Color(DIM), raf: 0,
       // fidget-spin state, driven by the pointer handlers, read by animate()
       spin: {
         dragging: false,
@@ -358,16 +305,6 @@ export default function RelayCore({
     canvas.addEventListener("pointerup", onPointerUp);
     canvas.addEventListener("pointercancel", onPointerUp);
 
-    const updBeam = (beam: any, t: number, intensity: number, speed: number) => {
-      beam.mat.opacity = intensity;
-      for (let i = 0; i < beam.N; i++) {
-        const u = (beam.offsets[i] + t * speed) % 1;
-        const p = beam.curve.getPointAt(u);
-        beam.positions[i * 3] = p.x; beam.positions[i * 3 + 1] = p.y; beam.positions[i * 3 + 2] = p.z;
-      }
-      beam.points.geometry.attributes.position.needsUpdate = true;
-    };
-
     const spinQuat = new THREE.Quaternion();
     const spinAxis = new THREE.Vector3();
     const Y_AXIS = new THREE.Vector3(0, 1, 0);
@@ -422,47 +359,6 @@ export default function RelayCore({
       r.core.scale.setScalar(1 + (armed ? 0 : st.coreFill * 0.14)
         + Math.sin(t * (armed ? 4 : 2)) * 0.04);
       // orb orientation is driven by the fidget-spin quaternion above
-
-      // gates
-      const applyGate = (gate: GateRefs, prog: number, off: boolean, baseHex: number,
-                         active: boolean, cur: THREE.Color) => {
-        const open = prog >= 1;
-        // a disabled gate still FILLS with its structural progress (so you can
-        // watch consensus build exactly like an enabled gate), just dimmer and
-        // without the firing spin/extra glow since it can't actually fire.
-        const dim = off ? 0.5 : 1;
-        cur.lerp(new THREE.Color(DIM).lerp(new THREE.Color(baseHex), prog), 0.1);
-        gate.ringMat.color.copy(cur);
-        gate.ringMat.opacity = (0.5 + prog * 0.45) * dim;
-        gate.discMat.color.setHex(baseHex);
-        gate.discMat.opacity += (prog * 0.7 * dim - gate.discMat.opacity) * 0.12;
-        gate.disc.scale.setScalar(0.2 + prog * 0.78);
-        (gate.glow.material as THREE.SpriteMaterial).color.setHex(baseHex);
-        gate.glow.scale.setScalar(0.1 + prog * (active && !off ? 2.2 : 1.0));
-        gate.titleMat.opacity = (0.5 + prog * 0.5) * (off ? 0.7 : 1);
-        if (open && active && !off) gate.group.rotation.z += d * 0.4;
-        else if (off) gate.group.rotation.z = 0;
-      };
-      const dir = st.coreDir;
-      applyGate(r.gateShort, st.shortProg, st.shortOff, RED, dir === "SHORT", r.curShort);
-      applyGate(r.gateLong, st.longProg, st.longOff, GREEN, dir === "LONG", r.curLong);
-
-      // arc flows from the core to whichever side consensus leans, as it builds —
-      // visible regardless of the gate toggle (dimmer when that gate is off, like
-      // the ring) so you can watch the circuit form even with gates disabled.
-      const beamFor = (side: "LONG" | "SHORT", prog: number, off: boolean) =>
-        dir === side
-          ? Math.min(1, 0.32 + 0.68 * Math.max(prog, st.coreFill)) * (off ? 0.6 : 1)
-          : 0;
-      updBeam(r.beamLong, t, beamFor("LONG", st.longProg, st.longOff), 0.5 + st.longProg * 0.9);
-      updBeam(r.beamShort, t, beamFor("SHORT", st.shortProg, st.shortOff), 0.5 + st.shortProg * 0.9);
-
-      // shock
-      if (r.shockActive) {
-        r.shock.scale.x += d * 3.0; r.shock.scale.y += d * 3.0;
-        r.shock.material.opacity -= d * 1.0;
-        if (r.shock.material.opacity <= 0) { r.shockActive = false; r.shock.material.opacity = 0; }
-      }
 
       r.renderer.render(r.scene, r.camera);
       r.raf = requestAnimationFrame(animate);
@@ -534,21 +430,43 @@ export default function RelayCore({
     <div ref={wrapRef} className="relative h-[300px] bg-[#070a0e] border-t border-edge overflow-hidden">
       <canvas ref={canvasRef} className="block w-full h-full"
         style={{ touchAction: "none" }} />
-      {/* tally + prominent confidence — the "so what" of the consensus core */}
-      <div className="absolute top-2 left-0 right-0 text-center pointer-events-none">
-        <div className="text-[10px] mono uppercase tracking-[0.14em]"
-          style={{ color: direction === "LONG" ? "#2de8b0" : direction === "SHORT" ? "#f0625f" : "#9fb0c3" }}>
-          consensus {agreement}/{activeModels} {direction === "FLAT" ? "scanning" : direction}
+      {/* confidence leads; model-vote agreement is the supplement beneath it */}
+      <div className="absolute top-3 left-0 right-0 flex flex-col items-center pointer-events-none">
+        <span className="text-[8px] mono uppercase tracking-[0.24em] text-slate-500">
+          confidence
+        </span>
+        <span className="text-[30px] font-bold mono tabular-nums leading-none mt-0.5"
+          style={{ color: headColor,
+                   textShadow: direction === "FLAT" ? "none" : `0 0 14px ${headColor}55` }}>
+          {confidence.toFixed(2)}
+        </span>
+        {/* gate progress: fill = confidence, tick = gate threshold */}
+        <div className="relative mt-2 h-[4px] w-[156px] rounded-full bg-white/10">
+          <div className="absolute inset-y-0 left-0 rounded-full transition-[width] duration-500"
+            style={{ width: `${Math.min(100, confidence * 100)}%`, background: headColor,
+                     boxShadow: confCleared ? `0 0 6px ${headColor}` : "none" }} />
+          <div className="absolute -top-[3px] h-[10px] w-px"
+            style={{ left: `${Math.min(100, confGate * 100)}%`, background: "rgba(226,232,240,0.85)" }} />
         </div>
-        <div className="mt-0.5 flex items-baseline justify-center gap-1.5 leading-none">
-          <span className="text-[22px] font-bold mono tabular-nums"
-            style={{ color: direction === "LONG" ? "#2de8b0" : direction === "SHORT" ? "#f0625f" : "#cbd5e1",
-                     textShadow: direction === "FLAT" ? "none"
-                       : `0 0 12px ${direction === "LONG" ? "#2de8b066" : "#f0625f66"}` }}>
-            {confidence.toFixed(2)}
+        <span className="mt-1 text-[8px] mono uppercase tracking-wider"
+          style={{ color: confCleared ? headColor : "#64748b" }}>
+          {confCleared ? "clears" : "needs"} gate {confGate.toFixed(2)}
+        </span>
+        {/* supplement: per-model votes + agreement tally */}
+        <div className="mt-2.5 flex items-center gap-1.5">
+          <span className="flex items-center gap-1">
+            {slotVotes.map((v, i) => {
+              const c = v === "LONG" ? "#2de8b0" : v === "SHORT" ? "#f0625f" : null;
+              return (
+                <span key={i} className="inline-block w-[6px] h-[6px] rounded-full"
+                  style={c ? { background: c, boxShadow: `0 0 4px ${c}` }
+                           : { background: "#ffffff14", border: "1px solid #ffffff22" }} />
+              );
+            })}
           </span>
-          <span className="text-[8px] mono uppercase tracking-wider text-slate-500">
-            conf · gate {confGate.toFixed(2)}
+          <span className="text-[9px] mono tracking-wide"
+            style={{ color: direction === "FLAT" ? "#94a3b8" : headColor }}>
+            {agreement}/{activeModels} {direction === "FLAT" ? "· scanning" : `agree ${direction}`}
           </span>
         </div>
       </div>

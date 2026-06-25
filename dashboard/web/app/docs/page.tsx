@@ -91,7 +91,7 @@ export default function DocsHome() {
       </Section>
 
       <div className="mt-8 flex flex-wrap gap-2">
-        <Pill tone="accent">5 active models</Pill>
+        <Pill tone="accent">6 active models</Pill>
         <Pill tone="cyan">2 bands</Pill>
         <Pill tone="warn">6 presets</Pill>
         <Pill tone="short">6 risk states</Pill>

@@ -2,9 +2,15 @@
 > hl-reaper-dashboard@1.0.0 start
 > next start -p 8888 -H 0.0.0.0
 
-  ▲ Next.js 14.2.29
-  - Local:        http://localhost:8888
-  - Network:      http://0.0.0.0:8888
-
- ✓ Starting...
- ✓ Ready in 336ms
+ ⨯ Failed to start server
+Error: listen EADDRINUSE: address already in use 0.0.0.0:8888
+    at Server.setupListenHandle [as _listen2] (node:net:1908:16)
+    at listenInCluster (node:net:1965:12)
+    at doListen (node:net:2139:7)
+    at process.processTicksAndRejections (node:internal/process/task_queues:83:21) {
+  code: 'EADDRINUSE',
+  errno: -98,
+  syscall: 'listen',
+  address: '0.0.0.0',
+  port: 8888
+}

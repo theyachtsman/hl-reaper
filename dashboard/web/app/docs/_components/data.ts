@@ -15,7 +15,7 @@ export const NAV = [
   { href: "/docs/glossary", label: "Glossary" },
 ] as const;
 
-// ---- the five active directional voters ------------------------------------
+// ---- the six active directional voters -------------------------------------
 // reaper/aggregator.py BASE_WEIGHTS / SCALP_WEIGHTS / TREND_WEIGHTS
 export type ModelRow = {
   key: string;
@@ -31,38 +31,46 @@ export const MODELS: ModelRow[] = [
     key: "ta",
     name: "TAModel",
     blurb: "RSI + MACD + EMA cross + Bollinger blended into one score",
-    base: 0.225,
-    scalp: 0.15,
-    trend: 0.3,
+    base: 0.19,
+    scalp: 0.13,
+    trend: 0.24,
   },
   {
     key: "meanrev",
     name: "MeanReversionModel",
     blurb: "z-score of price vs its 20-period mean — fades extremes, RANGING only",
-    base: 0.15,
-    scalp: 0.45,
+    base: 0.13,
+    scalp: 0.38,
     trend: 0.0,
   },
   {
     key: "funding",
     name: "FundingRateModel",
     blurb: "contrarian read of the perp funding rate — fades the crowded side",
-    base: 0.15,
-    scalp: 0.05,
-    trend: 0.2,
+    base: 0.13,
+    scalp: 0.04,
+    trend: 0.16,
   },
   {
     key: "ob",
     name: "OrderbookImbalanceModel",
     blurb: "live bid vs ask depth over the top 10 book levels",
-    base: 0.325,
-    scalp: 0.2,
-    trend: 0.3,
+    base: 0.27,
+    scalp: 0.17,
+    trend: 0.24,
   },
   {
     key: "vwap",
     name: "VWAPModel",
     blurb: "session VWAP with ±1σ bands as dynamic support / resistance",
+    base: 0.13,
+    scalp: 0.13,
+    trend: 0.16,
+  },
+  {
+    key: "momentum",
+    name: "MomentumModel",
+    blurb: "weighted rate-of-change over 3/6/12 candles — votes WITH a fast move (trend-following)",
     base: 0.15,
     scalp: 0.15,
     trend: 0.2,
@@ -206,20 +214,22 @@ export const VOTE_EXAMPLE = {
   band: "SCALP",
   regime: "RANGING",
   rows: [
-    { model: "TAModel", weight: 0.15, dir: "SHORT", conf: 0.62 },
-    { model: "MeanReversionModel", weight: 0.45, dir: "SHORT", conf: 0.78 },
-    { model: "FundingRateModel", weight: 0.05, dir: "FLAT", conf: 0.0 },
-    { model: "OrderbookImbalanceModel", weight: 0.2, dir: "SHORT", conf: 0.66 },
-    { model: "VWAPModel", weight: 0.15, dir: "LONG", conf: 0.55 },
+    { model: "TAModel", weight: 0.13, dir: "SHORT", conf: 0.62 },
+    { model: "MeanReversionModel", weight: 0.38, dir: "SHORT", conf: 0.78 },
+    { model: "FundingRateModel", weight: 0.04, dir: "FLAT", conf: 0.0 },
+    { model: "OrderbookImbalanceModel", weight: 0.17, dir: "SHORT", conf: 0.66 },
+    { model: "VWAPModel", weight: 0.13, dir: "LONG", conf: 0.55 },
+    // momentum abstains in a RANGING chop — no decisive move to follow
+    { model: "MomentumModel", weight: 0.15, dir: "FLAT", conf: 0.0 },
   ],
-  // active_weight excludes the FLAT abstention (0.05): 0.95
-  activeWeight: 0.95,
-  // score = -(.15*.62) -(.45*.78) -(.20*.66) + (.15*.55) = -0.4935
-  score: -0.4935,
-  // confidence = 0.4935 / 0.95 = 0.5195
+  // active_weight excludes the two FLAT abstentions (0.04 + 0.15): 0.81
+  activeWeight: 0.81,
+  // score = -(.13*.62) -(.38*.78) -(.17*.66) + (.13*.55) = -0.4177
+  score: -0.4177,
+  // confidence = 0.4177 / 0.81 = 0.5157
   confidence: 0.52,
   direction: "SHORT",
   longVotes: 1,
   shortVotes: 3,
-  flatVotes: 1,
+  flatVotes: 2,
 } as const;

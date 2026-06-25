@@ -8,25 +8,29 @@ from reaper.models import LONG, SHORT, FLAT, Ticket
 
 log = get_logger("aggregator")
 
-# Five active DIRECTIONAL voters (RegimeDetector is a meta-router at 0.0, ML and
-# LiqHeatmap are zeroed — both permanently FLAT). The freed ML weight (0.20) was
-# redistributed proportionally across the five so their relative proportions are
-# unchanged. Sum = 1.0.
+# Six active DIRECTIONAL voters (RegimeDetector is a meta-router at 0.0, ML and
+# LiqHeatmap are zeroed — both permanently FLAT). The legacy five summed to 1.0;
+# MomentumModel (2026-06-24) was added at 0.15 and the other five scaled by 0.85
+# so their relative proportions are unchanged. Sum = 1.0 (renormalized anyway).
 BASE_WEIGHTS = {
-    "TAModel":                  0.225,  # 0.18 + (0.18/0.80)*0.20
+    "TAModel":                  0.19,   # 0.225 * 0.85
     # zeroed 2026-06-15: direction classification confirmed not viable after a
     # full 225d retrain (0/7 cleared the majority-class gate — see
     # docs/ml_retrain_report.md). Permanently FLAT; kept as a slot for a future
     # different-target model (volatility/regime). No vote weight.
     "MLForecastModel":          0.00,
     "RegimeDetectorModel":      0.00,  # meta-model, used for routing only
-    "MeanReversionModel":       0.15,   # 0.12 + (0.12/0.80)*0.20
-    "FundingRateModel":         0.15,   # 0.12 + (0.12/0.80)*0.20
+    "MeanReversionModel":       0.13,   # 0.15 * 0.85
+    "FundingRateModel":         0.13,   # 0.15 * 0.85
     # OB is the only model with a measured positive directional tilt
     # (docs/microstructure_backtest_report.md — 1m hit 0.54-0.57, positive on
-    # 7/7 coins). 0.26 + (0.26/0.80)*0.20.
-    "OrderbookImbalanceModel":  0.325,
-    "VWAPModel":                0.15,   # 0.12 + (0.12/0.80)*0.20
+    # 7/7 coins). 0.325 * 0.85.
+    "OrderbookImbalanceModel":  0.27,
+    "VWAPModel":                0.13,   # 0.15 * 0.85
+    # price-velocity / trend-following voter (2026-06-24). Answers "is price
+    # moving hard one way right now?" — the question the other five miss in a
+    # fast move (see reaper/models/momentum_model.py).
+    "MomentumModel":            0.15,
     # zeroed 2026-06-14: 100% FLAT across all 7 coins on ~4 days recorded live
     # L2 — structurally inert on normal tape. Model still computes/logs (its
     # OI-distribution logic may feed Phase 8.6 cascade-v2); just no vote weight.
@@ -41,27 +45,34 @@ BASE_WEIGHTS = {
 # voters; the meta/dead slots stay 0.0.
 #
 #   SCALP — mean reversion is the dominant signal (fade the local top/bottom);
-#   OB confirms live pressure; TA/VWAP/funding round it out.
+#   OB confirms live pressure; TA/VWAP/funding round it out. MomentumModel
+#   (2026-06-24) gets a modest 0.15 here so a fast move can pull the scalp net
+#   toward the move instead of letting MEANREV fade a freefall.
 #   TREND — no mean reversion (it fails in sustained trends); TA + OB lead,
-#   funding (smooth-mapped) and VWAP confirm the structural move.
+#   funding (smooth-mapped) and VWAP confirm the structural move. MomentumModel
+#   gets a higher 0.20 — momentum matters most on the trend band.
+# Existing voters were scaled (SCALP x0.85, TREND x0.80) to make room; each set
+# still sums to 1.0 (the aggregator renormalizes regardless).
 SCALP_WEIGHTS = {
-    "TAModel":                  0.15,
-    "MeanReversionModel":       0.45,
+    "TAModel":                  0.13,   # 0.15 * 0.85
+    "MeanReversionModel":       0.38,   # 0.45 * 0.85
     "MLForecastModel":          0.00,
     "RegimeDetectorModel":      0.00,
-    "FundingRateModel":         0.05,
-    "OrderbookImbalanceModel":  0.20,
-    "VWAPModel":                0.15,
+    "FundingRateModel":         0.04,   # 0.05 * 0.85
+    "OrderbookImbalanceModel":  0.17,   # 0.20 * 0.85
+    "VWAPModel":                0.13,   # 0.15 * 0.85
+    "MomentumModel":            0.15,
     "LiquidationHeatmapModel":  0.00,
 }
 TREND_WEIGHTS = {
-    "TAModel":                  0.30,
+    "TAModel":                  0.24,   # 0.30 * 0.80
     "MeanReversionModel":       0.00,
     "MLForecastModel":          0.00,
     "RegimeDetectorModel":      0.00,
-    "FundingRateModel":         0.20,
-    "OrderbookImbalanceModel":  0.30,
-    "VWAPModel":                0.20,
+    "FundingRateModel":         0.16,   # 0.20 * 0.80
+    "OrderbookImbalanceModel":  0.24,   # 0.30 * 0.80
+    "VWAPModel":                0.16,   # 0.20 * 0.80
+    "MomentumModel":            0.20,
     "LiquidationHeatmapModel":  0.00,
 }
 
@@ -92,6 +103,18 @@ BOOK_REGIME_DAMPEN = 0.40
 # UNKNOWN regimes keep full weight. Mirrors BOOK_REGIME_DAMPEN's intent but acts
 # on the weight (per spec) rather than the confidence.
 FUNDING_COUNTER_TREND_DAMP = 0.40
+
+# Momentum regime dampening (2026-06-24): momentum exists in every regime, but in
+# a RANGING market fast moves are noisier (false breakouts that snap back), so a
+# MomentumModel vote has its WEIGHT cut to this factor in RANGING only. In
+# TRENDING_UP/DOWN and HIGH_VOL it keeps FULL weight — momentum is especially
+# meaningful there. This is a directionless weight cut (it does NOT depend on
+# whether momentum agrees or fights the trend): MomentumModel is trend-following
+# by construction so it can't be a counter-trend voter, and the existing
+# counter-trend penalty (apply_regime_bias) only dampens a scalp whose NET
+# direction fades the 1h trend — a strong momentum vote pushes the net WITH the
+# move, so it is never the thing being penalized there.
+MOMENTUM_RANGING_DAMP = 0.70
 
 # Permanently non-voting models (ML: direction classification not viable;
 # LiqHeatmap: inert on normal tape). Both carry 0 weight, so excluding them from
@@ -159,7 +182,8 @@ class SignalAggregator:
                  funding_hard_block_conf: float = FUNDING_HARD_BLOCK_CONF,
                  funding_hard_block_short_enabled: bool = False,
                  funding_hard_block_short_conf: float = FUNDING_HARD_BLOCK_CONF,
-                 funding_counter_trend_damp: float = FUNDING_COUNTER_TREND_DAMP):
+                 funding_counter_trend_damp: float = FUNDING_COUNTER_TREND_DAMP,
+                 momentum_ranging_damp: float = MOMENTUM_RANGING_DAMP):
         self.base_weights = dict(base_weights or BASE_WEIGHTS)
         self.funding_hard_block_enabled = funding_hard_block_enabled
         self.funding_hard_block_conf = funding_hard_block_conf
@@ -172,6 +196,21 @@ class SignalAggregator:
         # FUNDING_COUNTER_TREND_DAMP). 1.0 = no dampening, 0.0 = ignore funding
         # entirely when counter-trend. Hot-reloadable.
         self.funding_counter_trend_damp = funding_counter_trend_damp
+        # weight multiplier for a MomentumModel vote in a RANGING regime (see
+        # MOMENTUM_RANGING_DAMP). 1.0 = no dampening. Hot-reloadable.
+        self.momentum_ranging_damp = momentum_ranging_damp
+
+    def momentum_weight_factor(self, model: str, regime: str | None) -> float:
+        """Weight multiplier for `model` given the band's `regime`.
+
+        Only MomentumModel in a RANGING regime is dampened
+        (-> momentum_ranging_damp). Every other model and every other regime
+        (TRENDING_UP/DOWN, HIGH_VOL, UNKNOWN, None) returns 1.0 (full weight).
+        Directionless by design — momentum is trend-following so there is no
+        counter-trend case to distinguish."""
+        if model == "MomentumModel" and regime == "RANGING":
+            return self.momentum_ranging_damp
+        return 1.0
 
     def funding_weight_factor(self, model: str, direction: str,
                               regime: str | None) -> float:
@@ -299,6 +338,17 @@ class SignalAggregator:
                 log.info("AGGREGATOR: %s FUNDING dampened (%s + %s vote) "
                          "weight %.3f -> %.3f", coin, book_regime, t.direction,
                          w, w_eff)
+                w = w_eff
+            # momentum regime dampening: a MomentumModel vote in a RANGING
+            # regime has its WEIGHT cut (noisier false breakouts). Trending /
+            # high-vol regimes keep full weight. Uses the band's own regime, not
+            # the 1h trend regime — momentum is a same-band velocity read.
+            mf = self.momentum_weight_factor(t.model, regime)
+            if mf != 1.0:
+                w_eff = w * mf
+                meta["momentum_dampen"] = (
+                    f"MOMENTUM {t.direction} weight {w:.3f}->{w_eff:.3f} "
+                    f"x{mf:.2f} in {regime}")
                 w = w_eff
             active_weight += w
             if t.direction == LONG:

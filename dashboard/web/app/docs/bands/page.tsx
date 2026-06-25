@@ -77,7 +77,7 @@ export default function Bands() {
 
       <Section title="Different weight profiles">
         <p className="text-slate-400 text-sm mb-4 leading-relaxed">
-          The same five models carry very different weight in each band. SCALP promotes mean
+          The same six models carry very different weight in each band. SCALP promotes mean
           reversion to nearly half its weight; TREND zeroes it entirely and leans on TA, orderbook
           and funding to confirm structural moves.
         </p>

@@ -162,6 +162,18 @@ models:
       rsi_long: 38             # downtrend: LONG only at this extreme oversold
       rsi_neutral_low: 48      # confidence anchor: firing edge -> conf ~0.40
       rsi_neutral_high: 55     # +0.20 conf per (high-low) of extra RSI travel
+  # MomentumModel (2026-06-24): price-velocity / trend-following voter. Reads the
+  # weighted rate-of-change of close over 3/6/12 candles and votes WITH a fast
+  # move (SHORT on a hard drop, LONG on a hard pump). Added after a -4.86% BTC
+  # drop during which the ensemble called LONG the whole way down. Hot-reloadable
+  # via live_config (keys models.momentum.*), re-read by run_bot each loop.
+  momentum:
+    enabled: true
+    short_threshold: -0.003    # -0.3% weighted composite move triggers SHORT
+    long_threshold: 0.003      # +0.3% weighted composite move triggers LONG
+    full_conf_move: 0.010      # 1.0% composite = full confidence (0.95 ceiling)
+    min_candles: 15            # minimum candles required to vote (else FLAT)
+    ranging_weight_damp: 0.70  # 70% of full weight in a RANGING regime (noisier)
 
 # ---- aggregator: regime-aware weight dampening ----
 aggregator:

@@ -29,9 +29,9 @@ export default function HowItWorks() {
         <FlowDiagram />
       </Section>
 
-      <Section title="1 · The five-model ensemble">
+      <Section title="1 · The six-model ensemble">
         <p className="text-slate-400 text-sm mb-4 leading-relaxed">
-          Five models vote on direction. Each reads a different slice of the market, so they
+          Six models vote on direction. Each reads a different slice of the market, so they
           rarely all agree — which is the point. Each model returns a <em>ticket</em>: a direction
           (<DirPill dir="LONG" /> <DirPill dir="SHORT" /> or <DirPill dir="FLAT" />) and a
           confidence from 0 to 1. Weights differ by band; the values below are the per-band defaults.

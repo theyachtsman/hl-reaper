@@ -137,7 +137,7 @@ scalp = agg.aggregate("BTC", tickets, weights=SCALP_WEIGHTS,
 check("scalp aggregates SHORT (mean reversion carries it)",
       scalp.direction == SHORT, scalp.direction)
 check("scalp weights used are the fixed scalp set",
-      abs(scalp.weights["MeanReversionModel"] - 0.45) < 1e-9,
+      abs(scalp.weights["MeanReversionModel"] - 0.38) < 1e-9,
       str(scalp.weights.get("MeanReversionModel")))
 check("regime string still surfaced", scalp.regime == "TRENDING_UP",
       scalp.regime)

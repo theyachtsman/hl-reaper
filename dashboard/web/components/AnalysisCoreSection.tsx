@@ -113,7 +113,7 @@ export default function AnalysisCoreSection() {
         </span>
         <span className="label">Analysis Core</span>
         <span className="text-[10px] mono uppercase tracking-wider text-slate-500">
-          {band === "scalp" ? "5m scalp" : "1h trend"} · 5-model ensemble
+          {band === "scalp" ? "5m scalp" : "1h trend"} · 6-model ensemble
           {bandsEnabled.scalp !== bandsEnabled.trend && (
             <span className="text-amber-400/80"> · single-band mode</span>
           )}
@@ -143,7 +143,7 @@ export default function AnalysisCoreSection() {
           </span>
           <span className="border border-glow/30 rounded-full px-2.5 py-1 text-[10px] mono text-glow/90"
             title="A trade only fires when at least this many models agree AND weighted confidence clears the gate.">
-            ≥{gQ}/5 · ≥{gC}
+            ≥{gQ}/6 · ≥{gC}
           </span>
           <span className="border border-edge rounded-full px-2.5 py-1 text-[10px] mono text-slate-300">
             {armed} armed

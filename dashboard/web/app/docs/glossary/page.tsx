@@ -3,7 +3,7 @@ import { PageHeader, Card, ACCENT_BRIGHT } from "../_components/ui";
 export const metadata = { title: "Glossary · Docs" };
 
 const TERMS: { term: string; def: React.ReactNode }[] = [
-  { term: "Aggregator", def: "The component that combines the five model votes into a single directional signal with a confidence score." },
+  { term: "Aggregator", def: "The component that combines the six model votes into a single directional signal with a confidence score." },
   { term: "Armed signal", def: "A signal that has cleared every entry gate and is ready to place an order. On the dashboard an armed coin glows." },
   { term: "ATR", def: "Average True Range — a measure of recent volatility. Stop distances are sized as a multiple of ATR, so stops widen in volatile markets and tighten in calm ones." },
   { term: "Band", def: "One of the two parallel strategies: SCALP (5m, fast) or TREND (1h, patient). Each coin can be held by only one band at a time." },
@@ -13,7 +13,7 @@ const TERMS: { term: string; def: React.ReactNode }[] = [
   { term: "Confidence score", def: "The 0–1 strength of the aggregated signal: the absolute weighted score divided by the total active weight. Must clear the band's floor to trade." },
   { term: "Conviction", def: "Informal term for how strongly the ensemble agrees on a direction — high confidence plus high agreement." },
   { term: "Counter-trend dampening", def: "Reducing the influence of a vote that opposes the confirmed 1h trend. Funding votes against the trend are cut to 0.40× weight; counter-trend orderbook votes to 0.40× confidence; counter-trend scalps to 0.70× confidence." },
-  { term: "Ensemble", def: "The collection of five models voting together. No single model decides — the weighted group does." },
+  { term: "Ensemble", def: "The collection of six models voting together. No single model decides — the weighted group does." },
   { term: "FLAT vote", def: "A model abstaining (no edge, or confidence below 0.05). FLAT votes are excluded from both the score and the weight total, so they never dilute the models that did vote." },
   { term: "Funding rate", def: "The periodic payment between perp longs and shorts. Positive funding means longs pay shorts (longs crowded); the funding model fades the crowded side." },
   { term: "Maker timeout", def: "When a post-only (maker) limit order fails to fill within its window. Repeated timeouts can trigger the taker fallback." },

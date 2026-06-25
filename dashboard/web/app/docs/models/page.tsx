@@ -28,8 +28,8 @@ type ModelDoc = {
 const DOCS: ModelDoc[] = [
   {
     name: "TAModel",
-    scalp: 0.15,
-    trend: 0.3,
+    scalp: 0.13,
+    trend: 0.24,
     reads:
       "The last 100 candles on the band's resolution. Blends four classic indicators into one score: RSI(14), MACD histogram, the EMA-9 vs EMA-21 cross, and Bollinger Bands(20, 2σ).",
     long: "the blended score is positive — momentum and trend lean up (e.g. EMA-9 above EMA-21, rising MACD, price near the lower Bollinger band). In a confirmed uptrend it now also goes LONG at moderate RSI (see below).",
@@ -60,7 +60,7 @@ const DOCS: ModelDoc[] = [
   },
   {
     name: "MeanReversionModel",
-    scalp: 0.45,
+    scalp: 0.38,
     trend: 0.0,
     reads:
       "The z-score of the latest close against its rolling 20-period mean and standard deviation.",
@@ -72,8 +72,8 @@ const DOCS: ModelDoc[] = [
   },
   {
     name: "FundingRateModel",
-    scalp: 0.05,
-    trend: 0.2,
+    scalp: 0.04,
+    trend: 0.16,
     reads:
       "The current perp funding rate (annualized to an 8h figure), its 24h average, and its 3h trend from the funding history table.",
     long: "funding is negative — shorts are crowded and paying longs, so the contrarian read is up.",
@@ -99,8 +99,8 @@ const DOCS: ModelDoc[] = [
   },
   {
     name: "OrderbookImbalanceModel",
-    scalp: 0.2,
-    trend: 0.3,
+    scalp: 0.17,
+    trend: 0.24,
     reads:
       "Live L2 order book depth — the summed bid size vs ask size over the top 10 levels, expressed as an imbalance from −1 (all ask) to +1 (all bid). Ignores books older than 10s.",
     long: "the book is bid-heavy — imbalance above +0.30 (more resting buy depth).",
@@ -111,8 +111,8 @@ const DOCS: ModelDoc[] = [
   },
   {
     name: "VWAPModel",
-    scalp: 0.15,
-    trend: 0.2,
+    scalp: 0.13,
+    trend: 0.16,
     reads:
       "Session VWAP (volume-weighted average price) since UTC midnight, with ±1σ bands. Falls back to the last 120 candles early in a session.",
     long: "price tags the −1σ band (strong mean-reversion buy) or holds above a rising VWAP.",
@@ -121,6 +121,34 @@ const DOCS: ModelDoc[] = [
     best: "Intraday support/resistance — confirming whether price is rich or cheap versus the day's fair value.",
     worst: "Very young sessions or thin-volume coins, where VWAP is noisy and the bands are unreliable.",
   },
+  {
+    name: "MomentumModel",
+    scalp: 0.15,
+    trend: 0.2,
+    reads:
+      "The weighted rate of change of close over three lookback windows — 3, 6 and 12 candles on the band's resolution — blended 0.50 / 0.30 / 0.20 so the freshest move dominates. It ignores support, funding and book depth entirely; only the velocity of price matters.",
+    long: "the composite move is a hard pump — at or above +0.3% it starts voting LONG, ramping to full confidence by +1.0%. It follows the move, never fades it.",
+    short: "the composite move is a hard drop — at or below −0.3% it starts voting SHORT, ramping to full confidence by −1.0%.",
+    flat: "the composite move sits inside ±0.3% (no decisive velocity), or there are fewer than 15 candles to measure.",
+    best: "Fast one-directional moves — the freefall / blow-off where the mean-reversion voters call a bounce and price keeps going. It is the model that answers 'is price moving hard right now?', the question the other five miss.",
+    worst: "Choppy ranges, where fast moves are false breakouts that snap back — so in a RANGING regime its weight is cut to 0.70×. Trending and high-vol regimes keep full weight.",
+    extra: {
+      title: "Why it was added (6/24 drop)",
+      body: (
+        <>
+          On 2026-06-24 BTC fell 4.86% and ETH 5.91% in hours while the ensemble
+          called <DirPill dir="LONG" /> at 0.65–0.83 the entire way down —{" "}
+          MEANREV and VWAP read the oversold freefall as a bounce setup and no
+          model voted <DirPill dir="SHORT" />. MomentumModel is the trend-following
+          counterweight: a strong downward velocity now votes{" "}
+          <DirPill dir="SHORT" /> with high confidence, pulling the net verdict
+          away from a confident dip-buy into a crash. By construction it always
+          votes <em>with</em> the move, so the counter-trend scalp penalty never
+          applies to it. Thresholds are tunable live on the Controls page.
+        </>
+      ),
+    },
+  },
 ];
 
 export default function Models() {
@@ -128,7 +156,7 @@ export default function Models() {
     <>
       <PageHeader
         kicker="Models"
-        title="The five voters in detail"
+        title="The six voters in detail"
         intro="Each model reads a different part of the market and returns a directional ticket. Below is exactly what each one watches, what makes it vote LONG, SHORT or FLAT, how heavily it counts in each band, and when to trust it."
       />
 

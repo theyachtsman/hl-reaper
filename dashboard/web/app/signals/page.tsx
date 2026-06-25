@@ -10,6 +10,7 @@ const MODEL_ABBR: Record<string, string> = {
   FundingRateModel: "FUNDING",
   OrderbookImbalanceModel: "BOOK",
   VWAPModel: "VWAP",
+  MomentumModel: "MOMENTUM",
   LiquidationHeatmapModel: "LIQMAP",
   MLForecastModel: "ML",
 };
@@ -29,6 +30,8 @@ const MODEL_DESC: Record<string, string> = {
     "Order-book pressure. Compares resting bid vs ask size at the top of book for near-term directional lean. Highest-tilt model in the ensemble.",
   VWAPModel:
     "Volume-weighted average price. Flags whether price is trading above or below its structural equilibrium and which way it's reverting.",
+  MomentumModel:
+    "Price velocity. Measures the weighted rate of change over 3/6/12 candles and votes WITH a fast move — SHORT on a hard drop, LONG on a hard pump. The model that calls a freefall instead of fading it.",
   LiquidationHeatmapModel:
     "Estimates where leveraged positions are clustered and likely to liquidate. Inactive — stays FLAT on normal tape.",
   MLForecastModel:
