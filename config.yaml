@@ -27,6 +27,12 @@ stale_feed_seconds: 30      # WS considered stale after this
 db_path: "data/hl_reaper.db"
 log_level: "INFO"
 
+# signal_history retention. The bot logs one row per active coin×band every
+# loop cycle (every evaluation, traded or not), so the table must self-trim.
+# run_bot prunes rows older than this once an hour (and once on each restart).
+signal_history:
+  retention_days: 7
+
 # Phase 1 test-order settings (used only by scripts/test_order.py)
 test_order:
   coin: "BTC"

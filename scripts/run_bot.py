@@ -1222,6 +1222,11 @@ def main():
 
     hb_path = Path(cfg.heartbeat_path)
     last_status = 0.0
+    # signal_history retention: prune rows older than this window, hourly. The
+    # table grows ~one row per active coin×band every loop, so it must self-trim.
+    signal_retention_days = int(
+        (cfg._raw.get("signal_history", {}) or {}).get("retention_days", 7))
+    last_sig_prune = 0.0  # 0 -> prune on the first cycle (trims on every restart)
     prev_state = None
     # Arm the internal liveness watchdog: if a cycle wedges (hung socket,
     # deadlock) and stops bumping _loop_alive, self-restart via systemd well
@@ -1637,6 +1642,18 @@ def main():
                          state.value, buf.status_line(),
                          buf.seconds_since_msg())
                 db.set_state("risk_state", state.value)
+
+            # d2. prune signal_history to the retention window (hourly, indexed
+            # on ts_utc — cheap). Bounded growth without an external cron job.
+            if time.time() - last_sig_prune >= 3600:
+                last_sig_prune = time.time()
+                try:
+                    n = db.prune_signal_history(signal_retention_days)
+                    if n:
+                        log.info("pruned %d signal_history rows older than %dd",
+                                 n, signal_retention_days)
+                except Exception as e:
+                    log.warning("signal_history prune failed: %s", e)
 
             # e. sleep out the cycle
             time.sleep(max(0.5, loop_s - (time.time() - cycle_start)))

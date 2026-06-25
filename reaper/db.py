@@ -159,6 +159,19 @@ class DB:
                 f"VALUES ({','.join('?' * len(cols))})",
                 tuple(row.get(k) for k in cols))
 
+    def prune_signal_history(self, retention_days: int = 7) -> int:
+        """Delete signal_history rows older than retention_days; return the
+        number removed. Keeps the table bounded (~one band×coin row per voter
+        evaluation every loop adds up fast). ts_utc is ISO8601 UTC, so a
+        lexicographic compare against an ISO cutoff is chronological."""
+        import datetime as _dt
+        cutoff = (_dt.datetime.now(_dt.timezone.utc)
+                  - _dt.timedelta(days=retention_days)).isoformat()
+        with self._conn() as c:
+            cur = c.execute(
+                "DELETE FROM signal_history WHERE ts_utc < ?", (cutoff,))
+            return cur.rowcount
+
     def insert_funding(self, coin: str, rows: list[dict]):
         with self._conn() as c:
             c.executemany(
