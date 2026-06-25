@@ -1,17 +1,17 @@
 {
   "/_not-found/page": "app/_not-found/page.js",
   "/controls/page": "app/controls/page.js",
-  "/page": "app/page.js",
   "/history/page": "app/history/page.js",
+  "/page": "app/page.js",
   "/risk/page": "app/risk/page.js",
   "/signals/page": "app/signals/page.js",
-  "/docs/controls/page": "app/docs/controls/page.js",
   "/docs/bands/page": "app/docs/bands/page.js",
   "/docs/glossary/page": "app/docs/glossary/page.js",
-  "/docs/models/page": "app/docs/models/page.js",
-  "/docs/page": "app/docs/page.js",
-  "/docs/risk/page": "app/docs/risk/page.js",
   "/docs/dashboard/page": "app/docs/dashboard/page.js",
-  "/docs/presets/page": "app/docs/presets/page.js",
-  "/docs/how-it-works/page": "app/docs/how-it-works/page.js"
+  "/docs/models/page": "app/docs/models/page.js",
+  "/docs/controls/page": "app/docs/controls/page.js",
+  "/docs/page": "app/docs/page.js",
+  "/docs/how-it-works/page": "app/docs/how-it-works/page.js",
+  "/docs/risk/page": "app/docs/risk/page.js",
+  "/docs/presets/page": "app/docs/presets/page.js"
 }
