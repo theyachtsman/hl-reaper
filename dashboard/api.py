@@ -1179,23 +1179,121 @@ def signal_history_count(coin: str | None = None, band: str | None = None,
     return {"count": r[0]["n"] if r else 0}
 
 
+def _candles_range(coin: str, interval: str, start_ms: int,
+                   end_ms: int) -> list[dict]:
+    """Candle closes for an explicit [start, end] window (ms). Unlike _candles
+    (now-anchored, for the live chart) this serves historical export windows."""
+    raw = cache.info.candles_snapshot(coin, interval, int(start_ms), int(end_ms))
+    out = [{"time": int(c["t"]) // 1000, "close": float(c["c"])} for c in raw]
+    out.sort(key=lambda c: c["time"])
+    return out
+
+
+# forward-return columns appended to the signal_history export (export-only —
+# never stored, computed from HL candle closes at request time).
+FWD_RET_COLS = ("fwd_ret_5m", "fwd_ret_15m", "fwd_ret_30m")
+
+
+def _signal_forward_returns(out: list[dict]) -> dict:
+    """{row id: {fwd_ret_5m, fwd_ret_15m, fwd_ret_30m}} for the given signal
+    rows, as % price change from the candle containing the signal to the candle
+    N minutes later. Scalp -> 5m grid (all three windows); trend -> 1h grid
+    (only the next 1h close, mapped to fwd_ret_30m; the other two stay None).
+
+    A forward window is None when its candle isn't fully closed yet (recent
+    signals) or when candle data is unavailable — never a partial/derived value.
+    This runs in the bridge (separate process from the bot), so closes come from
+    HL's REST candles, not the bot's in-memory TA buffers — same underlying data.
+    Any failure degrades to None for the affected rows; the export never errors."""
+    import datetime as _dt
+
+    def _ts(s):
+        try:
+            return _dt.datetime.fromisoformat(s).timestamp()
+        except Exception:
+            return None
+
+    band_interval = lambda b: "5m" if b == "scalp" else "1h"  # noqa: E731
+    now_sec = time.time()
+
+    # 1. group signal times by (coin, interval) so we fetch ONE candle series per
+    #    pair across the whole window (+30m forward headroom), not per row.
+    groups: dict = {}
+    for r in out:
+        t = _ts(r.get("ts_utc"))
+        if t is None:
+            continue
+        groups.setdefault((r["coin"], band_interval(r.get("band"))), []).append(t)
+
+    # 2. fetch + build {candle_open_sec: close} per pair (best-effort per pair).
+    close_maps: dict = {}
+    for (coin, interval), times in groups.items():
+        sec = INTERVAL_SEC[interval]
+        try:
+            cs = _candles_range(coin, interval,
+                                int((min(times) - sec) * 1000),
+                                int((max(times) + 1800 + sec) * 1000))
+            close_maps[(coin, interval)] = {c["time"]: c["close"] for c in cs}
+        except Exception as e:
+            log.warning("forward-return candle fetch failed %s %s: %s",
+                        coin, interval, e)
+            close_maps[(coin, interval)] = {}
+
+    # 3. per-row lookup. A forward candle is only used once fully closed
+    #    (fwd_open + interval <= now) so recent signals yield None, not partials.
+    res: dict = {}
+    for r in out:
+        vals = {c: None for c in FWD_RET_COLS}
+        res[r.get("id")] = vals
+        t = _ts(r.get("ts_utc"))
+        scalp = r.get("band") == "scalp"
+        interval = "5m" if scalp else "1h"
+        sec = INTERVAL_SEC[interval]
+        cmap = close_maps.get((r["coin"], interval), {})
+        if t is None or not cmap:
+            continue
+        t_open = int(t // sec) * sec
+        base = cmap.get(t_open)
+        if not base:
+            continue
+        windows = (("fwd_ret_5m", 300), ("fwd_ret_15m", 900),
+                   ("fwd_ret_30m", 1800)) if scalp else (("fwd_ret_30m", sec),)
+        for col, offset in windows:
+            fwd_open = t_open + offset
+            if fwd_open + sec > now_sec:      # forward candle not closed yet
+                continue
+            fwd = cmap.get(fwd_open)
+            if fwd:
+                vals[col] = round((fwd - base) / base * 100, 4)
+    return res
+
+
 @app.get("/api/signal-history/export.csv")
 def signal_history_export(coin: str | None = None, band: str | None = None,
                           from_ts: str | None = None, to_ts: str | None = None,
                           cleared_only: bool = False):
     """CSV of signal_history honoring the same filters. No row limit — the
-    whole point is to analyze the blocked signals externally. Hand to Claude."""
+    whole point is to analyze the blocked signals externally. Hand to Claude.
+    Appends forward-return columns (computed from candle closes at export time,
+    never stored) so the CSV is a self-contained model-validation dataset."""
     import csv as _csv
     import io as _io
     where, params = _signal_history_where(coin, band, from_ts, to_ts,
                                           cleared_only)
     out = rows(f"SELECT * FROM signal_history{where} ORDER BY ts_utc DESC",
                *params)
+    try:
+        fwd = _signal_forward_returns(out)
+    except Exception as e:
+        log.warning("forward-return computation failed: %s", e)
+        fwd = {}
     buf = _io.StringIO()
     w = _csv.writer(buf)
-    w.writerow(SIGNAL_HISTORY_CSV_COLS)
+    w.writerow(SIGNAL_HISTORY_CSV_COLS + FWD_RET_COLS)
     for r in out:
-        w.writerow([r.get(c) for c in SIGNAL_HISTORY_CSV_COLS])
+        fr = fwd.get(r.get("id")) or {}
+        w.writerow([r.get(c) for c in SIGNAL_HISTORY_CSV_COLS]
+                   + [fr.get(c) for c in FWD_RET_COLS])
     tag = lambda s: (s or "").replace(":", "").replace(" ", "")[:19] or "all"  # noqa: E731
     fname = f"hl_reaper_signals_{tag(from_ts)}_{tag(to_ts)}.csv"
     return Response(buf.getvalue(), media_type="text/csv",
