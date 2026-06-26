@@ -469,6 +469,22 @@ export default function ControlsPage() {
         <div className="text-xs text-slate-500">
           No structural gates — the trend band&apos;s own 1h signal is its gate.
         </div>
+        <div className="label pt-1 text-purple-300/80">Regime Memory</div>
+        <div className="text-xs text-slate-500">
+          Suppresses a trend entry when the recent dominant 1h regime opposes its
+          direction (LONG vs TRENDING_DOWN, SHORT vs TRENDING_UP) — stops the bot
+          buying every bounce in a sustained downtrend. Not a gate: confidence and
+          model weights are untouched, it only blocks opening the position.
+        </div>
+        <Toggle cfg={cfg} ck="trading.regime_memory_enabled"
+          label="Regime memory enabled" onApply={setKey} onReset={clearKey} />
+        <Slider cfg={cfg} ck="trading.regime_memory_window" label="Regime memory window"
+          min={2} max={8} step={1} unit=" candles" onApply={setKey} onReset={clearKey}
+          note="default 4 · number of 1h candles to consider · smaller = more responsive to direction changes" />
+        <Slider cfg={cfg} ck="trading.regime_memory_threshold" label="Opposing regime threshold"
+          min={0.30} max={0.80} step={0.05} dp={2} onApply={setKey} onReset={clearKey}
+          note="default 0.50 · fraction of recent candles that must oppose entry to suppress it · lower = more suppression" />
+        <RegimeMemoryBuffer regime={status?.regime_history} />
         <div className="label pt-1">Risk / Stop Loss</div>
         <Slider cfg={cfg} ck="risk.trend_atr_sl_multiplier" label="ATR Stop Loss Multiplier"
           min={0.5} max={5.0} step={0.1} unit="x" dp={1} onApply={setKey} onReset={clearKey} />
@@ -762,6 +778,64 @@ function DirectionControls({
         ⚠ Disabling both directions halts all new entries — not allowed (the
         last enabled side can't be turned off). Takes effect within ~10s, no restart.
       </div>
+    </div>
+  );
+}
+
+// Live view of the bot's per-coin regime-memory buffers (published to bot_state
+// each loop). Gives context for tuning the window/threshold above: you can see
+// exactly what the trend band is remembering. oldest → newest, left to right.
+const REGIME_COLOR: Record<string, string> = {
+  TRENDING_UP: "text-emerald-300",
+  TRENDING_DOWN: "text-red-300",
+  RANGING: "text-slate-300",
+  HIGH_VOL: "text-amber-300",
+  UNKNOWN: "text-slate-600",
+};
+function RegimeMemoryBuffer({ regime }: { regime: any }) {
+  if (!regime) {
+    return (
+      <div className="text-xs text-slate-500 mono">
+        regime buffers — waiting for bot… (empty after a restart; fills one entry
+        per closed 1h candle)
+      </div>
+    );
+  }
+  const coins: Record<string, string[]> = regime.coins ?? {};
+  const dominant: Record<string, string> = regime.dominant ?? {};
+  const names = Object.keys(coins).sort();
+  return (
+    <div className="border border-edge rounded-lg p-2 grid gap-1">
+      <div className="text-xs text-slate-500">
+        Current buffers {regime.enabled ? "" : "(memory DISABLED)"} · window{" "}
+        {regime.window} · threshold {Number(regime.threshold).toFixed(2)}
+      </div>
+      {names.length === 0 ? (
+        <div className="text-xs text-slate-600 mono">no regimes recorded yet</div>
+      ) : (
+        names.map((c) => (
+          <div key={c} className="text-xs mono flex items-baseline gap-2">
+            <span className="w-12 text-slate-300">{c}</span>
+            <span className="flex-1">
+              {(coins[c] ?? []).length === 0 ? (
+                <span className="text-slate-600">—</span>
+              ) : (
+                (coins[c] ?? []).map((r, i) => (
+                  <span key={i}>
+                    {i > 0 && <span className="text-slate-600">, </span>}
+                    <span className={REGIME_COLOR[r] ?? "text-slate-400"}>{r}</span>
+                  </span>
+                ))
+              )}
+            </span>
+            {dominant[c] && (
+              <span className="text-slate-500">
+                dom: <span className={REGIME_COLOR[dominant[c]] ?? "text-slate-400"}>{dominant[c]}</span>
+              </span>
+            )}
+          </div>
+        ))
+      )}
     </div>
   );
 }

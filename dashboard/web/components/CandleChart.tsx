@@ -240,14 +240,14 @@ export default function CandleChart() {
     lines.push(series.createPriceLine({
       price: entry, color: "#60a5fa", lineWidth: 1,
       lineStyle: LineStyle.Dashed, axisLabelVisible: true,
-      title: `ENTRY  ${fmtPx(entry)}`,
+      title: `ENTRY`,
     }));
     if (tp != null && Number.isFinite(tp)) {
       const gain = (long ? tp - entry : entry - tp) * size;
       lines.push(series.createPriceLine({
         price: tp, color: "#4ade80", lineWidth: 1,
         lineStyle: LineStyle.Dashed, axisLabelVisible: true,
-        title: `TP  ${fmtPx(tp)}${size ? `  +$${gain.toFixed(2)}` : ""}`,
+        title: `TP${size ? `  +$${gain.toFixed(2)}` : ""}`,
       }));
       bandSeriesRef.current.push(
         mkBand(chart, entry, tp, "rgba(74,222,128,0.12)", lo, hi));
@@ -257,7 +257,7 @@ export default function CandleChart() {
       lines.push(series.createPriceLine({
         price: sl, color: "#f87171", lineWidth: 1,
         lineStyle: LineStyle.Dashed, axisLabelVisible: true,
-        title: `SL  ${fmtPx(sl)}${size ? `  -$${Math.abs(loss).toFixed(2)}` : ""}`,
+        title: `SL${size ? `  -$${Math.abs(loss).toFixed(2)}` : ""}`,
       }));
       bandSeriesRef.current.push(
         mkBand(chart, entry, sl, "rgba(248,113,113,0.12)", lo, hi));

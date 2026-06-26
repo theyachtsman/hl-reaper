@@ -241,6 +241,17 @@ trading:
   # changed market. Scalp is short-lived; trend tolerates more lag.
   scalp_armed_ttl_seconds: 75
   trend_armed_ttl_seconds: 75
+  # Regime memory (2026-06-26): trend-band pre-entry check. The trend band has
+  # no regime memory — a single RANGING candle in a sustained downtrend re-opens
+  # full LONG conviction, so the bot fires confidently-wrong LONGs on every
+  # bounce (June 25-26 signal history: 30.8% accuracy, avg 30m return -0.61%).
+  # Keep a rolling buffer of the last `window` 1h regime reads and SUPPRESS a
+  # trend entry when >=`threshold` of them oppose the direction (LONG opposed by
+  # TRENDING_DOWN, SHORT by TRENDING_UP). Not a gate — conf/weights untouched;
+  # only blocks opening the position. Scalp band is unaffected. Hot-reloadable.
+  regime_memory_enabled: true
+  regime_memory_window: 4         # number of 1h candles to remember (2-8)
+  regime_memory_threshold: 0.5    # fraction of window opposing -> suppress (0.30-0.80)
   # LONG structural gate (2026-06-17): supersedes the old OB/VWAP confirmation
   # (Change B). A LONG must clear ALL THREE structural signals — spot LEADING
   # perp (real demand, not leverage), OI RISING (fresh longs entering), and the

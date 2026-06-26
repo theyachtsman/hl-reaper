@@ -17,6 +17,14 @@ export type Status = {
   recorder_heartbeat_age_s: number | null;
   cache_age_s: number;
   coins: string[];
+  regime_history?: {
+    ts: number;
+    enabled: boolean;
+    window: number;
+    threshold: number;
+    dominant: Record<string, string>;
+    coins: Record<string, string[]>;
+  } | null;
 };
 
 type StatusStore = {

@@ -12,6 +12,7 @@ import sqlite3
 import sys
 import threading
 import time
+from collections import Counter, deque
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -156,6 +157,52 @@ def _momentum_cooldown_ok(coin: str, buf, params: dict) -> tuple[bool, str, dict
         return (False, f"pump_15m:+{move_3*100:.3f}%>{thr_3*100:.1f}%", moves)
     return (True, f"momentum_ok:5m={move_1*100:.3f}% 10m={move_2*100:.3f}% "
             f"15m={move_3*100:.3f}%", moves)
+
+
+# --- Regime memory (2026-06-26) --------------------------------------------
+# The trend band has no regime memory: it treats every 1h evaluation as
+# independent, so a single RANGING candle in a sustained downtrend immediately
+# re-opens the door to full LONG conviction (VWAP sees price below session VWAP
+# as "cheap", Momentum sees the bounce velocity). The June 25-26 signal history
+# shows this firing confidently-wrong LONGs on every bounce (30.8% accuracy,
+# avg 30m return -0.61%). Regime memory keeps a rolling buffer of the last N 1h
+# regime reads and SUPPRESSES a trend entry whose direction is contradicted by
+# the recent dominant regime. It is NOT a gate — confidence scores and model
+# weights are untouched; it only blocks opening a position the regime history
+# argues against. Trend band only (scalp has its own structural gates).
+def get_dominant_regime(history) -> str:
+    """Most common regime in recent history (UNKNOWN if empty)."""
+    if not history:
+        return "UNKNOWN"
+    return Counter(history).most_common(1)[0][0]
+
+
+def regime_allows_entry(history, direction: str,
+                        threshold: float = 0.5) -> bool:
+    """True if the recent regime history is consistent with `direction`.
+
+    `threshold` is the fraction of recent regimes that must OPPOSE the entry to
+    suppress it (default 0.5 -> suppress if >=50% of the window opposes). LONG is
+    opposed by TRENDING_DOWN, SHORT by TRENDING_UP. With <2 samples there is not
+    enough history to judge, so the entry is allowed (warmup is fail-open)."""
+    if not history or len(history) < 2:
+        return True  # insufficient history — allow entry
+    counts = Counter(history)
+    total = len(history)
+    if direction == LONG:
+        return counts.get("TRENDING_DOWN", 0) / total < threshold
+    if direction == SHORT:
+        return counts.get("TRENDING_UP", 0) / total < threshold
+    return True  # FLAT or unknown — allow
+
+
+def regime_memory_reason(history, direction: str) -> str:
+    """signal_history gate_block_reason string for a suppressed entry, e.g.
+    'regime_memory: 75% TRENDING_DOWN in last 4 evals'."""
+    opp = "TRENDING_DOWN" if direction == LONG else "TRENDING_UP"
+    n = len(history) if history else 0
+    frac = (Counter(history).get(opp, 0) / n) if n else 0.0
+    return f"regime_memory: {frac:.0%} {opp} in last {n} evals"
 
 
 def long_structural_gate(coin: str, buf, params: dict) -> tuple[bool, dict]:
@@ -692,10 +739,17 @@ def _signal_gate_eval(sig, threshold: float, required: int,
 
 def _signal_history_fields(coin: str, band: str, sig, tickets: list,
                            threshold: float, required: int,
-                           conf_pre_bias: float | None, trade_id) -> dict:
-    """Build a signal_history row dict from an aggregator evaluation."""
+                           conf_pre_bias: float | None, trade_id,
+                           override_block_reason: str | None = None) -> dict:
+    """Build a signal_history row dict from an aggregator evaluation.
+
+    `override_block_reason` forces the row to NOT-cleared with that reason — used
+    by the trend band's regime-memory suppression, which blocks an otherwise
+    gate-clearing signal for a reason the conf/agreement gate eval can't see."""
     import datetime as _dt
     cleared, reason = _signal_gate_eval(sig, threshold, required, conf_pre_bias)
+    if override_block_reason:
+        cleared, reason = False, override_block_reason
     votes = {t.model: f"{t.direction}:{t.confidence:.2f}" for t in tickets}
     # bool is a subclass of int — guard so a truthy non-id return never lands in
     # the trade_id column as 0/1.
@@ -769,6 +823,11 @@ def main():
     # armed (clearing the gate but not filling) longer than this; per-band.
     scalp_armed_ttl = float(t_raw.get("scalp_armed_ttl_seconds", 20))
     trend_armed_ttl = float(t_raw.get("trend_armed_ttl_seconds", 45))
+    # Regime memory (2026-06-26): trend-band pre-entry check — suppress a trend
+    # entry whose direction is contradicted by the recent 1h regime history.
+    regime_memory_enabled = bool(t_raw.get("regime_memory_enabled", True))
+    regime_memory_window = int(t_raw.get("regime_memory_window", 4))
+    regime_memory_threshold = float(t_raw.get("regime_memory_threshold", 0.5))
     # LONG structural gate (2026-06-17): supersedes the old Change B OB/VWAP
     # confirmation. A LONG must clear ALL of {spot leading, OI rising, book
     # bid-heavy}, else skip. SHORTs (the working side) are never gated.
@@ -908,6 +967,18 @@ def main():
     armed_signals = ArmedSignalTracker()
     log.info("armed-signal TTL ENABLED — drop stale setups: scalp %.0fs, "
              "trend %.0fs", scalp_armed_ttl, trend_armed_ttl)
+    # Regime memory buffers (2026-06-26): per-coin rolling deque of the last
+    # `window` 1h regime reads + the last trend candle ts that fed each buffer
+    # (so we append once per CLOSED 1h candle, not once per ~10s loop). Start
+    # EMPTY — entries are allowed until a buffer has >=2 samples (fail-open
+    # warmup), which is correct: a fresh restart has no regime history to argue
+    # against. The buffers are NOT persisted; they refill from live candles.
+    regime_history: dict[str, deque] = {}
+    last_regime_candle_t: dict[str, int] = {}
+    if regime_memory_enabled:
+        log.info("REGIME MEMORY ENABLED (trend band) — suppress entries when "
+                 ">=%.0f%% of the last %d 1h regimes oppose the direction",
+                 regime_memory_threshold * 100, regime_memory_window)
     if entry_style == "maker" and fallback_enabled:
         log.info("maker timeout->taker fallback ENABLED — fire after %d "
                  "consecutive timeouts within %.0fs, skip if move > %.1fxATR",
@@ -1273,6 +1344,11 @@ def main():
             maker_streaks.window_s = fallback_window_s
             scalp_armed_ttl = float(t_raw.get("scalp_armed_ttl_seconds", 20))
             trend_armed_ttl = float(t_raw.get("trend_armed_ttl_seconds", 45))
+            regime_memory_enabled = bool(
+                t_raw.get("regime_memory_enabled", True))
+            regime_memory_window = int(t_raw.get("regime_memory_window", 4))
+            regime_memory_threshold = float(
+                t_raw.get("regime_memory_threshold", 0.5))
             long_struct = long_structural_params(
                 t_raw, cfg._raw.get("models", {}) or {})
             short_struct = short_structural_params(
@@ -1526,6 +1602,23 @@ def main():
                     trend_regime = (trend_rt.direction
                                     if trend_rt and trend_rt.direction in REGIME_NAMES
                                     else "UNKNOWN")
+                    # regime-memory buffer: append the freshly-classified 1h
+                    # regime ONCE per closed trend candle (keyed on the candle
+                    # ts), so the deque tracks the last `window` HOURS of regime,
+                    # not the last `window` ~10s loops. Rebuild the deque when the
+                    # window is hot-reloaded (preserving the most recent samples).
+                    rh = regime_history.get(coin)
+                    if rh is None or rh.maxlen != regime_memory_window:
+                        rh = deque(list(rh or [])[-regime_memory_window:],
+                                   maxlen=regime_memory_window)
+                        regime_history[coin] = rh
+                    tc = buf.latest_candles(coin, trend_interval, 1)
+                    cur_ct = tc[-1]["t"] if tc else None
+                    if (cur_ct is not None
+                            and cur_ct != last_regime_candle_t.get(coin)
+                            and trend_regime in REGIME_NAMES):
+                        rh.append(trend_regime)
+                        last_regime_candle_t[coin] = cur_ct
                     trend_sig = aggregator.aggregate(
                         coin, trend_tickets, weights=TREND_WEIGHTS,
                         regime_routing=False, book_regime=trend_regime)
@@ -1585,10 +1678,30 @@ def main():
                     # never stale at submission — and the armed-signal TTL above
                     # bounds the across-cycle case.)
                     trend_tid = scalp_tid = None
+                    trend_rm_reason = None  # regime-memory suppression reason
                     if trend_band_enabled and trend_sig.direction != FLAT:
-                        trend_tid = open_entry(coin, trend_sig, "trend",
-                                               g_allowed, g_detail, s_allowed,
-                                               s_detail)
+                        # Regime-memory pre-entry check (trend band only): if the
+                        # recent dominant 1h regime opposes this direction, skip
+                        # the entry (does NOT touch conf/weights — see
+                        # regime_allows_entry). Buffer warmup is fail-open.
+                        if (regime_memory_enabled and not regime_allows_entry(
+                                rh, trend_sig.direction,
+                                regime_memory_threshold)):
+                            trend_rm_reason = regime_memory_reason(
+                                rh, trend_sig.direction)
+                            log.info("[REGIME_MEMORY] %s %s suppressed — recent "
+                                     "regime history: %s", coin,
+                                     trend_sig.direction, list(rh))
+                            if _should_log_skip(coin, "regime_memory"):
+                                db.log_trade(
+                                    coin, trend_sig.direction, "OPEN",
+                                    band="trend",
+                                    status="regime_memory_suppressed",
+                                    note=f"skip: {trend_rm_reason}")
+                        else:
+                            trend_tid = open_entry(coin, trend_sig, "trend",
+                                                   g_allowed, g_detail,
+                                                   s_allowed, s_detail)
                     if (not trend_tid and scalp_band_enabled
                             and scalp_sig.direction != FLAT):
                         scalp_tid = open_entry(coin, scalp_sig, "scalp",
@@ -1604,7 +1717,8 @@ def main():
                         db.log_signal_history(_signal_history_fields(
                             coin, "trend", trend_sig, trend_tickets,
                             tpb["min_confidence"], tpb["min_model_agreement"],
-                            None, trend_tid))
+                            None, trend_tid,
+                            override_block_reason=trend_rm_reason))
                         db.log_signal_history(_signal_history_fields(
                             coin, "scalp", scalp_sig, scalp_tickets,
                             sp["min_confidence"], sp["min_model_agreement"],
@@ -1632,6 +1746,18 @@ def main():
                 c: {"entry": t["entry_px"], "sl": t["sl"], "tp": t["tp"],
                     "is_long": t["is_long"], "band": t.get("band")}
                 for c, t in risk._pos_track.items()}, default=str))
+
+            # publish the regime-memory buffers so the Controls page can show
+            # what the trend band is remembering per coin (oldest -> newest).
+            db.set_state("regime_history", json.dumps({
+                "ts": int(time.time() * 1000),
+                "enabled": regime_memory_enabled,
+                "window": regime_memory_window,
+                "threshold": regime_memory_threshold,
+                "dominant": {c: get_dominant_regime(h)
+                             for c, h in regime_history.items()},
+                "coins": {c: list(h) for c, h in regime_history.items()},
+            }, default=str))
 
             # d. heartbeat + status
             hb_path.write_text(str(int(time.time())))

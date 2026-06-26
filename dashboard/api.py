@@ -377,6 +377,7 @@ def status():
         "recorder_heartbeat_age_s": rec_age,
         "cache_age_s": round(time.time() - cache.updated, 1),
         "coins": COINS,
+        "regime_history": json.loads(get_state("regime_history") or "null"),
     }
 
 
@@ -1544,6 +1545,12 @@ CONFIG_SCHEMA: dict[str, dict] = {
     # Regime bias connector: 1h regime dampens counter-trend scalp confidence
     "risk.regime_counter_trend_penalty": {"type": "float", "min": 0.3,
                                           "max": 1.0},
+    # Regime memory (2026-06-26): trend-band pre-entry suppression when the
+    # recent dominant 1h regime opposes the proposed direction.
+    "trading.regime_memory_enabled": {"type": "bool"},
+    "trading.regime_memory_window": {"type": "int", "min": 2, "max": 8},
+    "trading.regime_memory_threshold": {"type": "float", "min": 0.30,
+                                        "max": 0.80},
     # ---- TAModel regime-aware trending RSI thresholds (2026-06-24) ----------
     # In TRENDING_UP/DOWN, TA uses these relaxed RSI thresholds so it agrees with
     # the trend at moderate RSI instead of abstaining (FLAT). RANGING/HIGH_VOL
