@@ -906,10 +906,11 @@ def main():
     # thresholds in place, like ta_model / funding_model.
     mom_cfg = (m_raw.get("momentum", {}) or {})
     momentum_model = MomentumModel(
-        short_threshold=float(mom_cfg.get("short_threshold", -0.003)),
-        long_threshold=float(mom_cfg.get("long_threshold", 0.003)),
-        full_conf_move=float(mom_cfg.get("full_conf_move", 0.010)),
-        min_candles=int(mom_cfg.get("min_candles", 15)))
+        enter_z=float(mom_cfg.get("enter_z", 0.6)),
+        full_conf_z=float(mom_cfg.get("full_conf_z", 2.6)),
+        vol_window=int(mom_cfg.get("vol_window", 14)),
+        lookbacks=tuple(mom_cfg.get("lookbacks", (1, 2, 3))),
+        min_candles=int(mom_cfg.get("min_candles", 20)))
     models = [
         RegimeDetectorModel(),   # first: publishes regime for the others
         ta_model,
@@ -1407,12 +1408,14 @@ def main():
             # Momentum thresholds + ranging weight damp — hot-reload in place
             # from the (override-merged) config each loop (like TA / funding).
             mom_c = (cfg._raw.get("models", {}) or {}).get("momentum", {}) or {}
-            momentum_model.short_threshold = float(
-                mom_c.get("short_threshold", momentum_model.short_threshold))
-            momentum_model.long_threshold = float(
-                mom_c.get("long_threshold", momentum_model.long_threshold))
-            momentum_model.full_conf_move = float(
-                mom_c.get("full_conf_move", momentum_model.full_conf_move))
+            momentum_model.enter_z = float(
+                mom_c.get("enter_z", momentum_model.enter_z))
+            momentum_model.full_conf_z = float(
+                mom_c.get("full_conf_z", momentum_model.full_conf_z))
+            momentum_model.vol_window = int(
+                mom_c.get("vol_window", momentum_model.vol_window))
+            momentum_model.lookbacks = tuple(
+                mom_c.get("lookbacks", momentum_model.lookbacks))
             momentum_model.min_candles = int(
                 mom_c.get("min_candles", momentum_model.min_candles))
             new_mom_damp = float(

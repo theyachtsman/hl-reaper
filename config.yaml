@@ -168,17 +168,27 @@ models:
       rsi_long: 38             # downtrend: LONG only at this extreme oversold
       rsi_neutral_low: 48      # confidence anchor: firing edge -> conf ~0.40
       rsi_neutral_high: 55     # +0.20 conf per (high-low) of extra RSI travel
-  # MomentumModel (2026-06-24): price-velocity / trend-following voter. Reads the
-  # weighted rate-of-change of close over 3/6/12 candles and votes WITH a fast
-  # move (SHORT on a hard drop, LONG on a hard pump). Added after a -4.86% BTC
-  # drop during which the ensemble called LONG the whole way down. Hot-reloadable
+  # MomentumModel (2026-06-24, rewritten 2026-06-26): price-velocity /
+  # trend-following voter. Reads the weighted rate-of-change of close over the
+  # `lookbacks` candles and votes WITH a fast move (SHORT on a hard drop, LONG on
+  # a hard pump). Added after a -4.86% BTC drop during which the ensemble called
+  # LONG the whole way down.
+  #
+  # The composite ROC is normalized by the band's own recent per-candle
+  # volatility into a z-score (move in units of sigma), so thresholds are
+  # scale-free across intervals/regimes and confidence spans its range instead of
+  # railing. The 3/6/12 lookback was shortened to (1,2,3): on the 1h band the old
+  # windows spanned 3-12 HOURS and a fresh down-leg was swamped by a stale bounce,
+  # so the model voted confident LONG into a steady slide (anti-predictive in
+  # forward-return validation — see scripts/diagnose_momentum.py). Hot-reloadable
   # via live_config (keys models.momentum.*), re-read by run_bot each loop.
   momentum:
     enabled: true
-    short_threshold: -0.003    # -0.3% weighted composite move triggers SHORT
-    long_threshold: 0.003      # +0.3% weighted composite move triggers LONG
-    full_conf_move: 0.010      # 1.0% composite = full confidence (0.95 ceiling)
-    min_candles: 15            # minimum candles required to vote (else FLAT)
+    lookbacks: [1, 2, 3]       # ROC windows in candles (recent-weighted 0.5/0.3/0.2)
+    vol_window: 14             # trailing per-candle returns for the z denominator
+    enter_z: 0.6               # |z| >= 0.6 sigma triggers a vote (SHORT/LONG)
+    full_conf_z: 2.6           # |z| == 2.6 sigma = full confidence (0.95 ceiling)
+    min_candles: 20            # minimum candles required to vote (else FLAT)
     ranging_weight_damp: 0.70  # 70% of full weight in a RANGING regime (noisier)
 
 # ---- aggregator: regime-aware weight dampening ----

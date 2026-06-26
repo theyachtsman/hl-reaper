@@ -7,11 +7,29 @@ oversold freefall as a bounce setup while no model answered the one question tha
 matters in a fast move: "is price moving hard in one direction RIGHT NOW?"
 
 Unlike the other directional models this one ignores support levels, funding, and
-book depth. It measures the rate of change of close over three lookback windows,
-blends them (recent matters more), and votes SHORT on strong downward momentum /
-LONG on strong upward momentum. It is a TREND-FOLLOWING signal by construction —
-it never fades the move.
+book depth. It measures the rate of change of close over a few short lookback
+windows, blends them (recent matters more), and votes SHORT on strong downward
+momentum / LONG on strong upward momentum. It is a TREND-FOLLOWING signal by
+construction — it never fades the move.
+
+2026-06-26 rewrite (sign/saturation fix). A full day of signal logging exposed two
+defects on the 1h trend band:
+  1. Confidence railed to the 0.95 ceiling on >75% of votes — `full_conf_move`
+     (1.0%) was tiny next to the composite moves a 1h band actually produces
+     (p90 ~ 1.5-1.9%), so almost everything clamped to the cap.
+  2. "Confident LONG into a drop." The 3/6/12-candle lookback on a 1h band spans
+     3-12 HOURS; a fresh 2h down-leg was swamped by a 6h-old bounce off a low, so
+     the composite stayed POSITIVE and the model voted max-confidence LONG into a
+     steady slide (forward-return validation: anti-predictive at every horizon).
+
+Both are fixed by (a) shortening the lookback to (1,2,3) candles so it reads the
+RECENT move, and (b) normalizing the composite by the band's own recent
+volatility (a z-score). The z-score is scale-free — the same thresholds work
+regardless of the candle interval or volatility regime, and confidence spans its
+range instead of railing. See scripts/diagnose_momentum.py for the validation.
 """
+import statistics
+
 from reaper.logger import get_logger
 from reaper.models import BaseModel, LONG, SHORT, Ticket, candles_to_df
 
@@ -21,73 +39,91 @@ log = get_logger("model.momentum")
 class MomentumModel(BaseModel):
     name = "MomentumModel"
 
-    # Weighted composite of three rate-of-change windows. Recent ROC dominates
-    # so a sharp fresh move registers before the slower windows catch up.
-    ROC_WEIGHTS = (0.50, 0.30, 0.20)  # (roc_3, roc_6, roc_12)
+    # Weighted composite of the rate-of-change windows. Recent ROC dominates so a
+    # sharp fresh move registers before the slower windows catch up.
+    ROC_WEIGHTS = (0.50, 0.30, 0.20)
 
-    def __init__(self, short_threshold: float = -0.003,
-                 long_threshold: float = 0.003,
-                 full_conf_move: float = 0.010,
-                 min_candles: int = 15):
-        # composite move that starts registering a vote (signed)
-        self.short_threshold = short_threshold   # e.g. -0.003 = -0.3%
-        self.long_threshold = long_threshold     # e.g. +0.003 = +0.3%
-        # composite move that pins confidence to the 0.95 ceiling
-        self.full_conf_move = full_conf_move     # e.g. 0.010 = 1.0%
+    def __init__(self, enter_z: float = 0.6,
+                 full_conf_z: float = 2.6,
+                 vol_window: int = 14,
+                 lookbacks: tuple[int, ...] = (1, 2, 3),
+                 min_candles: int = 20):
+        # composite z-score (move in units of recent per-candle volatility) at
+        # which a vote starts registering; symmetric for LONG and SHORT.
+        self.enter_z = enter_z
+        # composite z-score that pins confidence to the 0.95 ceiling.
+        self.full_conf_z = full_conf_z
+        # trailing per-candle returns used to estimate volatility (the z denominator)
+        self.vol_window = vol_window
+        # ROC lookbacks in candles; len must match ROC_WEIGHTS
+        self.lookbacks = tuple(lookbacks)
         self.min_candles = min_candles
 
     def compute(self, coin: str, buf, interval: str | None = None) -> Ticket:
         try:
-            # roc_12 needs close[-13]; require min_candles (>=15) for headroom.
+            need = max(self.vol_window + 1, max(self.lookbacks) + 1,
+                       self.min_candles)
             df = candles_to_df(
-                buf.latest_candles(coin, interval or "1m", self.min_candles + 5))
+                buf.latest_candles(coin, interval or "1m", need + 5))
             if len(df) < self.min_candles:
                 return self.flat(reason="insufficient_candles", n=len(df))
-            close = df["c"]
-            c_now = float(close.iloc[-1])
-            c_3 = float(close.iloc[-4])
-            c_6 = float(close.iloc[-7])
-            c_12 = float(close.iloc[-13])
-            if c_3 <= 0 or c_6 <= 0 or c_12 <= 0:
-                return self.flat(reason="bad_price")
+            close = df["c"].to_numpy(dtype=float)
+            c_now = float(close[-1])
 
-            roc_3 = (c_now - c_3) / c_3
-            roc_6 = (c_now - c_6) / c_6
-            roc_12 = (c_now - c_12) / c_12
-            w3, w6, w12 = self.ROC_WEIGHTS
-            composite = roc_3 * w3 + roc_6 * w6 + roc_12 * w12
+            # weighted composite ROC over the (recent) lookback windows
+            rocs = []
+            composite = 0.0
+            for n, w in zip(self.lookbacks, self.ROC_WEIGHTS):
+                past = float(close[-1 - n])
+                if past <= 0:
+                    return self.flat(reason="bad_price")
+                roc = (c_now - past) / past
+                rocs.append(roc)
+                composite += roc * w
+
+            # recent per-candle return volatility -> scale-free denominator
+            window = close[-(self.vol_window + 1):]
+            rets = [(window[i] - window[i - 1]) / window[i - 1]
+                    for i in range(1, len(window)) if window[i - 1] > 0]
+            vol = statistics.pstdev(rets) if len(rets) >= 2 else 0.0
 
             base_meta = {
-                "roc_3": round(roc_3 * 100, 3),      # percent
-                "roc_6": round(roc_6 * 100, 3),
-                "roc_12": round(roc_12 * 100, 3),
-                "composite": round(composite * 100, 3),
+                **{f"roc_{n}": round(r * 100, 3)
+                   for n, r in zip(self.lookbacks, rocs)},
+                "composite": round(composite * 100, 3),   # percent
+                "vol": round(vol * 100, 3),               # percent
             }
+            if vol <= 0:
+                return self.flat(reason="no_volatility", **base_meta)
 
-            if composite <= self.short_threshold:
-                conf = self._confidence(composite, self.short_threshold)
+            z = composite / vol
+            base_meta["z"] = round(z, 3)
+
+            if z <= -self.enter_z:
+                conf = self._confidence(z)
                 if conf < 1e-9:
-                    return self.flat(**base_meta, threshold=self.short_threshold)
+                    return self.flat(**base_meta, enter_z=self.enter_z)
                 return Ticket(self.name, SHORT, conf,
-                              {**base_meta, "threshold": self.short_threshold})
-            if composite >= self.long_threshold:
-                conf = self._confidence(composite, self.long_threshold)
+                              {**base_meta, "enter_z": self.enter_z})
+            if z >= self.enter_z:
+                conf = self._confidence(z)
                 if conf < 1e-9:
-                    return self.flat(**base_meta, threshold=self.long_threshold)
+                    return self.flat(**base_meta, enter_z=self.enter_z)
                 return Ticket(self.name, LONG, conf,
-                              {**base_meta, "threshold": self.long_threshold})
+                              {**base_meta, "enter_z": self.enter_z})
             return self.flat(**base_meta, reason="below_threshold")
         except Exception as e:
             log.warning("compute failed for %s: %s", coin, e)
             return self.flat(error=str(e))
 
-    def _confidence(self, composite: float, threshold: float) -> float:
-        """Linear ramp from |threshold| (conf 0) to full_conf_move (conf 0.95).
+    def _confidence(self, z: float) -> float:
+        """Linear ramp from enter_z (conf 0) to full_conf_z (conf 0.95).
 
-        Uses magnitudes so the same math serves both directions. Clamped to
-        [0.0, 0.95] — the 0.95 ceiling matches the other models' caps."""
-        span = self.full_conf_move - abs(threshold)
+        Operates on the z-score magnitude so the same math serves both
+        directions and is independent of timeframe / volatility regime. Clamped
+        to [0.0, 0.95] — the 0.95 ceiling matches the other models' caps."""
+        span = self.full_conf_z - self.enter_z
         if span <= 0:
             return 0.95
-        raw = (abs(composite) - abs(threshold)) / span
+        raw = (abs(z) - self.enter_z) / span
         return min(0.95, max(0.0, raw))
