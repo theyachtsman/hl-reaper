@@ -36,18 +36,11 @@ type ActivePreset = {
 };
 
 // preset id → accent classes for the pill (active = solid, idle = outlined)
+// SCALP BAND RETIRED 2026-06-26 — the DUAL_BAND and SCALPER presets were removed.
 const PRESET_ACCENT: Record<string, { on: string; off: string }> = {
-  DUAL_BAND: {
-    on: "bg-teal-500/25 border-teal-500/70 text-teal-200",
-    off: "border-teal-500/40 text-teal-300 hover:bg-teal-500/10",
-  },
   BASELINE: {
     on: "bg-amber-500/25 border-amber-500/70 text-amber-200",
     off: "border-amber-500/40 text-amber-300 hover:bg-amber-500/10",
-  },
-  SCALPER: {
-    on: "bg-cyan-500/25 border-cyan-500/70 text-cyan-200",
-    off: "border-cyan-500/40 text-cyan-300 hover:bg-cyan-500/10",
   },
   SHORT_HUNTER: {
     on: "bg-red-500/25 border-red-500/70 text-red-200",
@@ -158,7 +151,7 @@ export default function ControlsPage() {
                   isActive ? accent.on : accent.off
                 )}
               >
-                {p.id === "BASELINE" && <span title="structural gates disabled">⚠ </span>}
+                {p.id === "BASELINE" && <span title="loosest entry bar — high frequency">⚠ </span>}
                 {p.display_name}
                 {isActive && " ✓"}
               </button>
@@ -169,7 +162,7 @@ export default function ControlsPage() {
         {pendingBaseline && (
           <div className="border border-amber-500/50 bg-amber-500/10 rounded-lg p-3 grid gap-2">
             <div className="text-sm text-amber-200">
-              This disables structural gates and increases trade frequency.
+              This lowers the confidence bar and increases trade frequency.
               Use only in trending markets. Continue?
             </div>
             <div className="flex gap-2">
@@ -384,77 +377,15 @@ export default function ControlsPage() {
         </div>
       </Section>
 
-      {/* ═══ SCALP BAND (5m) ═══ */}
-      <BandSection title="Scalp Band" subtitle="5m · tight & fast"
-        accent="cyan" cfg={cfg} enableKey="trading.scalp_band_enabled"
-        otherEnableKey="trading.trend_band_enabled" onApply={setKey}>
-        <Slider cfg={cfg} ck="risk.scalp_position_size_usd" label="Position Size (USD)"
-          min={10} max={500} step={5} prefix="$" onApply={setKey} onReset={clearKey} />
-        <Slider cfg={cfg} ck="risk.scalp_max_concurrent_positions" label="Max Concurrent Positions"
-          min={1} max={7} step={1} onApply={setKey} onReset={clearKey} />
-        <div className="label pt-1">Signal Gate</div>
-        <Slider cfg={cfg} ck="risk.scalp_min_confidence" label="Minimum Confidence"
-          min={0.30} max={0.80} step={0.01} dp={2} onApply={setKey} onReset={clearKey} />
-        <Slider cfg={cfg} ck="risk.scalp_min_model_agreement" label="Minimum Model Agreement"
-          min={1} max={6} step={1} onApply={setKey} onReset={clearKey} />
-        <div className="label pt-1">Directions</div>
-        <BandDirection band="scalp" cfg={cfg} onApply={setKey} />
-        <div className="label pt-1">Entry Filters (structural gates — scalp only)</div>
-        <Toggle cfg={cfg} ck="risk.scalp_structural_gates_enabled"
-          label="Structural gates master (LONG/SHORT)" onApply={setKey} onReset={clearKey} />
-        <div className="label text-emerald-300/80 pt-1">LONG structural</div>
-        <Toggle cfg={cfg} ck="trading.long_structural_gate_enabled"
-          label="LONG structural gate enabled" onApply={setKey} onReset={clearKey} />
-        <Slider cfg={cfg} ck="trading.long_spot_lead_threshold" label="Spot lead threshold"
-          min={0} max={1.0} step={0.01} pct unit="%" dp={2} onApply={setKey} onReset={clearKey} />
-        <Slider cfg={cfg} ck="trading.long_oi_rise_threshold" label="OI rise threshold"
-          min={0} max={5.0} step={0.1} pct unit="%" dp={2} onApply={setKey} onReset={clearKey} />
-        <Slider cfg={cfg} ck="trading.long_ob_bid_threshold" label="Book bid threshold"
-          min={0} max={0.9} step={0.05} dp={2} onApply={setKey} onReset={clearKey}
-          note="bid imbalance ≥ this (60/40 = 0.20)" />
-        <Toggle cfg={cfg} ck="trading.long_pump_cooldown_enabled"
-          label="Pump cooldown (block LONG after sharp pump)" onApply={setKey} onReset={clearKey} />
-        <Slider cfg={cfg} ck="trading.long_pump_threshold_1" label="5m pump threshold"
-          min={0.1} max={2.0} step={0.1} pct unit="%" dp={1} onApply={setKey} onReset={clearKey} />
-        <Slider cfg={cfg} ck="trading.long_pump_threshold_2" label="10m pump threshold"
-          min={0.1} max={3.0} step={0.1} pct unit="%" dp={1} onApply={setKey} onReset={clearKey} />
-        <Slider cfg={cfg} ck="trading.long_pump_threshold_3" label="15m pump threshold"
-          min={0.1} max={4.0} step={0.1} pct unit="%" dp={1} onApply={setKey} onReset={clearKey} />
-        <div className="label text-red-300/80 pt-1">SHORT structural</div>
-        <Toggle cfg={cfg} ck="trading.short_structural_gate_enabled"
-          label="SHORT structural gate enabled" onApply={setKey} onReset={clearKey} />
-        <Slider cfg={cfg} ck="trading.short_spot_lag_threshold" label="Spot lag threshold"
-          min={0} max={1.0} step={0.01} pct unit="%" dp={2} onApply={setKey} onReset={clearKey} />
-        <Slider cfg={cfg} ck="trading.short_oi_rise_threshold" label="OI rise threshold"
-          min={0} max={5.0} step={0.1} pct unit="%" dp={2} onApply={setKey} onReset={clearKey}
-          note="0 = testnet (OI barely moves)" />
-        <Slider cfg={cfg} ck="trading.short_ob_ask_threshold" label="Book ask threshold"
-          min={0} max={0.9} step={0.05} dp={2} onApply={setKey} onReset={clearKey} />
-        <Toggle cfg={cfg} ck="trading.short_dump_cooldown_enabled"
-          label="Dump cooldown (block SHORT after sharp drop)" onApply={setKey} onReset={clearKey} />
-        <Slider cfg={cfg} ck="trading.short_dump_threshold_1" label="5m dump threshold"
-          min={0.1} max={2.0} step={0.1} pct unit="%" dp={1} onApply={setKey} onReset={clearKey} />
-        <Slider cfg={cfg} ck="trading.short_dump_threshold_2" label="10m dump threshold"
-          min={0.1} max={3.0} step={0.1} pct unit="%" dp={1} onApply={setKey} onReset={clearKey} />
-        <Slider cfg={cfg} ck="trading.short_dump_threshold_3" label="15m dump threshold"
-          min={0.1} max={4.0} step={0.1} pct unit="%" dp={1} onApply={setKey} onReset={clearKey} />
-        <div className="label pt-1">Risk / Stop Loss</div>
-        <Slider cfg={cfg} ck="risk.scalp_atr_sl_multiplier" label="ATR Stop Loss Multiplier"
-          min={0.5} max={3.0} step={0.1} unit="x" dp={1} onApply={setKey} onReset={clearKey} />
-        <Slider cfg={cfg} ck="risk.scalp_take_profit_r" label="Take Profit (R)"
-          min={1.0} max={4.0} step={0.1} unit="R" dp={1} onApply={setKey} onReset={clearKey} />
-        <Slider cfg={cfg} ck="risk.scalp_trail_activation_r" label="Trailing Stop Activation (R)"
-          min={0.5} max={3.0} step={0.1} unit="R" dp={1} onApply={setKey} onReset={clearKey} />
-        <Slider cfg={cfg} ck="risk.scalp_max_hold_hours" label="Max Hold Time (hours)"
-          min={0.1} max={12} step={0.1} unit="h" dp={1} onApply={setKey} onReset={clearKey} />
-        <Slider cfg={cfg} ck="risk.scalp_breakeven_lock_r" label="Breakeven Lock (R)"
-          min={0} max={2.0} step={0.1} unit="R" dp={1} onApply={setKey} onReset={clearKey} />
-      </BandSection>
+      {/* SCALP BAND RETIRED 2026-06-26 — data-driven decision, trend-only
+          operation. The Scalp Band section and the Entry Filters (structural
+          gates) section that lived here were removed; the bot only trades the
+          trend band below. */}
 
       {/* ═══ TREND BAND (1h) ═══ */}
       <BandSection title="Trend Band" subtitle="1h · wide & patient"
         accent="purple" cfg={cfg} enableKey="trading.trend_band_enabled"
-        otherEnableKey="trading.scalp_band_enabled" onApply={setKey}>
+        onApply={setKey}>
         <Slider cfg={cfg} ck="risk.trend_position_size_usd" label="Position Size (USD)"
           min={10} max={1000} step={5} prefix="$" onApply={setKey} onReset={clearKey} />
         <Slider cfg={cfg} ck="risk.trend_max_concurrent_positions" label="Max Concurrent Positions"
@@ -498,17 +429,16 @@ export default function ControlsPage() {
           min={0} max={3.0} step={0.1} unit="R" dp={1} onApply={setKey} onReset={clearKey} />
       </BandSection>
 
-      {/* ═══ REGIME BIAS (connects the bands) ═══ */}
+      {/* ═══ REGIME BIAS ═══ */}
       <Section title="Regime Bias">
         <Slider cfg={cfg} ck="risk.regime_counter_trend_penalty"
           label="Counter-trend confidence penalty"
           min={0.3} max={1.0} step={0.05} unit="x" dp={2} onApply={setKey} onReset={clearKey}
-          note="1h regime dampens scalps fading the trend (1.0 = no penalty)" />
+          note="1h regime dampens counter-trend confidence (1.0 = no penalty)" />
         <div className="text-xs text-slate-500">
-          The 1h trend regime DAMPENS (never blocks) scalps that fade it — a scalp
-          short within a 1h uptrend (or long within a downtrend) needs higher
-          conviction to fire. Opposing positions can&apos;t coexist on one coin
-          (one-way exchange nets per coin), so a coin is owned by one band at a time.
+          The 1h trend regime DAMPENS (never blocks) confidence on entries that fade
+          it. Kept as a global control; with the scalp band retired (2026-06-26) the
+          trend band is the sole consumer.
         </div>
       </Section>
 
@@ -597,14 +527,17 @@ function BandSection({
   title, subtitle, accent, cfg, enableKey, otherEnableKey, onApply, children,
 }: {
   title: string; subtitle: string; accent: "cyan" | "purple"; cfg: Cfg;
-  enableKey: string; otherEnableKey: string;
+  enableKey: string; otherEnableKey?: string;
   onApply: (k: string, v: any) => void; children: React.ReactNode;
 }) {
   const a = BAND_ACCENT[accent];
   const enabled = Boolean(cfg.effective[enableKey] ?? cfg.defaults[enableKey] ?? true);
-  const otherEnabled = Boolean(
-    cfg.effective[otherEnableKey] ?? cfg.defaults[otherEnableKey] ?? true);
-  const wouldDisableBoth = enabled && !otherEnabled;
+  // Trend-only since 2026-06-26: with no sibling band, the trend band can be
+  // toggled freely (the API still rejects disabling the last active band).
+  const otherEnabled = otherEnableKey
+    ? Boolean(cfg.effective[otherEnableKey] ?? cfg.defaults[otherEnableKey] ?? true)
+    : true;
+  const wouldDisableBoth = Boolean(otherEnableKey) && enabled && !otherEnabled;
   const [open, setOpen] = useState(true);
   return (
     <div className={clsx("card grid gap-3 border-l-4", a.border, !enabled && "opacity-60")}>

@@ -35,9 +35,16 @@ export default function Presets() {
     <>
       <PageHeader
         kicker="Presets"
-        title="Six one-click configurations"
+        title="One-click configurations"
         intro="A preset is a named bundle of settings applied in a single click from the Controls page. It takes effect within one bot loop (~10s) — no restart. Changing any setting by hand afterward flips the active preset to CUSTOM."
       />
+
+      <Callout tone="warn" title="Trend-only presets — 2026-06-26">
+        The SCALPER and DUAL BAND presets were removed when the scalp band was
+        retired. The remaining presets (TREND RIDER, SHORT HUNTER, CONSERVATIVE,
+        BASELINE) are trend-only and never write scalp or structural-gate settings.
+        Any scalp/structural rows in the matrix below are historical.
+      </Callout>
 
       <Section title="Comparison matrix">
         <Card className="overflow-x-auto">

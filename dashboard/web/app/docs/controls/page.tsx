@@ -19,6 +19,13 @@ export default function Controls() {
         intro="The Controls page is the only place that writes to the live configuration. Every change is hot-reloaded into the running bot within one loop (~10s) — you never restart it. This page explains each control and the few things you should not touch mid-trade."
       />
 
+      <Callout tone="warn" title="Scalp band + structural gates retired — 2026-06-26">
+        The Controls page no longer has a Scalp Band section or an Entry Filters
+        (structural gates) section — both were removed when the scalp band was
+        retired (trend-only operation). The “Reading structural-gate status” notes
+        below are historical and no longer apply.
+      </Callout>
+
       <Section title="The control PIN">
         <Card>
           <p className="text-sm text-slate-300 leading-relaxed mb-2">

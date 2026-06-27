@@ -18,9 +18,17 @@ export default function Bands() {
     <>
       <PageHeader
         kicker="Bands"
-        title="SCALP vs TREND"
-        intro="The bot runs two strategies at once on every coin. SCALP is fast, tight and frequent; TREND is patient, wide and rare. They use different model weights, different risk geometry, and different entry bars — all pulled below from the live configuration."
+        title="TREND (1h)"
+        intro="The bot trades a single 1h trend band: patient, wide and selective. The SCALP band described below is retired and shown for historical reference only."
       />
+
+      <Callout tone="warn" title="Scalp band retired — 2026-06-26 (data-driven)">
+        The 5m scalp band was retired permanently after signal-history analysis
+        (17–21% win rate, fee drag making profitability impossible at $20–30 size,
+        per-model 5m accuracy at coin-flip except OrderBook). The bot is now
+        trend-only, and the structural entry gates that fed the scalp band were
+        removed with it. The SCALP material below is historical.
+      </Callout>
 
       <Section title="Side by side">
         <div className="grid md:grid-cols-2 gap-3">

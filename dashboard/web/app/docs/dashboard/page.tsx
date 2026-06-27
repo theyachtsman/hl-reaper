@@ -20,7 +20,7 @@ const ORB_LEGEND: { n: number; title: string; body: React.ReactNode }[] = [
   { n: 6, title: "Confidence bar", body: "The aggregated confidence as a fill (0.69). Compare it to the gate to see how close the signal is to firing." },
   { n: 7, title: "Consensus headline", body: "The resolved verdict — “CONSENSUS 1/6 LONG” — and the big confidence number against the band's gate (0.69 CONF · GATE 0.49)." },
   { n: 8, title: "The orb (core + model nodes)", body: "The wireframe core fills toward the bias colour as confidence builds, and pulses gold when armed. The six nodes (TA, MR, FR, OB, VP, MO) orbit it, each glowing its own vote colour. Drag to spin it like a fidget spinner — fling and it coasts down. It's a visualization, not a control." },
-  { n: 9, title: "SHORT / LONG gate poles", body: "Each side's structural gate. The ring fills as its four signals close (LONG: spot lead, OI↑, bid-heavy, no pump · SHORT: spot lag, OI↑ with falling price, ask-heavy, no dump). A beam flows toward the leaning side and a shockwave fires on arming. A gate switched off in Controls shows hazard stripes instead." },
+  { n: 9, title: "SHORT / LONG gate poles (retired)", body: "Historical: these poles showed each side's structural gate. The structural gates were retired with the scalp band on 2026-06-26 (trend-only operation), so the poles no longer render — the trend band's own 1h signal is its gate. A beam still flows toward the leaning side and a shockwave fires on arming." },
 ];
 
 function Panel({ title, children }: { title: string; children: React.ReactNode }) {

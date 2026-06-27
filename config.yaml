@@ -105,7 +105,14 @@ risk:
   # legacy fallback for any band param left unset. SL/TP/trail/hold/breakeven and
   # the entry gate (confidence/agreement) are per band; cascade detection,
   # drawdown circuit breakers and max_leverage stay GLOBAL across both bands.
-  # SCALP band — tight & fast
+  # ===========================================================================
+  # SCALP BAND RETIRED 2026-06-26 — data-driven decision, trend-only operation.
+  # The 5m scalp band no longer evaluates or trades (see scripts/run_bot.py). The
+  # keys below + all *_structural_gate_* / *_cooldown_* keys further down are
+  # INERT: kept so existing live_config rows still validate, but the bot never
+  # reads them. Do not re-enable without restoring the scalp loop.
+  # ===========================================================================
+  # SCALP band — tight & fast (INERT — scalp retired)
   scalp_min_confidence: 0.40
   scalp_min_model_agreement: 2       # lower bar — frequent small trades
   scalp_atr_sl_multiplier: 1.0
@@ -262,12 +269,12 @@ trading:
   regime_memory_enabled: true
   regime_memory_window: 4         # number of 1h candles to remember (2-8)
   regime_memory_threshold: 0.5    # fraction of window opposing -> suppress (0.30-0.80)
-  # LONG structural gate (2026-06-17): supersedes the old OB/VWAP confirmation
-  # (Change B). A LONG must clear ALL THREE structural signals — spot LEADING
-  # perp (real demand, not leverage), OI RISING (fresh longs entering), and the
-  # book BID-HEAVY (live buy pressure). Targets the LONG bleed (210 trades, 37%
-  # win, gross -$0.01). Any signal that can't be computed FAILS (block the LONG).
-  # SHORTs are never gated — the working side stays untouched.
+  # STRUCTURAL GATES RETIRED 2026-06-26 — removed from the trading loop with the
+  # scalp band (they were scalp-only, display-only in production, and never
+  # enabled live). All long_/short_ structural-gate + pump/dump-cooldown keys
+  # below are INERT: the bot no longer reads them (the gate functions are gone).
+  # LONG structural gate (2026-06-17, INERT): a LONG had to clear spot LEADING +
+  # OI RISING + book BID-HEAVY. SHORTs were never gated.
   long_structural_gate_enabled: true
   long_spot_lead_threshold: 0.0002   # min spot return to count as leading (0.02%)
   long_oi_rise_threshold: 0.001      # min OI increase to count as rising (0.1%)

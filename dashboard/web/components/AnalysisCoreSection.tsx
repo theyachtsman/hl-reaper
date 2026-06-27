@@ -10,7 +10,6 @@
 import { useEffect, useRef, useState } from "react";
 import clsx from "clsx";
 import { usePoll, useActiveCoins } from "@/lib/api";
-import { useBandStore } from "@/lib/store";
 import CoinCard3D, { Verdict } from "@/components/CoinCard3D";
 
 type Ticket = { model: string; direction: string; confidence: number; meta: any };
@@ -44,34 +43,15 @@ export default function AnalysisCoreSection() {
   const activeCoins = useActiveCoins();
 
   const coins = activeCoins ?? [];
-  // shared global band context — the same toggle drives Open Positions + the
-  // chart's default timeframe on the Live page (see useBandStore).
-  const band = useBandStore((s) => s.activeBand);
-  const setBand = useBandStore((s) => s.setActiveBand);
+  // SCALP BAND RETIRED 2026-06-26 — trend-only. `band` is always "trend"; the
+  // band selector is gone.
+  const band: Band = "trend";
   const gates = live?.gates?.[band];
   const gQ = gates?.min_model_agreement ?? 3;
   const gC = gates?.min_confidence ?? 0.4;
-  const bandsEnabled = live?.bands ?? { scalp: true, trend: true };
-  const setEnabledBands = useBandStore((s) => s.setEnabledBands);
 
-  // Publish enabled bands to the shared store, and if the active band gets
-  // disabled in Controls, fall back to the still-enabled band so the whole Live
-  // page (cores, Open Positions, chart timeframe — all driven by useBandStore)
-  // reflects the real single-band trading mode.
-  useEffect(() => {
-    setEnabledBands(bandsEnabled);
-    if (!bandsEnabled[band]) {
-      const other: Band = band === "scalp" ? "trend" : "scalp";
-      if (bandsEnabled[other]) setBand(other);
-    }
-  }, [bandsEnabled.scalp, bandsEnabled.trend, band, setBand, setEnabledBands]);
-
-  // per-band structural-gate enabled flags (trend band has no structural gates)
-  const gcfg = live?.gates?.scalp;
-  const gatesEnabled = band === "scalp"
-    ? { long: !!(gcfg?.structural_gates_enabled && gcfg?.long_structural_gate_enabled),
-        short: !!(gcfg?.structural_gates_enabled && gcfg?.short_structural_gate_enabled) }
-    : { long: false, short: false };
+  // structural gates were removed with the scalp band — never shown.
+  const gatesEnabled = { long: false, short: false };
 
   const posByCoin: Record<string, "LONG" | "SHORT"> = {};
   for (const p of pos?.positions ?? []) {
@@ -113,27 +93,9 @@ export default function AnalysisCoreSection() {
         </span>
         <span className="label">Analysis Core</span>
         <span className="text-[10px] mono uppercase tracking-wider text-slate-500">
-          {band === "scalp" ? "5m scalp" : "1h trend"} · 6-model ensemble
-          {bandsEnabled.scalp !== bandsEnabled.trend && (
-            <span className="text-amber-400/80"> · single-band mode</span>
-          )}
+          1h trend · 6-model ensemble
         </span>
-        {/* band selector — only bands enabled in Controls are shown, so a
-            disabled band disappears and a single enabled band reads as the mode. */}
-        <div className="flex items-center gap-1 rounded-full border border-edge p-0.5">
-          {(["scalp", "trend"] as Band[]).filter((b) => bandsEnabled[b]).map((b) => (
-            <button key={b} onClick={() => setBand(b)}
-              className={clsx(
-                "px-2.5 py-0.5 rounded-full text-[10px] font-semibold uppercase transition",
-                band === b
-                  ? b === "scalp"
-                    ? "bg-cyan-500/25 text-cyan-200"
-                    : "bg-purple-500/25 text-purple-200"
-                  : "text-slate-500 hover:text-slate-300")}>
-              {b}
-            </button>
-          ))}
-        </div>
+        {/* SCALP BAND RETIRED 2026-06-26 — band selector removed (trend-only). */}
         <div className="md:ml-auto flex flex-wrap items-center gap-2">
           <span className="border border-edge rounded-full px-2.5 py-1 text-[10px] mono text-slate-300">
             {(pulse?.n ?? 0).toLocaleString()} scans

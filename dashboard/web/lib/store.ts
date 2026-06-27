@@ -40,20 +40,22 @@ export const useStatusStore = create<StatusStore>((set) => ({
 // Global band context for the Live page: the SCALP/TREND toggle in the
 // Analysis Core drives Open Positions (filter + tag), the chart's default
 // timeframe (5m / 1h), and the Analysis Core verdicts — one shared variable
-// all three sections subscribe to. Defaults to SCALP (higher-frequency band).
+// all three sections subscribe to.
+//
+// SCALP BAND RETIRED 2026-06-26 — the bot is trend-only, so the SCALP/TREND
+// toggle is gone and `activeBand` is permanently "trend". The Band union and the
+// store shape are kept so existing subscribers compile, but scalp is never
+// selectable and is reported disabled.
 export type Band = "scalp" | "trend";
 type BandStore = {
   activeBand: Band;
   setActiveBand: (b: Band) => void;
-  // which bands are enabled in Controls (published by AnalysisCoreSection from
-  // /api/tickets) so every band selector on the Live page can grey out / refuse
-  // a disabled band and reflect single-band trading mode.
   enabledBands: Record<Band, boolean>;
   setEnabledBands: (e: Record<Band, boolean>) => void;
 };
 export const useBandStore = create<BandStore>((set) => ({
-  activeBand: "scalp",
+  activeBand: "trend",
   setActiveBand: (activeBand) => set({ activeBand }),
-  enabledBands: { scalp: true, trend: true },
+  enabledBands: { scalp: false, trend: true },
   setEnabledBands: (enabledBands) => set({ enabledBands }),
 }));

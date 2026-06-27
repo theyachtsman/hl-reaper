@@ -490,18 +490,11 @@ export default function SignalsPage() {
     `/api/signal-history/count?cleared_only=true&from_ts=${encodeURIComponent(dayStart)}`, 20000);
   const { data: evalAll } = usePoll<{ count: number }>("/api/signal-history/count", 60000);
 
-  // band follows Controls: only enabled bands are selectable; a disabled band
-  // falls back to whichever is live (no flash of the off band).
-  const [band, setBand] = useState<Band>("scalp");
-  const bandsEnabled = live?.bands ?? { scalp: true, trend: true };
-  const enabledBands = (["scalp", "trend"] as Band[]).filter((b) => bandsEnabled[b]);
-  const effBand: Band = bandsEnabled[band] || enabledBands.length === 0 ? band : enabledBands[0];
-  useEffect(() => {
-    if (live?.bands && effBand !== band) setBand(effBand);
-  }, [live?.bands, effBand, band]);
-
+  // SCALP BAND RETIRED 2026-06-26 — trend-only. The band selector is gone; the
+  // page always shows the 1h trend view.
+  const effBand: Band = "trend";
   const gate: BandGate = live?.gates?.[effBand] ??
-    { min_confidence: effBand === "scalp" ? 0.4 : 0.55, min_model_agreement: effBand === "scalp" ? 2 : 3 };
+    { min_confidence: 0.55, min_model_agreement: 3 };
 
   const verdictOf = (c: string) => live?.verdicts?.[c]?.[effBand];
   const ticketsOf = (c: string) => live?.coins?.[c]?.[effBand]?.tickets ?? [];
@@ -583,33 +576,14 @@ export default function SignalsPage() {
           </h1>
         </div>
         <span className="text-[10px] mono uppercase tracking-wider text-slate-500 hidden sm:inline">
-          {ACTIVE_N}-model ensemble · live L2 books · {effBand === "scalp" ? "5m scalp" : "1h trend"}
+          {ACTIVE_N}-model ensemble · live L2 books · 1h trend
         </span>
 
         <div className="md:ml-auto flex items-center gap-2">
-          {/* band selector — only Controls-enabled bands appear */}
-          {enabledBands.length >= 2 ? (
-            <div className="flex items-center gap-1 rounded-full border border-edge p-0.5">
-              {enabledBands.map((b) => (
-                <button key={b} onClick={() => setBand(b)}
-                  className={clsx("px-2.5 py-0.5 rounded-full text-[11px] font-semibold uppercase transition",
-                    effBand === b
-                      ? b === "scalp" ? "bg-cyan-500/25 text-cyan-200" : "bg-purple-500/25 text-purple-200"
-                      : "text-slate-500 hover:text-slate-300")}>
-                  {b}
-                </button>
-              ))}
-            </div>
-          ) : enabledBands.length === 1 ? (
-            <span className={clsx("px-2.5 py-0.5 rounded-full text-[11px] font-semibold uppercase border",
-              enabledBands[0] === "scalp"
-                ? "bg-cyan-500/20 text-cyan-200 border-cyan-500/40"
-                : "bg-purple-500/20 text-purple-200 border-purple-500/40")}>
-              {enabledBands[0]} band
-            </span>
-          ) : (
-            <span className="text-[11px] mono uppercase text-amber-400/80">⏻ all bands off</span>
-          )}
+          {/* SCALP BAND RETIRED 2026-06-26 — trend-only; static band label. */}
+          <span className="px-2.5 py-0.5 rounded-full text-[11px] font-semibold uppercase border bg-purple-500/20 text-purple-200 border-purple-500/40">
+            trend band
+          </span>
           {/* scan / pin state */}
           <button onClick={() => setPinned(null)}
             title={pinned ? "Resume auto-scan" : "Spotlight auto-scanning the book"}

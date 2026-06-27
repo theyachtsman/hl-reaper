@@ -475,9 +475,7 @@ export default function ProfitDeck() {
   const openPositions = pos?.positions ?? [];
   // account-wide pnl/deck calcs above stay over ALL positions; the Open
   // Positions panel below shows only the active band's positions.
-  const activeBand = useBandStore((s) => s.activeBand);
-  const setActiveBand = useBandStore((s) => s.setActiveBand);
-  const enabledBands = useBandStore((s) => s.enabledBands);
+  const activeBand = useBandStore((s) => s.activeBand);  // always "trend" now
   const bandPositions = openPositions.filter((p) => p.band === activeBand);
 
   /* analysis-core 3D backdrop: a live ribbon of the account's equity path,
@@ -609,22 +607,8 @@ export default function ProfitDeck() {
         <div className="core-card p-4 min-w-0">
           <div className="flex flex-wrap items-center gap-2 mb-2">
             <span className="label">open positions</span>
-            {/* band selector — shares the global Live-page band context with the
-                Analysis Core toggle, so switching here swaps both in sync */}
-            <div className="flex items-center gap-1 rounded-full border border-edge p-0.5">
-              {(["scalp", "trend"] as Band[]).filter((b) => enabledBands[b]).map((b) => (
-                <button key={b} onClick={() => setActiveBand(b)}
-                  className={clsx(
-                    "px-2 py-0.5 rounded-full text-[9px] font-semibold uppercase tracking-wider transition",
-                    activeBand === b
-                      ? b === "scalp"
-                        ? "bg-cyan-500/25 text-cyan-200"
-                        : "bg-purple-500/25 text-purple-200"
-                      : "text-slate-500 hover:text-slate-300")}>
-                  {b}
-                </button>
-              ))}
-            </div>
+            {/* SCALP BAND RETIRED 2026-06-26 — trend-only; the band selector is
+                gone and positions are the (single) trend band. */}
             <span className="px-1.5 rounded-full border border-edge text-[9px] mono text-slate-400">
               {bandPositions.length}
               {openPositions.length > bandPositions.length

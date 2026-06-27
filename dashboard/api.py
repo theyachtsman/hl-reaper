@@ -513,29 +513,16 @@ def tickets():
     eff = effective_config()
     risk_cfg = eff.get("risk", {}) or {}
     trading_cfg = eff.get("trading", {}) or {}
-    # Dual band (2026-06-20): the bot publishes a per-band verdict per coin —
-    # {coin: {scalp: {...}, trend: {...}}} — each already aggregated with the
-    # band's fixed weight set (and, for scalp, the 1h regime bias already
-    # applied). The bridge does NOT re-aggregate (that would drop the band
-    # weights + bias); it reads the published verdict and only computes
-    # would_fire against each band's gate.
-    scalp_struct = (bool(risk_cfg.get("scalp_structural_gates_enabled", True)))
+    # SCALP BAND RETIRED 2026-06-26 — trend-only. The bot publishes one verdict
+    # per coin — {coin: {trend: {...}}} — already aggregated with the trend
+    # weight set. The bridge does NOT re-aggregate (that would drop the band
+    # weights); it reads the published verdict and computes would_fire against
+    # the trend gate. Structural gates were removed with the scalp band.
     gates = {
-        "scalp": {
-            "min_confidence": float(risk_cfg.get("scalp_min_confidence", 0.40)),
-            "min_model_agreement": int(
-                risk_cfg.get("scalp_min_model_agreement", 2)),
-            "structural_gates_enabled": scalp_struct,
-            "long_structural_gate_enabled": bool(
-                trading_cfg.get("long_structural_gate_enabled", True)),
-            "short_structural_gate_enabled": bool(
-                trading_cfg.get("short_structural_gate_enabled", True)),
-        },
         "trend": {
             "min_confidence": float(risk_cfg.get("trend_min_confidence", 0.55)),
             "min_model_agreement": int(
                 risk_cfg.get("trend_min_model_agreement", 3)),
-            "structural_gates_enabled": False,
         },
         "funding_hard_block_enabled": bool(
             risk_cfg.get("funding_hard_block_enabled", True)),
@@ -543,10 +530,7 @@ def tickets():
             risk_cfg.get("regime_counter_trend_penalty", 0.7)),
         "mode": "live_config",
     }
-    bands_enabled = {
-        "scalp": bool(trading_cfg.get("scalp_band_enabled", True)),
-        "trend": bool(trading_cfg.get("trend_band_enabled", True)),
-    }
+    bands_enabled = {"trend": bool(trading_cfg.get("trend_band_enabled", True))}
     empty = {"ts": None, "coins": {}, "verdicts": {}, "gates": gates,
              "bands": bands_enabled}
     raw = get_state("live_tickets")
@@ -556,21 +540,6 @@ def tickets():
         data = json.loads(raw)
     except Exception:
         return empty
-
-    long_gates_pub = data.get("long_gates") or {}
-    short_gates_pub = data.get("short_gates") or {}
-    STRUCT_REASON = {
-        "spot_not_leading": "LONG blocked (spot not leading perp)",
-        "oi_not_rising": "LONG blocked (OI not rising)",
-        "book_not_bid_heavy": "LONG blocked (book not bid-heavy)",
-        "recent_pump": "LONG blocked (recent pump — cooldown)",
-    }
-    SHORT_STRUCT_REASON = {
-        "spot_not_lagging": "SHORT blocked (spot not lagging perp)",
-        "oi_not_rising": "SHORT blocked (OI not rising w/ falling price)",
-        "book_not_ask_heavy": "SHORT blocked (book not ask-heavy)",
-        "recent_dump": "SHORT blocked (recent dump — cooldown)",
-    }
 
     # parked non-voters (+ the meta router) are excluded from the reported vote
     # tally so the dashboard shows the real active-voter count (e.g. 1/1/3, not
@@ -601,30 +570,7 @@ def tickets():
                     and fund["direction"] in ("LONG", "SHORT")
                     and fund["direction"] != direction)
         block_reason = meta.get("block_reason")
-        long_gate = short_gate = None
-        long_blocked = short_blocked = False
-        # structural gates apply to the SCALP band only. The signal DETAIL is
-        # always surfaced (the bot computes it every loop regardless of the
-        # toggle) so the dashboard gate rings fill as consensus forms even when a
-        # gate is switched off — only the BLOCKING is gated on the enabled flags.
-        if band == "scalp":
-            long_gate = long_gates_pub.get(coin) or None
-            short_gate = short_gates_pub.get(coin) or None
-            if g["structural_gates_enabled"]:
-                if (g["long_structural_gate_enabled"] and direction == "LONG"
-                        and long_gate and not long_gate.get("allowed")):
-                    long_blocked = True
-                    block_reason = STRUCT_REASON.get(
-                        long_gate.get("block_reason"),
-                        "LONG blocked (structural gate)")
-                elif (g["short_structural_gate_enabled"] and direction == "SHORT"
-                        and short_gate and not short_gate.get("allowed")):
-                    short_blocked = True
-                    block_reason = SHORT_STRUCT_REASON.get(
-                        short_gate.get("block_reason"),
-                        "SHORT blocked (structural gate)")
         would_fire = (bands_enabled[band] and direction in ("LONG", "SHORT")
-                      and not long_blocked and not short_blocked
                       and confidence >= g["min_confidence"]
                       and agreement >= g["min_model_agreement"])
         return {
@@ -636,7 +582,6 @@ def tickets():
             "block_reason": block_reason,
             "regime_bias": meta.get("regime_bias"),
             "funding_dampen": meta.get("funding_dampen"),
-            "long_gate": long_gate or None, "short_gate": short_gate or None,
             "would_fire": would_fire, "enabled": bands_enabled[band],
         }
 
@@ -647,7 +592,6 @@ def tickets():
             if isinstance(bands, list):
                 continue
             verdicts[coin] = {
-                "scalp": _band_verdict(coin, "scalp", bands.get("scalp") or {}),
                 "trend": _band_verdict(coin, "trend", bands.get("trend") or {}),
             }
         except Exception as e:
@@ -1440,23 +1384,9 @@ CONFIG_SCHEMA: dict[str, dict] = {
     # Section 4 — entry filters
     "risk.funding_hard_block_enabled": {"type": "bool"},
     "risk.funding_hard_block_conf": {"type": "float", "min": 0.0, "max": 1.0},
-    "trading.long_structural_gate_enabled": {"type": "bool"},
-    "trading.long_spot_lead_threshold": {"type": "float", "min": 0.0,
-                                         "max": 0.01},
-    "trading.long_oi_rise_threshold": {"type": "float", "min": 0.0, "max": 0.05},
-    "trading.long_ob_bid_threshold": {"type": "float", "min": 0.0, "max": 0.9},
-    "trading.long_spot_lookback_minutes": {"type": "float", "min": 1, "max": 10},
-    "trading.long_oi_lookback_minutes": {"type": "float", "min": 1, "max": 10},
-    # LONG momentum cooldown (2026-06-18, anti-pump-top) — Signal 4
-    "trading.long_pump_cooldown_enabled": {"type": "bool"},
-    "trading.long_pump_threshold_1": {"type": "float", "min": 0.001,
-                                      "max": 0.02},
-    "trading.long_pump_threshold_2": {"type": "float", "min": 0.001,
-                                      "max": 0.03},
-    "trading.long_pump_threshold_3": {"type": "float", "min": 0.001,
-                                      "max": 0.04},
-    "trading.long_confirmation_enabled": {"type": "bool"},
-    "trading.long_confirmation_min": {"type": "int", "min": 0, "max": 5},
+    # SCALP BAND RETIRED 2026-06-26 — the LONG/SHORT structural gates (spot
+    # lead/lag, OI rise, book bid/ask, pump/dump cooldown) were removed with the
+    # scalp band. Funding hard-block below is the only remaining entry filter.
     "risk.funding_hard_block_short_enabled": {"type": "bool"},
     "risk.funding_hard_block_short_conf": {"type": "float", "min": 0.0,
                                            "max": 1.0},
@@ -1468,26 +1398,6 @@ CONFIG_SCHEMA: dict[str, dict] = {
     # aggregator weight when it votes against a sustained trend. 0.40 default.
     "aggregator.funding_counter_trend_damp": {"type": "float", "min": 0.0,
                                               "max": 1.0},
-    "trading.short_confirmation_enabled": {"type": "bool"},
-    "trading.short_confirmation_min": {"type": "int", "min": 0, "max": 5},
-    # SHORT structural gate (2026-06-19) — mirror of the LONG gate
-    "trading.short_structural_gate_enabled": {"type": "bool"},
-    "trading.short_spot_lag_threshold": {"type": "float", "min": 0.0,
-                                         "max": 0.01},
-    "trading.short_oi_rise_threshold": {"type": "float", "min": 0.0,
-                                        "max": 0.05},
-    "trading.short_ob_ask_threshold": {"type": "float", "min": 0.0, "max": 0.9},
-    "trading.short_spot_lookback_minutes": {"type": "float", "min": 1,
-                                            "max": 10},
-    "trading.short_oi_lookback_minutes": {"type": "float", "min": 1, "max": 10},
-    # SHORT dump cooldown (anti-dump-bottom) — Signal 4
-    "trading.short_dump_cooldown_enabled": {"type": "bool"},
-    "trading.short_dump_threshold_1": {"type": "float", "min": 0.001,
-                                       "max": 0.02},
-    "trading.short_dump_threshold_2": {"type": "float", "min": 0.001,
-                                       "max": 0.03},
-    "trading.short_dump_threshold_3": {"type": "float", "min": 0.001,
-                                       "max": 0.04},
     # Section 5 — risk / stops
     "risk.atr_sl_multiplier": {"type": "float", "min": 0.5, "max": 3.0},
     "risk.take_profit_r": {"type": "float", "min": 1.0, "max": 4.0},
@@ -1521,7 +1431,9 @@ CONFIG_SCHEMA: dict[str, dict] = {
     "trading.scalp_shorts_enabled": {"type": "bool"},
     "trading.trend_longs_enabled": {"type": "bool"},
     "trading.trend_shorts_enabled": {"type": "bool"},
-    # SCALP band geometry + gate
+    # SCALP band geometry — INERT (scalp band retired 2026-06-26). These keys
+    # remain writable so old live_config rows validate, but the trend-only loop
+    # never reads them. The structural-gates key was removed with the gates.
     "risk.scalp_min_confidence": {"type": "float", "min": 0.25, "max": 0.80},
     "risk.scalp_min_model_agreement": {"type": "int", "min": 1, "max": 6},
     "risk.scalp_atr_sl_multiplier": {"type": "float", "min": 0.5, "max": 3.0},
@@ -1531,8 +1443,7 @@ CONFIG_SCHEMA: dict[str, dict] = {
     "risk.scalp_breakeven_lock_r": {"type": "float", "min": 0.0, "max": 2.0},
     "risk.scalp_max_concurrent_positions": {"type": "int", "min": 1, "max": 7},
     "risk.scalp_position_size_usd": {"type": "float", "min": 10, "max": 500},
-    "risk.scalp_structural_gates_enabled": {"type": "bool"},
-    # TREND band geometry + gate (wider/longer than scalp)
+    # TREND band geometry + gate
     "risk.trend_min_confidence": {"type": "float", "min": 0.30, "max": 0.80},
     "risk.trend_min_model_agreement": {"type": "int", "min": 1, "max": 6},
     "risk.trend_atr_sl_multiplier": {"type": "float", "min": 0.5, "max": 5.0},
@@ -1567,31 +1478,17 @@ CONFIG_SCHEMA: dict[str, dict] = {
 
 # ---------------------------------------------------------------------------
 # Strategy presets — named bundles of live_config overrides applied in one
-# click. Keys are the REAL CONFIG_SCHEMA dotted keys the bot honors (the spec's
-# shorthand — take_profit_r, max_hold_hours, *_structural_gate_enabled,
-# pump/dump_cooldown_enabled — maps to risk.take_profit_r,
-# risk.max_hold_hours_scalp, trading.long/short_structural_gate_enabled,
-# trading.long_pump_cooldown_enabled, trading.short_dump_cooldown_enabled).
+# click. Keys are the REAL CONFIG_SCHEMA dotted keys the bot honors (e.g.
+# risk.trend_take_profit_r, risk.trend_max_hold_hours). Trend-only since the
+# scalp band + structural gates were retired (2026-06-26).
 # Applied via live_config upsert → effective within one bot loop (<=10s).
 # ---------------------------------------------------------------------------
 ACTIVE_PRESET_KEY = "system.active_preset"
 LAST_PRESET_KEY = "system.last_preset"
 
-# Shared per-band fragments (dual-band redesign 2026-06-20). Presets spread
-# these and then override what makes them distinct. Keys are the real
-# risk.scalp_*/trend_* CONFIG_SCHEMA keys the bot honors.
-_SCALP_TIGHT = {
-    "risk.scalp_min_confidence": 0.40,
-    "risk.scalp_min_model_agreement": 2,
-    "risk.scalp_atr_sl_multiplier": 1.0,
-    "risk.scalp_take_profit_r": 1.5,
-    "risk.scalp_trail_activation_r": 1.0,
-    "risk.scalp_max_hold_hours": 0.5,
-    "risk.scalp_breakeven_lock_r": 0.4,
-    "risk.scalp_max_concurrent_positions": 3,
-    "risk.scalp_position_size_usd": 30,
-    "risk.scalp_structural_gates_enabled": True,
-}
+# SCALP BAND RETIRED 2026-06-26 — trend-only. Presets now only ever write
+# trend-band + global keys; the scalp fragment and the SCALPER/DUAL_BAND presets
+# were removed. Keys are the real risk.trend_* CONFIG_SCHEMA keys the bot honors.
 _TREND_WIDE = {
     "risk.trend_min_confidence": 0.55,
     "risk.trend_min_model_agreement": 3,
@@ -1604,49 +1501,16 @@ _TREND_WIDE = {
     "risk.trend_position_size_usd": 75,
 }
 
+# Trend-only presets (scalp band + SCALPER/DUAL_BAND retired 2026-06-26). Every
+# preset enables the trend band and writes only trend-band + global keys — never
+# a scalp or structural-gate key (the live loop is trend-only regardless).
 PRESETS: dict[str, dict] = {
-    "DUAL_BAND": {
-        "display_name": "DUAL BAND",
-        "description": "Both bands active — 5m scalp + 1h trend simultaneously. "
-                       "The flagship dual-band configuration.",
-        "warning": None,
-        "settings": {
-            "trading.scalp_band_enabled": True,
-            "trading.trend_band_enabled": True,
-            "trading.longs_enabled": True,
-            "trading.shorts_enabled": True,
-            "trading.scalp_longs_enabled": True,
-            "trading.scalp_shorts_enabled": True,
-            "trading.trend_longs_enabled": True,
-            "trading.trend_shorts_enabled": True,
-            **_SCALP_TIGHT, **_TREND_WIDE,
-            "risk.regime_counter_trend_penalty": 0.7,
-            "risk.funding_hard_block_enabled": True,
-        },
-    },
-    "SCALPER": {
-        "display_name": "SCALPER",
-        "description": "Pure 5m scalp band. Trend band disabled. Tight stops, "
-                       "fast exits, high frequency.",
-        "warning": None,
-        "settings": {
-            "trading.scalp_band_enabled": True,
-            "trading.trend_band_enabled": False,
-            "trading.longs_enabled": True,
-            "trading.shorts_enabled": True,
-            "trading.scalp_longs_enabled": True,
-            "trading.scalp_shorts_enabled": True,
-            **_SCALP_TIGHT,
-            "risk.funding_hard_block_enabled": True,
-        },
-    },
     "TREND_RIDER": {
         "display_name": "TREND RIDER",
-        "description": "Pure 1h trend band. Scalp band disabled. Wide stops, "
-                       "lets winners run, low frequency.",
+        "description": "1h trend band. Wide stops, lets winners run, low "
+                       "frequency. The default trend-only configuration.",
         "warning": None,
         "settings": {
-            "trading.scalp_band_enabled": False,
             "trading.trend_band_enabled": True,
             "trading.longs_enabled": True,
             "trading.shorts_enabled": True,
@@ -1663,37 +1527,30 @@ PRESETS: dict[str, dict] = {
     },
     "SHORT_HUNTER": {
         "display_name": "SHORT HUNTER",
-        "description": "Both bands, shorts only. Optimized for downtrends.",
+        "description": "Trend band, shorts only. Optimized for downtrends.",
         "warning": None,
         "settings": {
-            "trading.scalp_band_enabled": True,
             "trading.trend_band_enabled": True,
             "trading.longs_enabled": False,    # global master: no longs
             "trading.shorts_enabled": True,
-            "trading.scalp_shorts_enabled": True,
             "trading.trend_shorts_enabled": True,
-            **_SCALP_TIGHT, **_TREND_WIDE,
+            **_TREND_WIDE,
             "risk.regime_counter_trend_penalty": 0.7,
             "risk.funding_hard_block_enabled": True,
         },
     },
     "CONSERVATIVE": {
         "display_name": "CONSERVATIVE",
-        "description": "Both bands, highest-quality entries only. Higher "
-                       "confidence/agreement bars on each band.",
+        "description": "Trend band, highest-quality entries only. Higher "
+                       "confidence/agreement bars.",
         "warning": None,
         "settings": {
-            "trading.scalp_band_enabled": True,
             "trading.trend_band_enabled": True,
             "trading.longs_enabled": True,
             "trading.shorts_enabled": True,
-            "trading.scalp_longs_enabled": True,
-            "trading.scalp_shorts_enabled": True,
             "trading.trend_longs_enabled": True,
             "trading.trend_shorts_enabled": True,
-            **_SCALP_TIGHT, **_TREND_WIDE,
-            "risk.scalp_min_confidence": 0.55,
-            "risk.scalp_min_model_agreement": 3,
+            **_TREND_WIDE,
             "risk.trend_min_confidence": 0.62,
             "risk.trend_min_model_agreement": 4,
             "risk.regime_counter_trend_penalty": 0.6,
@@ -1702,26 +1559,18 @@ PRESETS: dict[str, dict] = {
     },
     "BASELINE": {
         "display_name": "BASELINE",
-        "description": "Both bands, structural gates off. Max frequency. Best "
-                       "for strong trends only.",
-        "warning": ("This disables structural gates and increases trade "
+        "description": "Trend band, loosest entry bar. Max frequency. Best for "
+                       "strong trends only.",
+        "warning": ("This lowers the confidence bar and increases trade "
                     "frequency. Use only in trending markets."),
         "settings": {
-            "trading.scalp_band_enabled": True,
             "trading.trend_band_enabled": True,
             "trading.longs_enabled": True,
             "trading.shorts_enabled": True,
-            "trading.scalp_longs_enabled": True,
-            "trading.scalp_shorts_enabled": True,
             "trading.trend_longs_enabled": True,
             "trading.trend_shorts_enabled": True,
-            **_SCALP_TIGHT, **_TREND_WIDE,
-            "risk.scalp_min_confidence": 0.35,
-            "risk.scalp_structural_gates_enabled": False,
-            "trading.long_structural_gate_enabled": False,
-            "trading.short_structural_gate_enabled": False,
-            "trading.long_pump_cooldown_enabled": False,
-            "trading.short_dump_cooldown_enabled": False,
+            **_TREND_WIDE,
+            "risk.trend_min_confidence": 0.45,
             "risk.regime_counter_trend_penalty": 0.85,
             "risk.funding_hard_block_enabled": True,
         },

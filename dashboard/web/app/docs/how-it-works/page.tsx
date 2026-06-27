@@ -25,6 +25,13 @@ export default function HowItWorks() {
         intro="Every 10 seconds the bot pulls fresh data, asks each model for a vote, combines those votes into a single conviction, and checks that conviction against the entry gates. Here is exactly what happens at each step."
       />
 
+      <Callout tone="warn" title="Trend-only since 2026-06-26">
+        The 5m scalp band and its structural entry gates (spot lead/lag, OI rise,
+        book bid/ask, pump/dump cooldown) were retired. The pipeline below now runs
+        once per coin on the 1h trend band only; references to a second band or to
+        structural gates are historical.
+      </Callout>
+
       <Section title="The full pipeline">
         <FlowDiagram />
       </Section>

@@ -208,10 +208,9 @@ export default function CoinCard3D({ coin, mid, verdict, tickets, position, gate
         {hovered && verdict && (
           <div className="absolute top-11 left-3 z-10 rounded-lg p-2 text-[9px] mono text-slate-300
             bg-black/85 border border-edge pointer-events-none">
+            {/* SCALP BAND RETIRED 2026-06-26 — structural-gate detail rows
+                (spot/perp/OI/imbalance/moves) removed with the gates. */}
             <div className="text-slate-400">regime {verdict.regime || "—"}</div>
-            <div>spot {pct(lg?.spot_ret)} · perp {pct(lg?.perp_ret)}</div>
-            <div>OIΔ {pct(lg?.oi_change)} · imb {lg?.imbalance?.toFixed(2) ?? "—"}</div>
-            <div>5m {pct(lg?.move_5m, 2)} · 15m {pct(lg?.move_15m, 2)}</div>
             <div className="text-slate-400">votes L{verdict.long_votes} S{verdict.short_votes} F{verdict.flat_votes}</div>
           </div>
         )}

@@ -44,8 +44,8 @@ def _liveness_watchdog(stale_after_s: float):
             os._exit(1)
 
 from reaper import alerts
-from reaper.aggregator import (REGIME_NAMES, SCALP_WEIGHTS, TREND_WEIGHTS,
-                               SignalAggregator, apply_regime_bias)
+from reaper.aggregator import (REGIME_NAMES, TREND_WEIGHTS,  # noqa: F401
+                               SignalAggregator)
 from reaper.config import PROJECT_ROOT, Config
 from reaper.data.buffer import MarketBuffer
 from reaper.data.rest_pollers import RestPollers
@@ -99,64 +99,10 @@ class SignalWriter:
 
 def long_confirmation_count(model_votes: dict, models: set) -> int:
     """How many of `models` are actively voting LONG (legacy Change B gate).
-    Superseded by long_structural_gate() for live entries; retained for the
-    dashboard SHORT-mirror display and the regression suite."""
+    Not used for live entries (the structural gates it was superseded by were
+    retired with the scalp band, 2026-06-26); retained for the regression suite."""
     return sum(1 for t in model_votes.values()
                if t.model in models and t.direction == LONG)
-
-
-def _momentum_cooldown_ok(coin: str, buf, params: dict) -> tuple[bool, str, dict]:
-    """Signal 4 — momentum cooldown (no recent sharp pump).
-
-    Blocks LONG entry if price moved sharply UPWARD over a recent short window.
-    Even with all three structural signals green, those signals ARE the
-    consequence of a pump (spot leads + OI rises + book turns bid-heavy as the
-    move runs); by the time all three confirm the move is largely done and the
-    entry catches the top. The losing-LONG signature in 374 round-trips is a
-    4.6-minute MEDIAN hold — enter near the top, stopped on the retrace within
-    minutes. Letting the post-pump consolidation happen first fixes the TIMING;
-    the structural signals themselves stay valid.
-
-    Checks three lookback windows on 5m candles (5m / 10m / 15m) and blocks if
-    ANY exceeds its threshold. Returns (ok, reason, moves) where `moves` carries
-    the three % moves for logging + the dashboard. Fail-OPEN during warmup
-    (too few candles): momentum can't be judged, so it must not block.
-
-    NOTE: the symmetric SHORT dump-cooldown (block SHORT after a sharp DROP —
-    catching the bottom) is deliberately NOT added here. The SHORT side is
-    working (57% win, +$21.46 net); mirror this with inverted moves only if
-    SHORT entry quality degrades.
-    """
-    moves = {"move_5m": None, "move_10m": None, "move_15m": None}
-    if not params.get("pump_cooldown_enabled", True):
-        return True, "cooldown_disabled", moves
-    candles = buf.latest_candles(coin, "5m", 6)  # last ~30 minutes
-    if len(candles) < 3:
-        return True, "insufficient_candles", moves  # fail-open during warmup
-
-    thr_1 = float(params.get("pump_threshold_1", 0.005))   # 0.5% in 5m
-    thr_2 = float(params.get("pump_threshold_2", 0.008))   # 0.8% in 10m
-    thr_3 = float(params.get("pump_threshold_3", 0.012))   # 1.2% in 15m
-
-    current = float(candles[-1]["c"])
-    prev_1 = float(candles[-2]["c"])                       # 5m ago
-    prev_2 = float(candles[-3]["c"])                       # 10m ago
-    prev_3 = float(candles[-4]["c"]) if len(candles) >= 4 else prev_2  # 15m ago
-
-    move_1 = (current - prev_1) / prev_1 if prev_1 else 0.0
-    move_2 = (current - prev_2) / prev_2 if prev_2 else 0.0
-    move_3 = (current - prev_3) / prev_3 if prev_3 else 0.0
-    moves["move_5m"], moves["move_10m"], moves["move_15m"] = (
-        move_1, move_2, move_3)
-
-    if move_1 > thr_1:
-        return (False, f"pump_5m:+{move_1*100:.3f}%>{thr_1*100:.1f}%", moves)
-    if move_2 > thr_2:
-        return (False, f"pump_10m:+{move_2*100:.3f}%>{thr_2*100:.1f}%", moves)
-    if move_3 > thr_3:
-        return (False, f"pump_15m:+{move_3*100:.3f}%>{thr_3*100:.1f}%", moves)
-    return (True, f"momentum_ok:5m={move_1*100:.3f}% 10m={move_2*100:.3f}% "
-            f"15m={move_3*100:.3f}%", moves)
 
 
 # --- Regime memory (2026-06-26) --------------------------------------------
@@ -205,293 +151,9 @@ def regime_memory_reason(history, direction: str) -> str:
     return f"regime_memory: {frac:.0%} {opp} in last {n} evals"
 
 
-def long_structural_gate(coin: str, buf, params: dict) -> tuple[bool, dict]:
-    """Strong structural LONG gate (2026-06-17), supersedes Change B.
-
-    A LONG entry must clear ALL of these signals, each independently confirmed
-    in this project's research as pointing the right way:
-      1. SPOT LEADING perp  — real demand, not leverage-driven (spot return
-         over the lookback exceeds perp return and is itself positive).
-      2. OI RISING with price — fresh longs entering, structural participation
-         (not short-covering / liquidation exhaustion).
-      3. ORDERBOOK BID-HEAVY — live microstructure confirms buy pressure now.
-      4. MOMENTUM COOLDOWN — no recent sharp pump (2026-06-18, anti-pump-top):
-         the three signals above flash green AS a pump runs; entering then
-         catches the top. Block if price ran up past threshold in the last
-         5m/10m/15m and let the consolidation happen first.
-
-    Fail-safe: if any of signals 1-3 can't be computed (missing/stale history,
-    no book) that signal FAILS and the LONG is blocked. Better to miss a good
-    LONG than take a bad one — matters most during startup before history
-    accumulates. Signal 4 instead fails OPEN during warmup: momentum can't be
-    judged with too few candles, so it must not block on its own.
-
-    Returns (allowed, detail) where detail carries each signal's pass/fail and
-    the underlying numbers for logging + the dashboard. SHORTs never call this.
-    """
-    spot_lead_thr = float(params.get("spot_lead_threshold", 0.0002))
-    oi_rise_thr = float(params.get("oi_rise_threshold", 0.001))
-    ob_bid_thr = float(params.get("ob_bid_threshold", 0.20))
-    spot_lookback = float(params.get("spot_lookback_minutes", 5))
-    oi_lookback = float(params.get("oi_lookback_minutes", 5))
-    top_n = int(params.get("ob_top_levels", 10))
-
-    detail = {
-        "spot_leading": False, "oi_rising": False, "ob_bid_heavy": False,
-        "momentum_ok": False,
-        "spot_ret": None, "perp_ret": None, "oi_change": None,
-        "imbalance": None,
-        "move_5m": None, "move_10m": None, "move_15m": None, "pump_detail": "",
-        "allowed": False, "block_reason": "",
-    }
-
-    # --- Signal 1: spot leadership over the lookback window -----------------
-    spot_now = buf.spot_price(coin)
-    spot_then = buf.spot_price_n_minutes_ago(coin, spot_lookback)
-    perp_now = buf.mid(coin)
-    c5 = buf.latest_candles(coin, "5m", 2)
-    perp_then = float(c5[-2]["c"]) if len(c5) >= 2 else None
-    if all(v is not None and v > 0 for v in
-           (spot_now, spot_then, perp_now, perp_then)):
-        spot_ret = (spot_now - spot_then) / spot_then
-        perp_ret = (perp_now - perp_then) / perp_then
-        detail["spot_ret"] = spot_ret
-        detail["perp_ret"] = perp_ret
-        detail["spot_leading"] = spot_ret > perp_ret and spot_ret > spot_lead_thr
-
-    # --- Signal 2: OI rising (fresh buying) ---------------------------------
-    oi_now = (buf.ctx.get(coin) or {}).get("open_interest")
-    oi_then = buf.oi_n_minutes_ago(coin, oi_lookback)
-    if oi_now and oi_then:
-        detail["oi_change"] = (oi_now - oi_then) / oi_then
-        detail["oi_rising"] = oi_now > oi_then * (1 + oi_rise_thr)
-
-    # --- Signal 3: orderbook bid-heavy --------------------------------------
-    book = buf.books.get(coin)
-    if book and book.get("bids") and book.get("asks"):
-        bid_vol = sum(sz for _px, sz in book["bids"][:top_n])
-        ask_vol = sum(sz for _px, sz in book["asks"][:top_n])
-        total = bid_vol + ask_vol
-        if total > 0:
-            imb = (bid_vol - ask_vol) / total
-            detail["imbalance"] = imb
-            detail["ob_bid_heavy"] = imb >= ob_bid_thr
-
-    # --- Signal 4: momentum cooldown (no recent sharp pump) -----------------
-    m_ok, m_reason, m_moves = _momentum_cooldown_ok(coin, buf, params)
-    detail["momentum_ok"] = m_ok
-    detail["pump_detail"] = m_reason
-    detail.update(m_moves)
-
-    if not detail["spot_leading"]:
-        detail["block_reason"] = "spot_not_leading"
-    elif not detail["oi_rising"]:
-        detail["block_reason"] = "oi_not_rising"
-    elif not detail["ob_bid_heavy"]:
-        detail["block_reason"] = "book_not_bid_heavy"
-    elif not detail["momentum_ok"]:
-        detail["block_reason"] = "recent_pump"
-    else:
-        detail["allowed"] = True
-    return detail["allowed"], detail
-
-
-def _dump_cooldown_ok(coin: str, buf, params: dict) -> tuple[bool, str, dict]:
-    """SHORT Signal 4 — dump cooldown (no recent sharp DROP).
-
-    Mirror of _momentum_cooldown_ok for the SHORT side (2026-06-19). The three
-    structural SHORT signals (spot lagging + OI rising with falling price + book
-    ask-heavy) all flash green AS a dump runs; entering then catches the BOTTOM
-    and gets stopped on the bounce — the SHORT analogue of the losing-LONG
-    pump-top signature. Block SHORT entry if price dropped sharply over a recent
-    short window and let the dump exhaust first; the structural signals stay
-    valid, only the TIMING is corrected.
-
-    Checks three lookback windows on 5m candles (5m / 10m / 15m) and blocks if
-    ANY exceeds its (downward) threshold. Returns (ok, reason, moves) where
-    `moves` carries the three % moves for logging + the dashboard. Fail-OPEN
-    during warmup (too few candles): momentum can't be judged, so it must not
-    block.
-    """
-    moves = {"move_5m": None, "move_10m": None, "move_15m": None}
-    if not params.get("dump_cooldown_enabled", True):
-        return True, "cooldown_disabled", moves
-    candles = buf.latest_candles(coin, "5m", 6)  # last ~30 minutes
-    if len(candles) < 3:
-        return True, "insufficient_candles", moves  # fail-open during warmup
-
-    thr_1 = float(params.get("dump_threshold_1", 0.005))   # 0.5% in 5m
-    thr_2 = float(params.get("dump_threshold_2", 0.008))   # 0.8% in 10m
-    thr_3 = float(params.get("dump_threshold_3", 0.012))   # 1.2% in 15m
-
-    current = float(candles[-1]["c"])
-    prev_1 = float(candles[-2]["c"])                       # 5m ago
-    prev_2 = float(candles[-3]["c"])                       # 10m ago
-    prev_3 = float(candles[-4]["c"]) if len(candles) >= 4 else prev_2  # 15m ago
-
-    move_1 = (current - prev_1) / prev_1 if prev_1 else 0.0
-    move_2 = (current - prev_2) / prev_2 if prev_2 else 0.0
-    move_3 = (current - prev_3) / prev_3 if prev_3 else 0.0
-    moves["move_5m"], moves["move_10m"], moves["move_15m"] = (
-        move_1, move_2, move_3)
-
-    if move_1 < -thr_1:
-        return (False, f"dump_5m:{move_1*100:.3f}%<-{thr_1*100:.1f}%", moves)
-    if move_2 < -thr_2:
-        return (False, f"dump_10m:{move_2*100:.3f}%<-{thr_2*100:.1f}%", moves)
-    if move_3 < -thr_3:
-        return (False, f"dump_15m:{move_3*100:.3f}%<-{thr_3*100:.1f}%", moves)
-    return (True, f"momentum_ok:5m={move_1*100:.3f}% 10m={move_2*100:.3f}% "
-            f"15m={move_3*100:.3f}%", moves)
-
-
-def short_structural_gate(coin: str, buf, params: dict) -> tuple[bool, dict]:
-    """Strong structural SHORT gate (2026-06-19), mirror of long_structural_gate.
-
-    A SHORT entry must clear ALL of these signals, each the inverse of the LONG
-    gate's and each pointing the right way for genuine downside participation:
-      1. SPOT LAGGING perp — real selling, not a leverage-driven bounce (spot
-         return over the lookback is below perp return AND itself negative; spot
-         falling faster than perp, or perp trying to bounce while spot still
-         falls).
-      2. OI RISING with FALLING price — fresh shorts entering, structural
-         participation (not short-covering / long-liquidation exhaustion). This
-         is the new_shorts signal from the Phase 4.6 OI decomposition.
-      3. ORDERBOOK ASK-HEAVY — live microstructure confirms sell pressure now.
-      4. DUMP COOLDOWN — no recent sharp drop: the three signals above flash
-         green AS a dump runs; entering then catches the bottom. Block if price
-         fell past threshold in the last 5m/10m/15m and let the dump exhaust.
-
-    Fail-safe (mirror of the LONG gate): if any of signals 1-3 can't be computed
-    (missing/stale spot or OI history, no book) that signal FAILS and the SHORT
-    is blocked. Signal 4 fails OPEN during warmup. The drought this targets
-    (33 SHORTs on 6/17 -> 0 on 6/19) comes from the regime detector lagging into
-    TRENDING_UP; this gate reads live microstructure instead and fires SHORTs on
-    confirmed downside structure regardless of the regime/TA bias.
-
-    Returns (allowed, detail) — same shape as long_structural_gate — so the
-    dashboard, logging and tests treat both gates identically. LONGs never call
-    this.
-    """
-    spot_lag_thr = float(params.get("spot_lag_threshold", 0.0002))
-    oi_rise_thr = float(params.get("oi_rise_threshold", 0.001))
-    ob_ask_thr = float(params.get("ob_ask_threshold", 0.20))
-    spot_lookback = float(params.get("spot_lookback_minutes", 5))
-    oi_lookback = float(params.get("oi_lookback_minutes", 5))
-    top_n = int(params.get("ob_top_levels", 10))
-
-    detail = {
-        "spot_lagging": False, "oi_rising": False, "ob_ask_heavy": False,
-        "momentum_ok": False,
-        "spot_ret": None, "perp_ret": None, "oi_change": None,
-        "imbalance": None,
-        "move_5m": None, "move_10m": None, "move_15m": None, "dump_detail": "",
-        "allowed": False, "block_reason": "",
-    }
-
-    # --- Signal 1: spot lagging perp over the lookback window ---------------
-    spot_now = buf.spot_price(coin)
-    spot_then = buf.spot_price_n_minutes_ago(coin, spot_lookback)
-    perp_now = buf.mid(coin)
-    c5 = buf.latest_candles(coin, "5m", 2)
-    perp_then = float(c5[-2]["c"]) if len(c5) >= 2 else None
-    if all(v is not None and v > 0 for v in
-           (spot_now, spot_then, perp_now, perp_then)):
-        spot_ret = (spot_now - spot_then) / spot_then
-        perp_ret = (perp_now - perp_then) / perp_then
-        detail["spot_ret"] = spot_ret
-        detail["perp_ret"] = perp_ret
-        # spot falling faster than perp (real selling) OR perp bouncing while
-        # spot still falls (leverage-driven bounce) — both are spot < perp with
-        # spot itself negative past the threshold.
-        detail["spot_lagging"] = (spot_ret < perp_ret
-                                  and spot_ret < -spot_lag_thr)
-
-    # --- Signal 2: OI rising WITH falling price (fresh shorts) --------------
-    oi_now = (buf.ctx.get(coin) or {}).get("open_interest")
-    oi_then = buf.oi_n_minutes_ago(coin, oi_lookback)
-    if oi_now and oi_then and detail["perp_ret"] is not None:
-        detail["oi_change"] = (oi_now - oi_then) / oi_then
-        detail["oi_rising"] = (oi_now > oi_then * (1 + oi_rise_thr)
-                               and detail["perp_ret"] < -0.0001)
-
-    # --- Signal 3: orderbook ask-heavy -------------------------------------
-    book = buf.books.get(coin)
-    if book and book.get("bids") and book.get("asks"):
-        bid_vol = sum(sz for _px, sz in book["bids"][:top_n])
-        ask_vol = sum(sz for _px, sz in book["asks"][:top_n])
-        total = bid_vol + ask_vol
-        if total > 0:
-            imb = (bid_vol - ask_vol) / total
-            detail["imbalance"] = imb
-            detail["ob_ask_heavy"] = imb <= -ob_ask_thr
-
-    # --- Signal 4: dump cooldown (no recent sharp drop) --------------------
-    m_ok, m_reason, m_moves = _dump_cooldown_ok(coin, buf, params)
-    detail["momentum_ok"] = m_ok
-    detail["dump_detail"] = m_reason
-    detail.update(m_moves)
-
-    if not detail["spot_lagging"]:
-        detail["block_reason"] = "spot_not_lagging"
-    elif not detail["oi_rising"]:
-        detail["block_reason"] = "oi_not_rising"
-    elif not detail["ob_ask_heavy"]:
-        detail["block_reason"] = "book_not_ask_heavy"
-    elif not detail["momentum_ok"]:
-        detail["block_reason"] = "recent_dump"
-    else:
-        detail["allowed"] = True
-    return detail["allowed"], detail
-
-
-def long_structural_params(t_raw: dict, m_raw: dict) -> dict:
-    """Collect the LONG structural-gate tunables (config + live overrides) so
-    the initial read and the per-loop hot-reload stay in sync."""
-    return {
-        "enabled": bool(t_raw.get("long_structural_gate_enabled", True)),
-        "spot_lead_threshold": float(
-            t_raw.get("long_spot_lead_threshold", 0.0002)),
-        "oi_rise_threshold": float(t_raw.get("long_oi_rise_threshold", 0.001)),
-        "ob_bid_threshold": float(t_raw.get("long_ob_bid_threshold", 0.20)),
-        "spot_lookback_minutes": float(
-            t_raw.get("long_spot_lookback_minutes", 5)),
-        "oi_lookback_minutes": float(t_raw.get("long_oi_lookback_minutes", 5)),
-        "ob_top_levels": int(m_raw.get("ob_top_levels", 10)),
-        # Signal 4 — momentum cooldown (anti-pump-top, 2026-06-18)
-        "pump_cooldown_enabled": bool(
-            t_raw.get("long_pump_cooldown_enabled", True)),
-        "pump_threshold_1": float(t_raw.get("long_pump_threshold_1", 0.005)),
-        "pump_threshold_2": float(t_raw.get("long_pump_threshold_2", 0.008)),
-        "pump_threshold_3": float(t_raw.get("long_pump_threshold_3", 0.012)),
-    }
-
-
-def short_structural_params(t_raw: dict, m_raw: dict) -> dict:
-    """Collect the SHORT structural-gate tunables (config + live overrides) so
-    the initial read and the per-loop hot-reload stay in sync. Mirror of
-    long_structural_params (2026-06-19)."""
-    return {
-        "enabled": bool(t_raw.get("short_structural_gate_enabled", True)),
-        "spot_lag_threshold": float(
-            t_raw.get("short_spot_lag_threshold", 0.0002)),
-        "oi_rise_threshold": float(t_raw.get("short_oi_rise_threshold", 0.001)),
-        "ob_ask_threshold": float(t_raw.get("short_ob_ask_threshold", 0.20)),
-        "spot_lookback_minutes": float(
-            t_raw.get("short_spot_lookback_minutes", 5)),
-        "oi_lookback_minutes": float(t_raw.get("short_oi_lookback_minutes", 5)),
-        "ob_top_levels": int(m_raw.get("ob_top_levels", 10)),
-        # Signal 4 — dump cooldown (anti-dump-bottom, 2026-06-19)
-        "dump_cooldown_enabled": bool(
-            t_raw.get("short_dump_cooldown_enabled", True)),
-        "dump_threshold_1": float(t_raw.get("short_dump_threshold_1", 0.005)),
-        "dump_threshold_2": float(t_raw.get("short_dump_threshold_2", 0.008)),
-        "dump_threshold_3": float(t_raw.get("short_dump_threshold_3", 0.012)),
-    }
-
-
-# Throttle high-frequency skip logging. The structural gate and the direction
-# switches reject the same coin every loop (~10s); without this the trades table
+# Throttle high-frequency skip logging. The direction switches (and other
+# per-coin skips) reject the same coin every loop (~10s); without this the trades
+# table
 # grows ~15k near-duplicate skip rows/day. Persist at most one skip row per
 # (coin, category) per SKIP_LOG_THROTTLE_S — enough to audit that a side is being
 # held without flooding the table. In-memory, resets on restart.
@@ -819,31 +481,20 @@ def main():
     fallback_window_s = float(t_raw.get("maker_timeout_fallback_window_s", 180))
     fallback_exhaustion_mult = float(
         t_raw.get("maker_timeout_exhaustion_atr_mult", 1.5))
-    # armed-signal TTL ceilings (2026-06-22) — drop a setup that has stayed
-    # armed (clearing the gate but not filling) longer than this; per-band.
-    scalp_armed_ttl = float(t_raw.get("scalp_armed_ttl_seconds", 20))
+    # armed-signal TTL ceiling (2026-06-22) — drop a setup that has stayed armed
+    # (clearing the gate but not filling) longer than this.
     trend_armed_ttl = float(t_raw.get("trend_armed_ttl_seconds", 45))
     # Regime memory (2026-06-26): trend-band pre-entry check — suppress a trend
     # entry whose direction is contradicted by the recent 1h regime history.
     regime_memory_enabled = bool(t_raw.get("regime_memory_enabled", True))
     regime_memory_window = int(t_raw.get("regime_memory_window", 4))
     regime_memory_threshold = float(t_raw.get("regime_memory_threshold", 0.5))
-    # LONG structural gate (2026-06-17): supersedes the old Change B OB/VWAP
-    # confirmation. A LONG must clear ALL of {spot leading, OI rising, book
-    # bid-heavy}, else skip. SHORTs (the working side) are never gated.
-    long_struct = long_structural_params(t_raw, m_raw)
-    # SHORT structural gate (2026-06-19): mirror of the LONG gate for the SHORT
-    # side. A SHORT must clear ALL of {spot lagging, OI rising with falling
-    # price, book ask-heavy} plus the dump cooldown. Targets the SHORT drought
-    # (33->0 SHORTs as the regime detector lagged into TRENDING_UP).
-    short_struct = short_structural_params(t_raw, m_raw)
-    # Dual-band (2026-06-20): two aggregations per coin per cycle — SCALP on the
-    # fast resolution, TREND on the slow one. Each band has its own weight set,
-    # entry gate, risk geometry and concurrency (see RiskManager.bands). One-way
-    # exchange nets per coin, so a coin is owned by at most one band at a time.
-    scalp_band_enabled = bool(t_raw.get("scalp_band_enabled", True))
+    # SCALP BAND RETIRED 2026-06-26 — data-driven decision, trend-only operation.
+    # The scalp band (5m) and the structural gates that fed it are gone from the
+    # live loop; only the 1h trend band evaluates and trades. Scalp/gate config
+    # keys may remain in config.yaml but are inert. trend_band_enabled is kept so
+    # the trend band can still be paused from Controls.
     trend_band_enabled = bool(t_raw.get("trend_band_enabled", True))
-    scalp_interval = str(t_raw.get("scalp_interval", "5m"))
     trend_interval = str(t_raw.get("trend_interval", "1h"))
     # Legacy SHORT OB/VWAP mirror — OFF by default; superseded by short_struct
     # above but still read for the dashboard / regression suite.
@@ -952,22 +603,12 @@ def main():
         log.warning("DIRECTION MODE — longs_enabled=%s shorts_enabled=%s "
                     "(toggle live from the Controls page)",
                     cfg.longs_enabled, cfg.shorts_enabled)
-    if long_struct["enabled"]:
-        log.info("LONG STRUCTURAL gate ENABLED — need spot leading (>%.4f) + "
-                 "OI rising (>%.3f) + book bid-heavy (>=%.2f)",
-                 long_struct["spot_lead_threshold"],
-                 long_struct["oi_rise_threshold"],
-                 long_struct["ob_bid_threshold"])
-    if short_struct["enabled"]:
-        log.info("SHORT STRUCTURAL gate ENABLED — need spot lagging (<-%.4f) + "
-                 "OI rising w/ falling price (>%.3f) + book ask-heavy (<=-%.2f)",
-                 short_struct["spot_lag_threshold"],
-                 short_struct["oi_rise_threshold"],
-                 short_struct["ob_ask_threshold"])
+    log.info("SCALP BAND RETIRED 2026-06-26 — trend-only operation; structural "
+             "gates removed")
     maker_streaks = MakerTimeoutTracker(fallback_n, fallback_window_s)
     armed_signals = ArmedSignalTracker()
-    log.info("armed-signal TTL ENABLED — drop stale setups: scalp %.0fs, "
-             "trend %.0fs", scalp_armed_ttl, trend_armed_ttl)
+    log.info("armed-signal TTL ENABLED — drop stale trend setups after %.0fs",
+             trend_armed_ttl)
     # Regime memory buffers (2026-06-26): per-coin rolling deque of the last
     # `window` 1h regime reads + the last trend candle ts that fed each buffer
     # (so we append once per CLOSED 1h candle, not once per ~10s loop). Start
@@ -1027,14 +668,12 @@ def main():
                      band=risk._pos_track.get(coin, {}).get("band"), note=reason)
         return bool(res)
 
-    def open_entry(coin: str, sig, band: str, g_allowed: bool, g_detail: dict,
-                   s_allowed: bool, s_detail: dict) -> bool:
+    def open_entry(coin: str, sig, band: str) -> bool:
         """Attempt ONE band entry for coin given its aggregated signal. Returns
-        the opened trade's id (truthy) iff a position was opened, else False (so
-        the caller skips the other band on this coin — one-way exchange owns one
-        position per coin, and the id links signal_history to the trade). Mirrors the
-        legacy single-band entry flow, scoped to the band's gate/geometry/size.
-        Structural gates apply to the SCALP band only."""
+        the opened trade's id (truthy) iff a position was opened, else False (the
+        id links signal_history to the trade). Trend-only since 2026-06-26 —
+        `band` is always "trend"; the trend band's own 1h signal IS its gate.
+        Structural gates were retired with the scalp band."""
         bp = risk.band_params(band)
         is_long = sig.direction == LONG
 
@@ -1054,31 +693,6 @@ def main():
                     db.log_trade(coin, SHORT, "OPEN", band=band,
                                  status="direction_disabled",
                                  note=f"{band} shorts disabled")
-                return False
-
-        # structural gates — SCALP band only (trend's own 1h signal is its gate)
-        if band == "scalp" and bp["structural_gates_enabled"]:
-            if is_long and long_struct["enabled"] and not g_allowed:
-                reason = g_detail["block_reason"]
-                why = (g_detail["pump_detail"] if reason == "recent_pump"
-                       else f"imb={g_detail['imbalance']}")
-                log.info("scalp LONG skipped on %s: long_blocked (%s)",
-                         coin, reason)
-                if _should_log_skip(coin, "long_blocked"):
-                    db.log_trade(coin, LONG, "OPEN", band=band,
-                                 status=f"long_blocked_{reason}",
-                                 note=f"skip: structural gate ({reason}) {why}")
-                return False
-            if not is_long and short_struct["enabled"] and not s_allowed:
-                reason = s_detail["block_reason"]
-                why = (s_detail["dump_detail"] if reason == "recent_dump"
-                       else f"imb={s_detail['imbalance']}")
-                log.info("scalp SHORT skipped on %s: short_blocked (%s)",
-                         coin, reason)
-                if _should_log_skip(coin, "short_blocked"):
-                    db.log_trade(coin, SHORT, "OPEN", band=band,
-                                 status=f"short_blocked_{reason}",
-                                 note=f"skip: structural gate ({reason}) {why}")
                 return False
 
         # sizing — per-band size; per-coin override (Controls) wins when set
@@ -1114,7 +728,7 @@ def main():
         # submit another order) before this attempt goes out. age() is None on
         # the first armed attempt, so the very first submission is never
         # blocked; arm() then stamps the time used by later cycles.
-        armed_ttl = scalp_armed_ttl if band == "scalp" else trend_armed_ttl
+        armed_ttl = trend_armed_ttl
         armed_age = armed_signals.age(coin, band, sig.direction)
         if armed_age is not None and armed_age > armed_ttl:
             log.info("[ARMED_TTL] %s %s %s dropped — armed %.1fs ago, stale "
@@ -1135,8 +749,8 @@ def main():
             log.warning("skip %s [%s]: no ATR/mid for stops", coin, band)
             return False
         sl, tp = risk.calc_sl_tp(coin, entry_ref, is_long, atr, band=band)
-        weights = SCALP_WEIGHTS if band == "scalp" else TREND_WEIGHTS
-        interval = scalp_interval if band == "scalp" else trend_interval
+        weights = TREND_WEIGHTS
+        interval = trend_interval
         fmap = "smooth" if funding_smooth else "binary"
         # active = total non-FLAT directional voters (long+short); confidence is
         # normalized over these, so it exposes how thin the consensus was.
@@ -1343,20 +957,14 @@ def main():
                 t_raw.get("maker_timeout_exhaustion_atr_mult", 1.5))
             maker_streaks.n = fallback_n
             maker_streaks.window_s = fallback_window_s
-            scalp_armed_ttl = float(t_raw.get("scalp_armed_ttl_seconds", 20))
             trend_armed_ttl = float(t_raw.get("trend_armed_ttl_seconds", 45))
             regime_memory_enabled = bool(
                 t_raw.get("regime_memory_enabled", True))
             regime_memory_window = int(t_raw.get("regime_memory_window", 4))
             regime_memory_threshold = float(
                 t_raw.get("regime_memory_threshold", 0.5))
-            long_struct = long_structural_params(
-                t_raw, cfg._raw.get("models", {}) or {})
-            short_struct = short_structural_params(
-                t_raw, cfg._raw.get("models", {}) or {})
-            scalp_band_enabled = bool(t_raw.get("scalp_band_enabled", True))
+            # SCALP BAND RETIRED 2026-06-26 — trend-only; structural gates gone.
             trend_band_enabled = bool(t_raw.get("trend_band_enabled", True))
-            scalp_interval = str(t_raw.get("scalp_interval", "5m"))
             trend_interval = str(t_raw.get("trend_interval", "1h"))
             short_conf_enabled = bool(
                 t_raw.get("short_confirmation_enabled", False))
@@ -1588,16 +1196,12 @@ def main():
             # exchange nets per coin -> one band per coin at a time).
             if state == BotState.ACTIVE:
                 live_tickets: dict = {}
-                long_gates: dict = {}
-                short_gates: dict = {}
-                penalty = risk.regime_counter_trend_penalty
                 for coin in coins_active:
                     if coin in coins_disabled:
                         continue
-                    # dual aggregation — TREND first so its (1h) regime can
-                    # dampen counter-trend OrderbookImbalance votes in BOTH
-                    # bands (bid-heavy book in a downtrend = absorption, not a
-                    # reversal — see BOOK_REGIME_DAMPEN).
+                    # trend-only aggregation (1h). Its regime also dampens
+                    # counter-trend OrderbookImbalance votes (bid-heavy book in a
+                    # downtrend = absorption, not a reversal — BOOK_REGIME_DAMPEN).
                     trend_tickets = [m.compute(coin, buf, interval=trend_interval)
                                      for m in models]
                     trend_rt = next((t for t in trend_tickets
@@ -1625,41 +1229,16 @@ def main():
                     trend_sig = aggregator.aggregate(
                         coin, trend_tickets, weights=TREND_WEIGHTS,
                         regime_routing=False, book_regime=trend_regime)
-                    scalp_tickets = [m.compute(coin, buf, interval=scalp_interval)
-                                     for m in models]
-                    scalp_sig = aggregator.aggregate(
-                        coin, scalp_tickets, weights=SCALP_WEIGHTS,
-                        regime_routing=False, book_regime=trend_regime)
-                    # regime bias: 1h (trend) regime DAMPENS counter-trend scalp
-                    # confidence (never blocks). Trend signal is never modified.
-                    # Capture the pre-bias scalp conf so signal_history can tell
-                    # apart "dampened below gate" from a plain low-conf miss.
-                    scalp_conf_pre_bias = scalp_sig.confidence
-                    apply_regime_bias(scalp_sig, trend_sig.regime, penalty)
 
-                    # structural gates — SCALP band only; computed every loop for
-                    # the dashboard regardless of verdict, reused for scalp entry.
-                    g_allowed, g_detail = long_structural_gate(
-                        coin, buf, long_struct)
-                    long_gates[coin] = {**g_detail,
-                                        "enabled": long_struct["enabled"]}
-                    s_allowed, s_detail = short_structural_gate(
-                        coin, buf, short_struct)
-                    short_gates[coin] = {**s_detail,
-                                         "enabled": short_struct["enabled"]}
+                    # SCALP BAND RETIRED 2026-06-26 — data-driven decision,
+                    # trend-only operation. The 5m scalp aggregation, the regime
+                    # bias that dampened it, and the structural gates that fed it
+                    # are gone from the live loop. Only the 1h trend band below
+                    # evaluates and trades.
 
-                    # publish both bands' opinions for the dashboard
-                    live_tickets[coin] = {
-                        "scalp": _pack_band(scalp_tickets, scalp_sig),
-                        "trend": _pack_band(trend_tickets, trend_sig)}
-                    if scalp_sig.direction != FLAT:
-                        signals.log(coin, "AGGREGATOR_SCALP", scalp_sig.direction,
-                                    scalp_sig.confidence,
-                                    {"regime": scalp_sig.regime,
-                                     "long": scalp_sig.long_votes,
-                                     "short": scalp_sig.short_votes,
-                                     "flat": scalp_sig.flat_votes,
-                                     **scalp_sig.meta})
+                    # publish the trend band's opinion for the dashboard
+                    live_tickets[coin] = {"trend": _pack_band(trend_tickets,
+                                                              trend_sig)}
                     if trend_sig.direction != FLAT:
                         signals.log(coin, "AGGREGATOR_TREND", trend_sig.direction,
                                     trend_sig.confidence,
@@ -1669,7 +1248,6 @@ def main():
                                      "flat": trend_sig.flat_votes,
                                      **trend_sig.meta})
 
-                    # TREND first (priority), then SCALP if the coin is still free.
                     # Fix 1 (2026-06-22): order submission is SAME-ITERATION — the
                     # signal is aggregated immediately above and open_entry()
                     # submits the maker order synchronously here, in this cycle.
@@ -1680,7 +1258,7 @@ def main():
                     # signal is re-aggregated right before its own submit, so it is
                     # never stale at submission — and the armed-signal TTL above
                     # bounds the across-cycle case.)
-                    trend_tid = scalp_tid = None
+                    trend_tid = None
                     trend_rm_reason = None  # regime-memory suppression reason
                     if trend_band_enabled and trend_sig.direction != FLAT:
                         # Regime-memory pre-entry check (trend band only): if the
@@ -1702,30 +1280,18 @@ def main():
                                     status="regime_memory_suppressed",
                                     note=f"skip: {trend_rm_reason}")
                         else:
-                            trend_tid = open_entry(coin, trend_sig, "trend",
-                                                   g_allowed, g_detail,
-                                                   s_allowed, s_detail)
-                    if (not trend_tid and scalp_band_enabled
-                            and scalp_sig.direction != FLAT):
-                        scalp_tid = open_entry(coin, scalp_sig, "scalp",
-                                               g_allowed, g_detail, s_allowed,
-                                               s_detail)
+                            trend_tid = open_entry(coin, trend_sig, "trend")
 
-                    # signal_history: one row per band per cycle for this active
-                    # coin, traded or not. Additive diagnostics only — a failure
-                    # here must never break the loop.
+                    # signal_history: one row per cycle for this active coin,
+                    # traded or not. Additive diagnostics only — a failure here
+                    # must never break the loop.
                     try:
-                        sp = risk.band_params("scalp")
                         tpb = risk.band_params("trend")
                         db.log_signal_history(_signal_history_fields(
                             coin, "trend", trend_sig, trend_tickets,
                             tpb["min_confidence"], tpb["min_model_agreement"],
                             None, trend_tid,
                             override_block_reason=trend_rm_reason))
-                        db.log_signal_history(_signal_history_fields(
-                            coin, "scalp", scalp_sig, scalp_tickets,
-                            sp["min_confidence"], sp["min_model_agreement"],
-                            scalp_conf_pre_bias, scalp_tid))
                     except Exception as e:
                         log.warning("signal_history logging failed for %s: %s",
                                     coin, e)
@@ -1734,10 +1300,7 @@ def main():
                     db.set_state("live_tickets", json.dumps(
                         {"ts": int(time.time() * 1000),
                          "coins": live_tickets,
-                         "long_gates": long_gates,
-                         "short_gates": short_gates,
-                         "bands": {"scalp_enabled": scalp_band_enabled,
-                                   "trend_enabled": trend_band_enabled}},
+                         "bands": {"trend_enabled": trend_band_enabled}},
                         default=str))
 
             # publish the in-trade tracker (entry/sl/tp/band per open coin) to
