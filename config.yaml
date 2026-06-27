@@ -197,6 +197,20 @@ models:
     full_conf_z: 2.6           # |z| == 2.6 sigma = full confidence (0.95 ceiling)
     min_candles: 20            # minimum candles required to vote (else FLAT)
     ranging_weight_damp: 0.70  # 70% of full weight in a RANGING regime (noisier)
+  # Trend-band ensemble weights (2026-06-27). With the hard RANGING lockout the
+  # ensemble only needs to pick direction in a clear 1h trend. Accuracy
+  # attribution put OB and VWAP consistently above random and TA/Funding/Momentum
+  # at/below a coin flip (Momentum anti-predictive post z-score fix), so OB+VWAP
+  # carry 0.70 and Funding/Momentum are near-zero spectators (kept non-zero so
+  # their votes are still captured for diagnosis). The aggregator renormalizes
+  # over active voters, so these need not sum to exactly 1.0. Hot-reloadable via
+  # live_config (keys models.trend_weights.*), re-read by run_bot each loop.
+  trend_weights:
+    ob: 0.40
+    vwap: 0.30
+    ta: 0.20
+    funding: 0.05
+    momentum: 0.05
 
 # ---- aggregator: regime-aware weight dampening ----
 aggregator:
@@ -258,6 +272,16 @@ trading:
   # changed market. Scalp is short-lived; trend tolerates more lag.
   scalp_armed_ttl_seconds: 75
   trend_armed_ttl_seconds: 75
+  # Hard RANGING lockout (2026-06-27): the FIRST trend-band entry check. The bot
+  # has real edge only in sustained directional 1h trends — in RANGING regimes
+  # cleared signals are LESS accurate than blocked ones (high confidence is
+  # anti-predictive), driven by mean-reversion models (TA/Funding) voting LONG
+  # into every oscillation. So when the CURRENT 1h regime is RANGING, block ALL
+  # new trend entries in BOTH directions — the bot simply waits for a clear
+  # trend. This is binary (RANGING or not), not tunable. It runs BEFORE regime
+  # memory, which still suppresses counter-regime entries in TRENDING_UP/DOWN.
+  # HIGH_VOL is not RANGING, so entries are still allowed there. Hot-reloadable.
+  ranging_lockout_enabled: true
   # Regime memory (2026-06-26): trend-band pre-entry check. The trend band has
   # no regime memory — a single RANGING candle in a sustained downtrend re-opens
   # full LONG conviction, so the bot fires confidently-wrong LONGs on every

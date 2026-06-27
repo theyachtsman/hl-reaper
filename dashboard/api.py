@@ -1456,6 +1456,9 @@ CONFIG_SCHEMA: dict[str, dict] = {
     # Regime bias connector: 1h regime dampens counter-trend scalp confidence
     "risk.regime_counter_trend_penalty": {"type": "float", "min": 0.3,
                                           "max": 1.0},
+    # Hard RANGING lockout (2026-06-27): block ALL new trend entries when the
+    # current 1h regime is RANGING (binary, runs before regime memory).
+    "trading.ranging_lockout_enabled": {"type": "bool"},
     # Regime memory (2026-06-26): trend-band pre-entry suppression when the
     # recent dominant 1h regime opposes the proposed direction.
     "trading.regime_memory_enabled": {"type": "bool"},

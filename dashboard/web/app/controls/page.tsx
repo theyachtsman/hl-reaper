@@ -402,6 +402,14 @@ export default function ControlsPage() {
         </div>
         <div className="label pt-1 text-purple-300/80">Regime Memory</div>
         <div className="text-xs text-slate-500">
+          When ON: no new entries when the current regime is RANGING. The bot
+          waits for a clear trend before entering. Blocks both directions — the
+          ensemble has no reliable edge in ranging conditions regardless of
+          confidence. Runs before regime memory below.
+        </div>
+        <Toggle cfg={cfg} ck="trading.ranging_lockout_enabled"
+          label="Ranging lockout enabled" onApply={setKey} onReset={clearKey} />
+        <div className="text-xs text-slate-500">
           Suppresses a trend entry when the recent dominant 1h regime opposes its
           direction (LONG vs TRENDING_DOWN, SHORT vs TRENDING_UP) — stops the bot
           buying every bounce in a sustained downtrend. Not a gate: confidence and

@@ -151,6 +151,34 @@ def regime_memory_reason(history, direction: str) -> str:
     return f"regime_memory: {frac:.0%} {opp} in last {n} evals"
 
 
+# --- Trend-band ensemble weights (2026-06-27) ------------------------------
+# config models.trend_weights uses short keys; the aggregator weight set is
+# keyed by model class name. This maps one to the other.
+_TREND_WEIGHT_KEYS = {
+    "ob": "OrderbookImbalanceModel",
+    "vwap": "VWAPModel",
+    "ta": "TAModel",
+    "funding": "FundingRateModel",
+    "momentum": "MomentumModel",
+}
+
+
+def load_trend_weights(m_raw: dict) -> dict:
+    """Build the trend-band weight set by overlaying config models.trend_weights
+    onto the TREND_WEIGHTS defaults. Returns a fresh class-name-keyed dict so it
+    can be hot-reloaded each loop (the aggregator renormalizes, so the values
+    need not sum to 1.0). Unknown/omitted keys keep their default."""
+    w = dict(TREND_WEIGHTS)
+    cfg_w = (m_raw.get("trend_weights", {}) or {})
+    for short, model in _TREND_WEIGHT_KEYS.items():
+        if short in cfg_w:
+            try:
+                w[model] = float(cfg_w[short])
+            except (TypeError, ValueError):
+                pass
+    return w
+
+
 # Throttle high-frequency skip logging. The direction switches (and other
 # per-coin skips) reject the same coin every loop (~10s); without this the trades
 # table
@@ -484,11 +512,17 @@ def main():
     # armed-signal TTL ceiling (2026-06-22) — drop a setup that has stayed armed
     # (clearing the gate but not filling) longer than this.
     trend_armed_ttl = float(t_raw.get("trend_armed_ttl_seconds", 45))
+    # Hard RANGING lockout (2026-06-27): trend-band's FIRST entry check — block
+    # ALL new entries (both directions) when the current 1h regime is RANGING.
+    ranging_lockout_enabled = bool(t_raw.get("ranging_lockout_enabled", True))
     # Regime memory (2026-06-26): trend-band pre-entry check — suppress a trend
     # entry whose direction is contradicted by the recent 1h regime history.
     regime_memory_enabled = bool(t_raw.get("regime_memory_enabled", True))
     regime_memory_window = int(t_raw.get("regime_memory_window", 4))
     regime_memory_threshold = float(t_raw.get("regime_memory_threshold", 0.5))
+    # Trend-band ensemble weights (2026-06-27): config models.trend_weights
+    # overlaid on the TREND_WEIGHTS defaults, re-read each loop (hot-reload).
+    trend_weights = load_trend_weights(m_raw)
     # SCALP BAND RETIRED 2026-06-26 — data-driven decision, trend-only operation.
     # The scalp band (5m) and the structural gates that fed it are gone from the
     # live loop; only the 1h trend band evaluates and trades. Scalp/gate config
@@ -617,6 +651,13 @@ def main():
     # against. The buffers are NOT persisted; they refill from live candles.
     regime_history: dict[str, deque] = {}
     last_regime_candle_t: dict[str, int] = {}
+    if ranging_lockout_enabled:
+        log.info("RANGING LOCKOUT ENABLED (trend band) — no new entries while "
+                 "the current 1h regime is RANGING")
+    log.info("trend weights: OB=%.2f VWAP=%.2f TA=%.2f FUND=%.2f MOM=%.2f",
+             trend_weights["OrderbookImbalanceModel"], trend_weights["VWAPModel"],
+             trend_weights["TAModel"], trend_weights["FundingRateModel"],
+             trend_weights["MomentumModel"])
     if regime_memory_enabled:
         log.info("REGIME MEMORY ENABLED (trend band) — suppress entries when "
                  ">=%.0f%% of the last %d 1h regimes oppose the direction",
@@ -958,11 +999,19 @@ def main():
             maker_streaks.n = fallback_n
             maker_streaks.window_s = fallback_window_s
             trend_armed_ttl = float(t_raw.get("trend_armed_ttl_seconds", 45))
+            ranging_lockout_enabled = bool(
+                t_raw.get("ranging_lockout_enabled", True))
             regime_memory_enabled = bool(
                 t_raw.get("regime_memory_enabled", True))
             regime_memory_window = int(t_raw.get("regime_memory_window", 4))
             regime_memory_threshold = float(
                 t_raw.get("regime_memory_threshold", 0.5))
+            new_trend_weights = load_trend_weights(
+                cfg._raw.get("models", {}) or {})
+            if new_trend_weights != trend_weights:
+                log.warning("LIVE CONFIG: trend weights %s -> %s",
+                            trend_weights, new_trend_weights)
+                trend_weights = new_trend_weights
             # SCALP BAND RETIRED 2026-06-26 — trend-only; structural gates gone.
             trend_band_enabled = bool(t_raw.get("trend_band_enabled", True))
             trend_interval = str(t_raw.get("trend_interval", "1h"))
@@ -1227,7 +1276,7 @@ def main():
                         rh.append(trend_regime)
                         last_regime_candle_t[coin] = cur_ct
                     trend_sig = aggregator.aggregate(
-                        coin, trend_tickets, weights=TREND_WEIGHTS,
+                        coin, trend_tickets, weights=trend_weights,
                         regime_routing=False, book_regime=trend_regime)
 
                     # SCALP BAND RETIRED 2026-06-26 — data-driven decision,
@@ -1259,13 +1308,30 @@ def main():
                     # never stale at submission — and the armed-signal TTL above
                     # bounds the across-cycle case.)
                     trend_tid = None
-                    trend_rm_reason = None  # regime-memory suppression reason
+                    trend_rm_reason = None  # block reason (lockout / regime mem)
                     if trend_band_enabled and trend_sig.direction != FLAT:
+                        # Hard RANGING lockout (2026-06-27): the FIRST entry check,
+                        # ahead of regime memory. The bot has edge only in
+                        # sustained 1h trends — in a RANGING regime high confidence
+                        # is anti-predictive, so block ALL new entries (both
+                        # directions) and simply wait. Binary on the CURRENT regime
+                        # (not history); HIGH_VOL is not RANGING and is unaffected.
+                        if (ranging_lockout_enabled
+                                and trend_regime == "RANGING"):
+                            trend_rm_reason = "ranging_lockout"
+                            log.info("[RANGING_LOCKOUT] %s — regime is RANGING, "
+                                     "no entry (%s conf=%.2f)", coin,
+                                     trend_sig.direction, trend_sig.confidence)
+                            if _should_log_skip(coin, "ranging_lockout"):
+                                db.log_trade(
+                                    coin, trend_sig.direction, "OPEN",
+                                    band="trend", status="ranging_lockout",
+                                    note="skip: ranging_lockout")
                         # Regime-memory pre-entry check (trend band only): if the
                         # recent dominant 1h regime opposes this direction, skip
                         # the entry (does NOT touch conf/weights — see
                         # regime_allows_entry). Buffer warmup is fail-open.
-                        if (regime_memory_enabled and not regime_allows_entry(
+                        elif (regime_memory_enabled and not regime_allows_entry(
                                 rh, trend_sig.direction,
                                 regime_memory_threshold)):
                             trend_rm_reason = regime_memory_reason(

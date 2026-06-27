@@ -64,15 +64,25 @@ SCALP_WEIGHTS = {
     "MomentumModel":            0.15,
     "LiquidationHeatmapModel":  0.00,
 }
+# Trend-only restructure (2026-06-27): with the hard RANGING lockout in place
+# the ensemble only has to do one thing — pick the correct direction in a clear
+# 1h trend. Accuracy attribution across sessions put OB and VWAP consistently
+# above random and TA/Funding/Momentum at or below a coin flip (Momentum turned
+# anti-predictive post z-score fix), so OB+VWAP now carry 0.70 of the weight and
+# Funding/Momentum are near-zero spectators (kept non-zero so their votes are
+# still captured for diagnosis without being able to override OB+VWAP). These
+# are the DEFAULTS — run_bot overlays config models.trend_weights on top each
+# loop (hot-reloadable). MeanReversion stays zeroed (it fails in trends and
+# RANGING is locked out anyway).
 TREND_WEIGHTS = {
-    "TAModel":                  0.24,   # 0.30 * 0.80
+    "TAModel":                  0.20,
     "MeanReversionModel":       0.00,
     "MLForecastModel":          0.00,
     "RegimeDetectorModel":      0.00,
-    "FundingRateModel":         0.16,   # 0.20 * 0.80
-    "OrderbookImbalanceModel":  0.24,   # 0.30 * 0.80
-    "VWAPModel":                0.16,   # 0.20 * 0.80
-    "MomentumModel":            0.20,
+    "FundingRateModel":         0.05,
+    "OrderbookImbalanceModel":  0.40,
+    "VWAPModel":                0.30,
+    "MomentumModel":            0.05,
     "LiquidationHeatmapModel":  0.00,
 }
 
